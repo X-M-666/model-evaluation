@@ -22,10 +22,23 @@ class StartRequest(BaseModel):
     seed: int | None = Field(None, description="随机种子")
     dataset_name: str | None = Field(None, description="自定义评测集名称，None=用内置题库")
     repeat_n: int = Field(1, ge=1, le=20, description="重复评测次数，取平均")
+    num_questions: int | None = Field(None, ge=1, le=7, description="内置题库题目数量（仅内置题库模式生效，3/5/7，None=全维度）")
 
 
 class StartResponse(BaseModel):
     job_id: str
+
+
+class ReviewScoreItem(BaseModel):
+    id: str = Field(..., description="题目 id")
+    round: int = Field(1, ge=1, description="轮次（repeat_n>1 时从 1 开始）")
+    answer_x: float = Field(..., ge=0, le=10, description="答案X 得分 0-10")
+    answer_y: float = Field(..., ge=0, le=10, description="答案Y 得分 0-10")
+    note: str = Field("", max_length=2000, description="可选评语")
+
+
+class ReviewSubmission(BaseModel):
+    scores: list[ReviewScoreItem]
 
 
 class JobStatusResponse(BaseModel):

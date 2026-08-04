@@ -68,6 +68,40 @@ def save_verdict(job_id: str, verdict: dict) -> Path:
     return p
 
 
+def save_reveal(job_id: str, reveal: dict) -> Path:
+    """持久化双盲身份映射（答案X/答案Y 对应哪份答卷），重启不丢。"""
+    p = _job_dir(job_id) / "reveal.json"
+    p.write_text(json.dumps(reveal, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_reveal(job_id: str) -> dict | None:
+    p = _job_dir(job_id) / "reveal.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def save_review(job_id: str, review: dict) -> Path:
+    """保存用户已提交的人工评审（草稿/结果）。"""
+    p = _job_dir(job_id) / "review.json"
+    p.write_text(json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_review(job_id: str) -> dict | None:
+    p = _job_dir(job_id) / "review.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
 def save_error(job_id: str, message: str) -> Path:
     p = _job_dir(job_id) / "error.json"
     p.write_text(json.dumps({"error": message}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -87,6 +121,8 @@ def _job_state(d: Path) -> str:
     if "report.json" in files:
         return "completed"
     if "answers-a.json" in files and "answers-b.json" in files:
+        if "verdict.json" not in files:
+            return "reviewing"
         return "judging"
     if "tasks.json" in files:
         return "executing"
@@ -144,7 +180,10 @@ def get_job_files(job_id: str) -> dict[str, Any] | None:
     if not d.exists():
         return None
     result = {}
-    for name in ["tasks.json", "answers-a.json", "answers-b.json", "verdict.json", "report.json", "config.json"]:
+    names = ["tasks.json", "answers-a.json", "answers-b.json", "verdict.json",
+             "report.json", "config.json"]
+    names += sorted(p.name for p in d.glob("answers-*-r*.json"))
+    for name in names:
         p = d / name
         if p.exists():
             try:

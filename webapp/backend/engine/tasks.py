@@ -225,16 +225,21 @@ QUESTION_POOL: dict[str, list[dict[str, Any]]] = {
 def generate_tasks(
     dims: list[str] | None = None,
     seed: int | None = None,
+    num_questions: int | None = None,
 ) -> list[dict[str, Any]]:
     """从题库池按维度抽取题目，生成任务集。
 
     Args:
         dims: 需覆盖的维度列表（默认全部七维度）；同一维度只会抽 1 题。
         seed: 随机种子；固定 seed 可复现同一任务集（便于对比不同模型）。
+        num_questions: 题目数量上限（如 3/5/7）；从 dims 中随机抽样该数量的
+            维度出题，超过 dims 长度时以 dims 长度为准。
     """
     if seed is not None:
         random.seed(seed)
     selected_dims = dims or list(DIMENSIONS)
+    if num_questions is not None:
+        selected_dims = random.sample(selected_dims, min(num_questions, len(selected_dims)))
     tasks: list[dict[str, Any]] = []
     for dim in selected_dims:
         pool = QUESTION_POOL.get(dim, [])
@@ -250,9 +255,10 @@ def generate_tasks(
 def build_task_set(
     dims: list[str] | None = None,
     seed: int | None = None,
+    num_questions: int | None = None,
 ) -> dict[str, Any]:
     """生成完整任务集 dict（与 .eval/tasks.json 结构一致）。"""
-    tasks = generate_tasks(dims, seed)
+    tasks = generate_tasks(dims, seed, num_questions)
     stability_ids = [
         t["id"] for t in tasks if t["dimension"] == "效率与稳定性"
     ]
@@ -261,6 +267,7 @@ def build_task_set(
         "total": len(tasks),
         "created_by": "webapp",
         "multimodal": "N/A",
+        "num_questions": num_questions,
     }
     if stability_ids:
         meta["eval_flags"] = {"stability_repeat": {stability_ids[0]: 2}}

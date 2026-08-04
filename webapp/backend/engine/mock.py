@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
-"""模拟评测数据生成器：每次点击随机生成不同题目、不同答案、不同评分，无需真实 API。"""
+"""模拟评测数据生成器：每次点击随机生成不同题目、不同答案，无需真实 API。
+
+与真实评测一致：生成任务集与双模型答卷后即进入人工评审阶段，
+由用户在 review 页打分，提交后才生成 verdict 与报告。
+"""
 from __future__ import annotations
 
 import random
 import time
+from typing import Any
+
 from backend.engine.tasks import build_task_set
-from backend.storage import create_job_id, save_config, save_task_set, save_answers, save_verdict, save_report
+from backend.engine.human_review import make_reveal
+from backend.storage import (
+    create_job_id, save_config, save_task_set, save_answers, save_reveal,
+)
 
 # 模型名池（每次随机抽两个）
 MODEL_POOL = [
@@ -69,29 +78,6 @@ ANSWER_TEMPLATES = {
     ],
 }
 
-# 评审依据模板（按胜方类型）
-BASIS_TEMPLATES = {
-    "tie": [
-        "双方回答均正确完整，表述略有差异但质量等价，均为满分。",
-        "两模型输出功能等价，细节处理相当，无明显优劣。",
-        "双方答案均覆盖全部要点，准确度一致，判为平局。",
-        "两份回答质量相当，各有特色但整体水平相同。",
-    ],
-    "answer_x": [
-        "X回答更完整准确，覆盖所有要点；Y回答有轻微遗漏或表述不够精确。",
-        "X的推理过程更清晰，结论准确；Y结论正确但过程略简略。",
-        "X在细节处理上更到位，格式更规范；Y基本正确但有小瑕疵。",
-        "X的回答信息量更大且准确，Y的回答稍有不足。",
-    ],
-    "answer_y": [
-        "Y回答更完整准确，覆盖所有要点；X回答有轻微遗漏或表述不够精确。",
-        "Y的推理过程更清晰，结论准确；X结论正确但过程略简略。",
-        "Y在细节处理上更到位，格式更规范；X基本正确但有小瑕疵。",
-        "Y的回答信息量更大且准确，X的回答稍有不足。",
-    ],
-}
-
-
 def _pick_model(exclude: str = "") -> str:
     """从模型池中随机选一个不重复的模型名。"""
     pool = [m for m in MODEL_POOL if m != exclude]
@@ -111,46 +97,11 @@ def _random_api_info(base_latency: int = 500) -> dict:
     }
 
 
-def _random_scores(tasks: list[dict]) -> list[dict]:
-    """为每道题生成随机评分。"""
-    scores = []
-    for t in tasks:
-        dim = t["dimension"]
-        is_code = dim == "代码能力"
-        # 代码题更容易平局，其他题随机
-        if is_code:
-            x = random.choice([9, 9.5, 10, 10])
-            y = random.choice([9, 9.5, 10, 10])
-        else:
-            x = round(random.uniform(6, 10), 1)
-            y = round(random.uniform(6, 10), 1)
+def prepare_mock_job(seed: int | None = None) -> dict[str, Any]:
+    """生成模拟评测的准备数据（配置/任务集/答卷/揭示映射），返回供主流程注册。
 
-        if x == y:
-            winner = "tie"
-        elif x > y:
-            winner = "answer_x"
-        else:
-            winner = "answer_y"
-
-        basis = random.choice(BASIS_TEMPLATES[winner])
-        arbiter_note = ""
-        if abs(x - y) <= 0.5 and winner != "tie":
-            arbiter_note = f"分差仅{abs(x-y)}分，维持原判。"
-
-        scores.append({
-            "id": t["id"],
-            "dimension": dim,
-            "answer_x": x,
-            "answer_y": y,
-            "winner": winner,
-            "basis": basis,
-            "arbiter_note": arbiter_note,
-        })
-    return scores
-
-
-def generate_mock_job(seed: int | None = None) -> str:
-    """生成一条完整的模拟评测记录，返回 job_id。"""
+    不生成 verdict 与报告——与真实评测一致，等待人工评审打分。
+    """
     if seed is None:
         seed = int(time.time()) % 100000
 
@@ -161,12 +112,15 @@ def generate_mock_job(seed: int | None = None) -> str:
     model_b_url = MODEL_URLS.get(model_b_name, "https://api.example.com/v1")
 
     # 1. 保存配置
-    save_config(job_id, {
+    config = {
         "model_a": {"name": model_a_name, "url": model_a_url, "key": "mock"},
         "model_b": {"name": model_b_name, "url": model_b_url, "key": "mock"},
         "dims": None,
         "seed": seed,
-    })
+        "dataset_name": None,
+        "repeat_n": 1,
+    }
+    save_config(job_id, config)
 
     # 2. 生成任务集（随机种子决定抽哪些题）
     task_set = build_task_set(seed=seed)
@@ -214,44 +168,20 @@ def generate_mock_job(seed: int | None = None) -> str:
 
     save_answers(job_id, "a", answers_a)
     save_answers(job_id, "b", answers_b)
+    save_answers(job_id, "a-r1", answers_a)
+    save_answers(job_id, "b-r1", answers_b)
 
-    # 4. 构造 verdict
-    scores = _random_scores(task_set["tasks"])
-    dim_totals = {}
-    for s in scores:
-        dim = s["dimension"]
-        if dim not in dim_totals:
-            dim_totals[dim] = {"x": 0, "y": 0}
-        dim_totals[dim]["x"] += s["answer_x"]
-        dim_totals[dim]["y"] += s["answer_y"]
+    # 4. 生成并持久化 X/Y 身份映射（重启不丢，评审页据此隐藏身份）
+    reveal = make_reveal(1)
+    save_reveal(job_id, reveal)
 
-    total_x = round(sum(d["x"] for d in dim_totals.values()), 1)
-    total_y = round(sum(d["y"] for d in dim_totals.values()), 1)
-    if total_x > total_y:
-        winner_model = model_a_name
-    elif total_y > total_x:
-        winner_model = model_b_name
-    else:
-        winner_model = "平局"
-
-    verdict = {
-        "meta": {"total": 7, "valid": 7, "invalid": 0, "tie_arbitrated": 0},
-        "scores": scores,
-        "per_dimension": dim_totals,
-        "totals": {"answer_x": total_x, "answer_y": total_y},
-        "revealed": {"answer_x": f"{model_a_name} (模拟)", "answer_y": f"{model_b_name} (模拟)"},
-        "conclusion": f"{winner_model} 以 {max(total_x,total_y)}:{min(total_x,total_y)} 胜出（模拟数据）",
-        "winner_model": winner_model,
-    }
-    save_verdict(job_id, verdict)
-    save_report(job_id, {
-        "config": {"model_a": {"name": model_a_name, "url": model_a_url},
-                   "model_b": {"name": model_b_name, "url": model_b_url},
-                   "dims": None, "seed": seed, "repeat_n": 1},
-        "tasks": task_set,
+    return {
+        "job_id": job_id,
+        "config": config,
+        "task_set": task_set,
         "answers_a": answers_a,
         "answers_b": answers_b,
-        "verdict": verdict,
-    })
-
-    return job_id
+        "reveal": reveal,
+        "rounds_answers": [{"a": answers_a, "b": answers_b}],
+        "repeat_n": 1,
+    }

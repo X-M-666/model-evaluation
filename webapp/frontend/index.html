@@ -59,7 +59,7 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <body>
 <div class="wrap">
 <h1>模型对决评测平台</h1>
-<p class="sub">输入两个模型的 API 配置，自动出题、调用、双盲评审并展示对比报告</p>
+<p class="sub">输入两个模型的 API 配置，自动出题、调用、<strong>人工双盲评审</strong>并展示对比报告</p>
 
 <!-- 模型 A -->
 <div class="card">
@@ -104,16 +104,26 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <h2>评测集</h2>
 <div class="dataset-section">
   <div class="radio-group">
-    <label><input type="radio" name="ds-mode" value="builtin" checked onchange="switchDatasetMode()"> 内置题库（七维度，每维度随机抽1题）</label>
+    <label><input type="radio" name="ds-mode" value="builtin" checked onchange="switchDatasetMode()"> 内置题库（可选 3/5/7 题）</label>
     <label><input type="radio" name="ds-mode" value="custom" onchange="switchDatasetMode()"> 自定义评测集</label>
   </div>
 
   <!-- 内置题库选项 -->
   <div id="builtin-opts" style="margin-top:14px">
+    <div class="param-row">
+      <label style="flex:0 0 220px">题目数量
+        <select id="num-questions">
+          <option value="3">3 题</option>
+          <option value="5">5 题</option>
+          <option value="7" selected>7 题（全部维度）</option>
+        </select>
+      </label>
+      <label style="flex:0 0 240px">随机种子（可选，固定种子可复现题目）
+        <input id="seed" placeholder="留空自动" />
+      </label>
+    </div>
     <label>维度（默认全部七维度）</label>
     <div id="dims-box"></div>
-    <label style="margin-top:14px">随机种子（可选，固定种子可复现题目）</label>
-    <input id="seed" placeholder="留空自动" style="width:200px" />
   </div>
 
   <!-- 自定义评测集选项 -->
@@ -128,7 +138,7 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
       <a href="#" onclick="downloadTemplate('txt');return false">TXT 模板</a>
     </div>
     <label>或粘贴 JSON 到文本框</label>
-    <textarea id="ds-json" placeholder='{"name":"我的测试集","tasks":[{"prompt":"题目","expected":"答案"}]}'></textarea>
+    <textarea id="ds-json" placeholder='{"name":"我的测试集","tasks":[{"prompt":"题目","expected":"示例答案"}]}'></textarea>
     <button class="btn-upload" onclick="uploadJson()">上传文本框内容</button>
     <div id="upload-result" style="margin-top:8px;font-size:13px"></div>
 
@@ -379,6 +389,7 @@ async function startEval(){
     seed: seed ? parseInt(seed) : null,
     dataset_name: dsName || null,
     repeat_n: parseInt(g('repeat-n')) || 1,
+    num_questions: dsMode==='builtin' ? parseInt(document.getElementById('num-questions').value) : null,
   };
 
   try{
@@ -395,8 +406,11 @@ async function startEval(){
       const evt = JSON.parse(e.data);
       const round = evt.round ? `[${evt.round}] ` : '';
       if(evt.state==='executing') progText.textContent = `${round}模型调用中 ${evt.progress||''}`;
-      else if(evt.state==='judging') progText.textContent = `${round}评审中...`;
-      else if(evt.state==='completed'){
+      else if(evt.state==='reviewing'){
+        progText.textContent = '模型作答完成，跳转人工双盲评审...';
+        evtSource.close();
+        setTimeout(()=>window.location='/review.html?job='+jobId, 500);
+      }else if(evt.state==='completed'){
         progText.textContent = '完成，跳转报告页...';
         evtSource.close();
         setTimeout(()=>window.location='/report.html?job='+jobId, 600);
@@ -420,7 +434,8 @@ async function startMock(){
   try{
     const r = await fetch(API+'/api/eval/mock',{method:'POST'});
     const d = await r.json();
-    window.location='/report.html?job='+d.job_id;
+    // 与真实评测一致：先进入人工双盲评审，提交后才显示结果
+    window.location='/review.html?job='+d.job_id;
   }catch(e){
     alert('生成失败: '+e);
     btn.disabled = false; btn.textContent = '测试结果案例';
@@ -443,19 +458,26 @@ async function loadHistory(){
     const d = await r.json();
     const el = document.getElementById('historyList');
     if(!d.jobs||!d.jobs.length){ el.innerHTML='<em>暂无历史记录</em>'; return; }
-    el.innerHTML = d.jobs.slice(0,10).map(j=>`
+    el.innerHTML = d.jobs.slice(0,10).map(j=>{
+      const stateTag = j.state==='completed' ? '<span class="tag done">completed</span>'
+        : j.state==='reviewing' ? '<span class="tag">reviewing</span>'
+        : '<span class="tag pending">'+j.state+'</span>';
+      const link = j.state==='reviewing'
+        ? `<a href="/review.html?job=${j.job_id}" style="color:#f0883e;text-decoration:none">去评审</a>`
+        : `<a href="/report.html?job=${j.job_id}" style="color:#58a6ff;text-decoration:none">查看</a>`;
+      return `
       <div class="history-row">
         <div>
-          <span class="tag ${j.state==='completed'?'done':'pending'}">${j.state}</span>
+          ${stateTag}
           <strong>${esc(j.model_a)}</strong> vs <strong>${esc(j.model_b)}</strong>
           <span style="color:#8b949e;font-size:12px;margin-left:8px">${j.created_at.slice(0,16)}</span>
         </div>
         <div>
-          <a href="/report.html?job=${j.job_id}" style="color:#58a6ff;text-decoration:none">查看</a>
+          ${link}
           <button class="btn-danger" onclick="deleteJob('${j.job_id}')">删除</button>
         </div>
-      </div>
-    `).join('');
+      </div>`;
+    }).join('');
   }catch(e){}
 }
 </script>

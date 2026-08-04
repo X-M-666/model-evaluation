@@ -8,31 +8,44 @@
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
-.wrap{max-width:1000px;margin:30px auto;padding:0 20px}
+.wrap{max-width:1100px;margin:30px auto;padding:0 20px}
 h1{font-size:24px;color:#58a6ff;margin-bottom:6px}
 .sub{color:#8b949e;font-size:14px;margin-bottom:24px}
 a{color:#58a6ff;text-decoration:none}
 .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;margin-bottom:16px}
 h2{font-size:17px;color:#58a6ff;margin-bottom:14px}
 .winner-box{text-align:center;padding:24px}
-.winner-box .big{font-size:28px;color:#f0883e;font-weight:bold}
-.winner-box .vs{color:#8b949e;margin:8px 0}
-.winner-box .score{font-size:40px;font-weight:bold;color:#f0883e}
+.winner-box .label{color:#8b949e;font-size:14px}
+.winner-box .score{font-size:44px;font-weight:bold;color:#f0883e}
+.winner-box .vs{color:#8b949e;margin:8px 0;font-size:18px}
+.winner-box .detail{font-size:13px;color:#8b949e;margin-top:8px;line-height:1.7}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:14px}
+.stat-box{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:14px;text-align:center}
+.stat-box .v{font-size:24px;font-weight:bold;color:#58a6ff}
+.stat-box .k{font-size:12px;color:#8b949e;margin-top:4px}
+.stat-box.win .v{color:#3fb950}
+.stat-box.lose .v{color:#f85149}
+.chart{width:100%;height:380px}
+.chart-sm{width:100%;height:320px}
 table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{padding:10px 12px;border-bottom:1px solid #21262d;text-align:left}
-th{color:#8b949e;font-weight:normal;font-size:12px;text-transform:uppercase}
+th{color:#8b949e;font-weight:normal;font-size:12px}
 td{color:#c9d1d9}
 .winner-cell{color:#3fb950;font-weight:bold}
 .loser-cell{color:#f85149}
 .tie-cell{color:#8b949e}
-#radarChart{width:100%;height:400px}
-.conclusion{line-height:1.7;color:#c9d1d9}
 .basis{font-size:13px;color:#8b949e;margin-top:4px;line-height:1.6}
 .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:6px}
 .tag.w{background:#238636;color:#fff}
 .tag.l{background:#da3633;color:#fff}
 .tag.t{background:#30363d;color:#8b949e}
+.analysis-section{margin-bottom:18px}
+.analysis-section h3{font-size:15px;color:#f0883e;margin-bottom:8px}
+.analysis-section p{font-size:13.5px;color:#c9d1d9;line-height:1.8;margin-bottom:6px}
 .loading{text-align:center;padding:60px;color:#8b949e}
+.chart-card{min-height:420px}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:900px){.two-col{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -46,27 +59,43 @@ td{color:#c9d1d9}
 </div>
 
 <div class="card winner-box" id="winnerCard"></div>
+<div class="card" id="statCard"></div>
 
-<div class="card">
-<h2>雷达图：七维度能力对比</h2>
-<div id="radarChart"></div>
+<div class="two-col">
+  <div class="card chart-card"><h2>逐题得分对比（分组柱状图）</h2><div id="chartScore" class="chart"></div></div>
+  <div class="card chart-card"><h2>维度聚合得分（雷达图）</h2><div id="chartDim" class="chart"></div></div>
+</div>
+
+<div class="two-col">
+  <div class="card chart-card"><h2>响应延迟对比（ms）</h2><div id="chartLatency" class="chart"></div></div>
+  <div class="card chart-card"><h2>Token 消耗构成（堆叠柱状图）</h2><div id="chartTokens" class="chart"></div></div>
+</div>
+
+<div class="two-col">
+  <div class="card chart-card" id="codeCard"><h2>代码题沙箱通过率</h2><div id="chartCode" class="chart-sm"></div></div>
+  <div class="card chart-card"><h2>效率-成本权衡（散点图，气泡=得分）</h2><div id="chartScatter" class="chart"></div></div>
+</div>
+
+<div class="two-col">
+  <div class="card chart-card"><h2>胜场分布</h2><div id="chartWin" class="chart-sm"></div></div>
+  <div class="card chart-card" id="stabilityCard" style="display:none"><h2>跨轮稳定性（均值±标准差）</h2><div id="chartStability" class="chart"></div></div>
+</div>
+
+<div class="card" id="analysisCard">
+<h2>精确分析（规则化统计）</h2>
+<div id="analysisBody"></div>
 </div>
 
 <div class="card">
-<h2>逐题评分</h2>
+<h2>逐题评分明细</h2>
 <table id="scoreTable">
 <thead><tr><th>题目</th><th>维度</th><th>答案X</th><th>答案Y</th><th>胜方</th><th>依据</th></tr></thead>
 <tbody id="scoreBody"></tbody>
 </table>
 </div>
 
-<div class="card" id="conclusionCard">
-<h2>综合结论</h2>
-<div class="conclusion" id="conclusionText"></div>
-</div>
-
 <div class="card">
-<h2>答卷详情</h2>
+<h2>答卷详情（最后一轮）</h2>
 <details><summary style="cursor:pointer;color:#8b949e">展开答案X 原文</summary><pre id="ansXPre" style="white-space:pre-wrap;font-size:13px;margin-top:10px;color:#8b949e"></pre></details>
 <details><summary style="cursor:pointer;color:#8b949e;margin-top:8px">展开答案Y 原文</summary><pre id="ansYPre" style="white-space:pre-wrap;font-size:13px;margin-top:10px;color:#8b949e"></pre></details>
 </div>
@@ -75,6 +104,7 @@ td{color:#c9d1d9}
 <script>
 const params = new URLSearchParams(window.location.search);
 const jobId = params.get('job');
+const C = {x:'#58a6ff', y:'#f0883e'};
 
 if(!jobId){
   document.querySelector('.wrap').innerHTML='<div class="loading">缺少 job 参数，<a href="/">返回首页</a></div>';
@@ -89,10 +119,13 @@ async function loadReport(){
     const data = await r.json();
     renderReport(data);
   }catch(e){
-    // 尝试从 status 读
     try{
       const r2 = await fetch(`/api/eval/${jobId}/status`);
       const s = await r2.json();
+      if(s.state==='reviewing'){
+        document.querySelector('.wrap').innerHTML=`<div class="loading">该评测等待人工评审，<a href="/review.html?job=${jobId}">立即去评审 →</a></div>`;
+        return;
+      }
       if(s.state!=='completed'){
         document.querySelector('.wrap').innerHTML=`<div class="loading">评测进行中（${s.state}），请稍后刷新</div>`;
         return;
@@ -103,100 +136,266 @@ async function loadReport(){
 }
 
 function renderReport(data){
-  const v = data.verdict;
+  const v = data.verdict || {};
   const cfg = data.config || {};
   const tasks = data.tasks?.tasks || [];
-  const ansA = data.answers_a || {};
-  const ansB = data.answers_b || {};
-
+  const rep = data.report || null;
+  const s = rep ? rep.summary : null;
   const ma = cfg.model_a?.name || '?';
   const mb = cfg.model_b?.name || '?';
   const dsName = cfg.dataset_name || null;
   const repeatN = cfg.repeat_n || 1;
-  const seedInfo = cfg.seed != null ? `seed=${cfg.seed}` : '';
 
-  let subText = `${ma} vs ${mb} | 任务集: ${tasks.length} 题 | jobId: ${jobId}`;
+  let subText = `${ma} vs ${mb} | 任务集: ${tasks.length} 题 | 评审: 人工双盲 | jobId: ${jobId}`;
   if(dsName) subText += ` | 评测集: ${dsName}`;
   if(repeatN > 1) subText += ` | 重复 ${repeatN} 次取平均`;
-  if(seedInfo) subText += ` | ${seedInfo}`;
+  if(cfg.seed != null) subText += ` | seed=${cfg.seed}`;
   document.getElementById('subInfo').textContent = subText;
 
-  // 胜方展示
-  const totalX = v.totals?.answer_x || 0;
-  const totalY = v.totals?.answer_y || 0;
-  const winner = totalX > totalY ? '答案X' : totalY > totalX ? '答案Y' : '平局';
-  const revealed = v.revealed || {};
+  const xLabel = s ? s.x_model : (v.revealed?.answer_x || '答案X');
+  const yLabel = s ? s.y_model : (v.revealed?.answer_y || '答案Y');
+  const totalX = s ? s.total_x : (v.totals?.answer_x || 0);
+  const totalY = s ? s.total_y : (v.totals?.answer_y || 0);
 
+  const winner = totalX > totalY ? xLabel : totalY > totalX ? yLabel : '平局';
   document.getElementById('winnerCard').innerHTML = `
-    <div style="color:#8b949e;font-size:14px">胜方</div>
-    <div class="score">${winner}</div>
-    <div class="vs" style="font-size:18px">${int(totalX)} : ${int(totalY)}</div>
-    <div style="font-size:13px;color:#8b949e;margin-top:8px">
-      答案X = ${revealed.answer_x||'?'} (${ansA.model||'?'})&nbsp;&nbsp;
-      答案Y = ${revealed.answer_y||'?'} (${ansB.model||'?'})
-    </div>
+    <div class="label">胜方</div>
+    <div class="score">${esc(winner)}</div>
+    <div class="vs">${fmt(totalX)} : ${fmt(totalY)}</div>
+    <div class="detail">答案X = ${esc(xLabel)}&nbsp;&nbsp;|&nbsp;&nbsp;答案Y = ${esc(yLabel)}</div>
   `;
 
-  // 雷达图
-  const dimData = v.per_dimension || {};
-  const dimNames = Object.keys(dimData);
-  const xVals = dimNames.map(d=>dimData[d].x||0);
-  const yVals = dimNames.map(d=>dimData[d].y||0);
-  const maxPerDim = dimNames.map(d=>Math.max(dimData[d].x||0,dimData[d].y||0,10));
+  if(s){
+    const stats = [
+      {k:'满分', v:fmt(s.max_score)},
+      {k:'答案X 总分', v:fmt(s.total_x), c:s.winner==='answer_x'?'win':(s.winner==='answer_y'?'lose':'')},
+      {k:'答案Y 总分', v:fmt(s.total_y), c:s.winner==='answer_y'?'win':(s.winner==='answer_x'?'lose':'')},
+      {k:'平均分 X/Y', v:fmt(s.avg_x)+' / '+fmt(s.avg_y)},
+      {k:'胜场 X/Y/平', v:`${s.win_x}/${s.win_y}/${s.ties}`},
+      {k:'评测轮次', v:repeatN},
+    ];
+    document.getElementById('statCard').innerHTML = `<h2>核心指标</h2><div class="stat-grid">${stats.map(st=>`<div class="stat-box ${st.c||''}"><div class="v">${st.v}</div><div class="k">${st.k}</div></div>`).join('')}</div>`;
+    renderCharts(rep);
+    renderAnalysis(rep.analysis || []);
+  }else{
+    document.getElementById('statCard').style.display='none';
+    document.querySelectorAll('.chart-card').forEach(c=>c.style.display='none');
+    document.getElementById('analysisCard').style.display='none';
+  }
 
-  const chart = echarts.init(document.getElementById('radarChart'));
-  chart.setOption({
-    tooltip:{},
-    legend:{data:['答案X','答案Y'],textStyle:{color:'#c9d1d9'},top:0},
-    radar:{
-      indicator: dimNames.map((d,i)=>({name:d, max:maxPerDim[i]})),
-      shape:'circle',
-      axisName:{color:'#8b949e',fontSize:12},
-      splitArea:{areaStyle:{color:['#161b22','#1c2128']}},
-      splitLine:{lineStyle:{color:'#30363d'}},
-      axisLine:{lineStyle:{color:'#30363d'}},
-    },
-    series:[{
-      type:'radar',
-      data:[
-        {value:xVals,name:'答案X',lineStyle:{color:'#58a6ff'},areaStyle:{color:'rgba(88,166,255,0.15)'},itemStyle:{color:'#58a6ff'}},
-        {value:yVals,name:'答案Y',lineStyle:{color:'#f0883e'},areaStyle:{color:'rgba(240,136,62,0.15)'},itemStyle:{color:'#f0883e'}},
-      ]
-    }]
+  renderScoreTable(v);
+  const ansA = data.answers_a || {};
+  const ansB = data.answers_b || {};
+  document.getElementById('ansXPre').textContent = (ansA.answers||[]).map(a=>`[${a.id}]\n${a.raw_answer}`).join('\n\n');
+  document.getElementById('ansYPre').textContent = (ansB.answers||[]).map(a=>`[${a.id}]\n${a.raw_answer}`).join('\n\n');
+}
+
+function renderCharts(rep){
+  const ch = rep.charts || {};
+  const s = rep.summary || {};
+
+  const baseOpt = (legend, xAxisName, yAxisName) => ({
+    tooltip:{trigger:'axis'},
+    legend:{data:legend,textStyle:{color:'#c9d1d9'},top:0},
+    grid:{left:50,right:20,top:36,bottom:40},
+    xAxis:{type:'category',data:[],axisLabel:{color:'#8b949e'},axisLine:{lineStyle:{color:'#30363d'}}},
+    yAxis:{type:'value',name:yAxisName||'',nameTextStyle:{color:'#8b949e'},axisLabel:{color:'#8b949e'},splitLine:{lineStyle:{color:'#21262d'}}},
+    color:['#58a6ff','#f0883e'],
   });
 
-  // 评分表
+  // 1. 逐题得分
+  if(ch.score_by_question){
+    const d = ch.score_by_question;
+    const o = baseOpt(['答案X','答案Y'],'','得分');
+    o.xAxis.data = d.categories;
+    o.yAxis.max = 10;
+    o.series = [
+      {name:'答案X',type:'bar',data:d.x,itemStyle:{color:C.x},barMaxWidth:28},
+      {name:'答案Y',type:'bar',data:d.y,itemStyle:{color:C.y},barMaxWidth:28},
+    ];
+    echarts.init(document.getElementById('chartScore')).setOption(o);
+  }
+
+  // 2. 维度聚合（≥3 维度用雷达图，否则分组柱状）
+  if(ch.score_by_dimension){
+    const d = ch.score_by_dimension;
+    if(d.dimensions.length >= 3){
+      const el = document.getElementById('chartDim');
+      el.parentElement.querySelector('h2').textContent = '维度聚合得分（雷达图）';
+      echarts.init(el).setOption({
+        tooltip:{},
+        legend:{data:['答案X','答案Y'],textStyle:{color:'#c9d1d9'},top:0},
+        radar:{
+          indicator:d.dimensions.map(name=>({name,max:Math.max(...d.x,...d.y,10)})),
+          shape:'circle',axisName:{color:'#8b949e',fontSize:12},
+          splitArea:{areaStyle:{color:['#161b22','#1c2128']}},
+          splitLine:{lineStyle:{color:'#30363d'}},axisLine:{lineStyle:{color:'#30363d'}},
+        },
+        series:[{
+          type:'radar',
+          data:[
+            {value:d.x,name:'答案X',lineStyle:{color:C.x},areaStyle:{color:'rgba(88,166,255,0.15)'},itemStyle:{color:C.x}},
+            {value:d.y,name:'答案Y',lineStyle:{color:C.y},areaStyle:{color:'rgba(240,136,62,0.15)'},itemStyle:{color:C.y}},
+          ],
+        }],
+      });
+    }else{
+      const el = document.getElementById('chartDim');
+      el.parentElement.querySelector('h2').textContent = '维度聚合得分（分组柱状图）';
+      const o = baseOpt(['答案X','答案Y'],'','维度总分');
+      o.xAxis.data = d.dimensions;
+      o.series = [
+        {name:'答案X',type:'bar',data:d.x,itemStyle:{color:C.x},barMaxWidth:36},
+        {name:'答案Y',type:'bar',data:d.y,itemStyle:{color:C.y},barMaxWidth:36},
+      ];
+      echarts.init(el).setOption(o);
+    }
+  }
+
+  // 3. 延迟
+  if(ch.latency_by_question){
+    const d = ch.latency_by_question;
+    const o = baseOpt(['答案X','答案Y'],'','毫秒');
+    o.xAxis.data = d.categories;
+    o.series = [
+      {name:'答案X',type:'bar',data:d.x,itemStyle:{color:C.x},barMaxWidth:28},
+      {name:'答案Y',type:'bar',data:d.y,itemStyle:{color:C.y},barMaxWidth:28},
+    ];
+    echarts.init(document.getElementById('chartLatency')).setOption(o);
+  }
+
+  // 4. Token 堆叠
+  if(ch.tokens_by_question){
+    const d = ch.tokens_by_question;
+    const o = baseOpt(['X-prompt','X-completion','Y-prompt','Y-completion'],'','tokens');
+    o.xAxis.data = d.categories;
+    o.series = [
+      {name:'X-prompt',type:'bar',stack:'X',data:d.x_prompt,itemStyle:{color:'#1f6feb'},barMaxWidth:30},
+      {name:'X-completion',type:'bar',stack:'X',data:d.x_completion,itemStyle:{color:'#58a6ff'},barMaxWidth:30},
+      {name:'Y-prompt',type:'bar',stack:'Y',data:d.y_prompt,itemStyle:{color:'#b15e3c'},barMaxWidth:30},
+      {name:'Y-completion',type:'bar',stack:'Y',data:d.y_completion,itemStyle:{color:'#f0883e'},barMaxWidth:30},
+    ];
+    echarts.init(document.getElementById('chartTokens')).setOption(o);
+  }
+
+  // 5. 代码通过率
+  if(ch.code_pass_rate && ch.code_pass_rate.length){
+    const d = ch.code_pass_rate;
+    const cats = d.map(q=>q.id);
+    const xP = d.map(q=>q.x_passed), xT = d.map(q=>q.x_total);
+    const yP = d.map(q=>q.y_passed), yT = d.map(q=>q.y_total);
+    echarts.init(document.getElementById('chartCode')).setOption({
+      tooltip:{trigger:'axis',formatter:ps=>{
+        const q = d[ps[0].dataIndex];
+        return `${q.id}<br/>答案X 通过: ${q.x_passed}/${q.x_total}<br/>答案Y 通过: ${q.y_passed}/${q.y_total}`;
+      }},
+      legend:{data:['答案X 通过','答案X 未通过','答案Y 通过','答案Y 未通过'],textStyle:{color:'#c9d1d9'},top:0},
+      grid:{left:50,right:20,top:36,bottom:40},
+      xAxis:{type:'value',max:1,axisLabel:{color:'#8b949e',formatter:v=>v+'×'},splitLine:{lineStyle:{color:'#21262d'}}},
+      yAxis:{type:'category',data:cats,axisLabel:{color:'#8b949e'},axisLine:{lineStyle:{color:'#30363d'}}},
+      series:[
+        {name:'答案X 通过',type:'bar',stack:'x',data:xP.map((p,i)=>({value: xT[i]? p/xT[i]:0})),itemStyle:{color:'#3fb950'}},
+        {name:'答案X 未通过',type:'bar',stack:'x',data:xP.map((p,i)=>({value: xT[i]? (xT[i]-p)/xT[i]:0})),itemStyle:{color:'#da3633'}},
+        {name:'答案Y 通过',type:'bar',stack:'y',data:yP.map((p,i)=>({value: yT[i]? p/yT[i]:0})),itemStyle:{color:'#2ea043'}},
+        {name:'答案Y 未通过',type:'bar',stack:'y',data:yP.map((p,i)=>({value: yT[i]? (yT[i]-p)/yT[i]:0})),itemStyle:{color:'#f85149'}},
+      ],
+    });
+  }else{
+    document.getElementById('codeCard').style.display='none';
+  }
+
+  // 6. 效率散点
+  if(ch.efficiency_scatter){
+    const d = ch.efficiency_scatter;
+    const mk = (pts, name, color) => ({
+      name, type:'scatter',
+      symbolSize: v => 8 + v[2] * 3,
+      itemStyle:{color},
+      data: pts.map(p=>[p.latency_ms, p.completion_tokens, p.score, p.name]),
+    });
+    echarts.init(document.getElementById('chartScatter')).setOption({
+      tooltip:{formatter: p=>{
+        const d2 = p.data;
+        return `${d2[3]}: ${d2[0]} ms · ${d2[1]} tokens · 得分 ${d2[2]}`;
+      }},
+      legend:{data:['答案X','答案Y'],textStyle:{color:'#c9d1d9'},top:0},
+      grid:{left:60,right:20,top:36,bottom:45},
+      xAxis:{type:'value',name:'延迟(ms)',nameTextStyle:{color:'#8b949e'},axisLabel:{color:'#8b949e'},splitLine:{lineStyle:{color:'#21262d'}}},
+      yAxis:{type:'value',name:'输出 tokens',nameTextStyle:{color:'#8b949e'},axisLabel:{color:'#8b949e'},splitLine:{lineStyle:{color:'#21262d'}}},
+      series:[mk(d.x_points,'答案X',C.x), mk(d.y_points,'答案Y',C.y)],
+    });
+  }
+
+  // 7. 胜场分布
+  if(ch.win_distribution){
+    const d = ch.win_distribution;
+    const total = d.win_x + d.win_y + d.ties;
+    echarts.init(document.getElementById('chartWin')).setOption({
+      tooltip:{trigger:'item',formatter:'{b}: {c} 题 ({d}%)'},
+      legend:{textStyle:{color:'#c9d1d9'},bottom:0},
+      series:[{
+        type:'pie',radius:['40%','68%'],center:['50%','45%'],
+        label:{color:'#c9d1d9',formatter:'{b}: {c}'},
+        data:[
+          {value:d.win_x,name:'答案X 胜',itemStyle:{color:C.x}},
+          {value:d.win_y,name:'答案Y 胜',itemStyle:{color:C.y}},
+          {value:d.ties,name:'平局',itemStyle:{color:'#8b949e'}},
+        ],
+      }],
+    });
+  }
+
+  // 8. 稳定性（repeat>1）
+  if(ch.stability){
+    document.getElementById('stabilityCard').style.display='block';
+    const d = ch.stability;
+    const o = baseOpt(['答案X','答案Y'],'','平均分');
+    o.xAxis.data = d.categories;
+    o.yAxis.max = 10;
+    o.series = [
+      {name:'答案X',type:'bar',data:d.x.map((v,i)=>({value:v,itemStyle:{color:C.x}})),barMaxWidth:24},
+      {name:'答案Y',type:'bar',data:d.y.map((v,i)=>({value:v,itemStyle:{color:C.y}})),barMaxWidth:24},
+      {name:'X 标准差',type:'scatter',symbol:'diamond',symbolSize:10,itemStyle:{color:'#fff'},data:d.x_std.map((v,i)=>[i,v])},
+      {name:'Y 标准差',type:'scatter',symbol:'diamond',symbolSize:10,itemStyle:{color:'#000'},data:d.y_std.map((v,i)=>[i,v])},
+    ];
+    echarts.init(document.getElementById('chartStability')).setOption(o);
+  }
+}
+
+function renderAnalysis(sections){
+  if(!sections || !sections.length){
+    document.getElementById('analysisBody').innerHTML='<p style="color:#8b949e">无分析数据</p>';
+    return;
+  }
+  document.getElementById('analysisBody').innerHTML = sections.map(sec=>`
+    <div class="analysis-section"><h3>${esc(sec.title)}</h3>${sec.paragraphs.map(p=>`<p>${esc(p)}</p>`).join('')}</div>
+  `).join('');
+}
+
+function renderScoreTable(v){
   const scores = v.scores || [];
-  const isAvg = v.meta?.repeat_n > 1 || scores.some(s=>s.answer_x_std != null);
+  const isAvg = v.meta?.repeat_n > 1;
   const tbody = document.getElementById('scoreBody');
   tbody.innerHTML = scores.map(s=>{
     const winnerTag = s.winner==='tie'?'<span class="tag t">平</span>':
       s.winner==='answer_x'?'<span class="tag w">X胜</span>':'<span class="tag l">Y胜</span>';
     const xClass = s.winner==='answer_x'?'winner-cell':s.winner==='answer_y'?'loser-cell':'tie-cell';
     const yClass = s.winner==='answer_y'?'winner-cell':s.winner==='answer_x'?'loser-cell':'tie-cell';
-    const fmt = (sc, sd) => isAvg && sd ? `${sc}/10<span style="color:#8b949e;font-size:11px">±${sd}</span>` : `${sc}/10`;
+    const fmtS = (sc, sd) => isAvg && sd ? `${sc}/10<sup style="color:#8b949e">±${sd}</sup>` : `${sc}/10`;
     return `<tr>
-      <td><strong>${s.id}</strong></td>
-      <td>${s.dimension}</td>
-      <td class="${xClass}">${fmt(s.answer_x, s.answer_x_std)}</td>
-      <td class="${yClass}">${fmt(s.answer_y, s.answer_y_std)}</td>
+      <td><strong>${esc(s.id)}</strong></td>
+      <td>${esc(s.dimension)}</td>
+      <td class="${xClass}">${fmtS(s.answer_x, s.answer_x_std)}</td>
+      <td class="${yClass}">${fmtS(s.answer_y, s.answer_y_std)}</td>
       <td>${winnerTag}</td>
       <td><details><summary style="cursor:pointer;color:#8b949e">展开</summary><div class="basis">${esc(s.basis||'')}</div></details></td>
     </tr>`;
   }).join('');
-
-  // 结论
-  document.getElementById('conclusionText').textContent = v.conclusion || '无结论';
-
-  // 答卷原文
-  document.getElementById('ansXPre').textContent = (ansA.answers||[]).map(a=>`[${a.id}]\n${a.raw_answer}`).join('\n\n');
-  document.getElementById('ansYPre').textContent = (ansB.answers||[]).map(a=>`[${a.id}]\n${a.raw_answer}`).join('\n\n');
 }
 
-function int(n){return Math.round(n)}
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;')}
+function fmt(n){ return Math.round(n*100)/100; }
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
-// 导出原始 JSON
 async function exportJson(){
   try{
     const r = await fetch(`/api/eval/${jobId}/report`);
