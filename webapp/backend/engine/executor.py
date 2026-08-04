@@ -103,7 +103,7 @@ async def execute_task(
         temperature = config.get("temperature", 0.7) if repeat_index == 1 else 0.0
 
     raw_answer, api_info = await _call_one(
-        client, config["url"].rstrip("/"), config["key"], prompt,
+        client, config["url"].rstrip("/") + "/chat/completions", config["key"], prompt,
         temperature=temperature, max_tokens=max_tokens, top_p=top_p,
     )
     api_info["repeat_index"] = repeat_index

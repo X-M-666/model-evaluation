@@ -23,7 +23,7 @@ async def _call_judge_model(
     temperature: float = 0.0,
     max_tokens: int = 4096,
 ) -> str | None:
-    url = judge_config["url"].rstrip("/")
+    url = judge_config["url"].rstrip("/") + "/chat/completions"
     api_key = judge_config["key"]
     payload = {
         "messages": [{"role": "user", "content": prompt}],
