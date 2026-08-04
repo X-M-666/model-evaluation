@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行时数据与日志
+.eval/
+webapp/data/
+webapp/server*.log
+webapp/server.err.log
+
+# 编辑器
+.vscode/
+.idea/

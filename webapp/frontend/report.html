@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>评测报告 - 模型对决</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
+.wrap{max-width:1000px;margin:30px auto;padding:0 20px}
+h1{font-size:24px;color:#58a6ff;margin-bottom:6px}
+.sub{color:#8b949e;font-size:14px;margin-bottom:24px}
+a{color:#58a6ff;text-decoration:none}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;margin-bottom:16px}
+h2{font-size:17px;color:#58a6ff;margin-bottom:14px}
+.winner-box{text-align:center;padding:24px}
+.winner-box .big{font-size:28px;color:#f0883e;font-weight:bold}
+.winner-box .vs{color:#8b949e;margin:8px 0}
+.winner-box .score{font-size:40px;font-weight:bold;color:#f0883e}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:10px 12px;border-bottom:1px solid #21262d;text-align:left}
+th{color:#8b949e;font-weight:normal;font-size:12px;text-transform:uppercase}
+td{color:#c9d1d9}
+.winner-cell{color:#3fb950;font-weight:bold}
+.loser-cell{color:#f85149}
+.tie-cell{color:#8b949e}
+#radarChart{width:100%;height:400px}
+.conclusion{line-height:1.7;color:#c9d1d9}
+.basis{font-size:13px;color:#8b949e;margin-top:4px;line-height:1.6}
+.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:6px}
+.tag.w{background:#238636;color:#fff}
+.tag.l{background:#da3633;color:#fff}
+.tag.t{background:#30363d;color:#8b949e}
+.loading{text-align:center;padding:60px;color:#8b949e}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>📊 评测报告</h1>
+<p class="sub" id="subInfo">加载中...</p>
+<div style="margin-bottom:16px">
+<a href="/">← 返回配置</a>
+<span style="margin:0 8px;color:#30363d">|</span>
+<a href="#" onclick="exportJson();return false;">导出 JSON</a>
+</div>
+
+<div class="card winner-box" id="winnerCard"></div>
+
+<div class="card">
+<h2>雷达图：七维度能力对比</h2>
+<div id="radarChart"></div>
+</div>
+
+<div class="card">
+<h2>逐题评分</h2>
+<table id="scoreTable">
+<thead><tr><th>题目</th><th>维度</th><th>答案X</th><th>答案Y</th><th>胜方</th><th>依据</th></tr></thead>
+<tbody id="scoreBody"></tbody>
+</table>
+</div>
+
+<div class="card" id="conclusionCard">
+<h2>综合结论</h2>
+<div class="conclusion" id="conclusionText"></div>
+</div>
+
+<div class="card">
+<h2>答卷详情</h2>
+<details><summary style="cursor:pointer;color:#8b949e">展开答案X 原文</summary><pre id="ansXPre" style="white-space:pre-wrap;font-size:13px;margin-top:10px;color:#8b949e"></pre></details>
+<details><summary style="cursor:pointer;color:#8b949e;margin-top:8px">展开答案Y 原文</summary><pre id="ansYPre" style="white-space:pre-wrap;font-size:13px;margin-top:10px;color:#8b949e"></pre></details>
+</div>
+</div>
+
+<script>
+const params = new URLSearchParams(window.location.search);
+const jobId = params.get('job');
+
+if(!jobId){
+  document.querySelector('.wrap').innerHTML='<div class="loading">缺少 job 参数，<a href="/">返回首页</a></div>';
+}else{
+  loadReport();
+}
+
+async function loadReport(){
+  try{
+    const r = await fetch(`/api/eval/${jobId}/report`);
+    if(!r.ok) throw new Error('报告未找到或尚未完成');
+    const data = await r.json();
+    renderReport(data);
+  }catch(e){
+    // 尝试从 status 读
+    try{
+      const r2 = await fetch(`/api/eval/${jobId}/status`);
+      const s = await r2.json();
+      if(s.state!=='completed'){
+        document.querySelector('.wrap').innerHTML=`<div class="loading">评测进行中（${s.state}），请稍后刷新</div>`;
+        return;
+      }
+    }catch(_){}
+    document.querySelector('.wrap').innerHTML=`<div class="loading">加载失败: ${e}，<a href="/">返回首页</a></div>`;
+  }
+}
+
+function renderReport(data){
+  const v = data.verdict;
+  const cfg = data.config || {};
+  const tasks = data.tasks?.tasks || [];
+  const ansA = data.answers_a || {};
+  const ansB = data.answers_b || {};
+
+  const ma = cfg.model_a?.name || '?';
+  const mb = cfg.model_b?.name || '?';
+  const dsName = cfg.dataset_name || null;
+  const repeatN = cfg.repeat_n || 1;
+  const seedInfo = cfg.seed != null ? `seed=${cfg.seed}` : '';
+
+  let subText = `${ma} vs ${mb} | 任务集: ${tasks.length} 题 | jobId: ${jobId}`;
+  if(dsName) subText += ` | 评测集: ${dsName}`;
+  if(repeatN > 1) subText += ` | 重复 ${repeatN} 次取平均`;
+  if(seedInfo) subText += ` | ${seedInfo}`;
+  document.getElementById('subInfo').textContent = subText;
+
+  // 胜方展示
+  const totalX = v.totals?.answer_x || 0;
+  const totalY = v.totals?.answer_y || 0;
+  const winner = totalX > totalY ? '答案X' : totalY > totalX ? '答案Y' : '平局';
+  const revealed = v.revealed || {};
+
+  document.getElementById('winnerCard').innerHTML = `
+    <div style="color:#8b949e;font-size:14px">胜方</div>
+    <div class="score">${winner}</div>
+    <div class="vs" style="font-size:18px">${int(totalX)} : ${int(totalY)}</div>
+    <div style="font-size:13px;color:#8b949e;margin-top:8px">
+      答案X = ${revealed.answer_x||'?'} (${ansA.model||'?'})&nbsp;&nbsp;
+      答案Y = ${revealed.answer_y||'?'} (${ansB.model||'?'})
+    </div>
+  `;
+
+  // 雷达图
+  const dimData = v.per_dimension || {};
+  const dimNames = Object.keys(dimData);
+  const xVals = dimNames.map(d=>dimData[d].x||0);
+  const yVals = dimNames.map(d=>dimData[d].y||0);
+  const maxPerDim = dimNames.map(d=>Math.max(dimData[d].x||0,dimData[d].y||0,10));
+
+  const chart = echarts.init(document.getElementById('radarChart'));
+  chart.setOption({
+    tooltip:{},
+    legend:{data:['答案X','答案Y'],textStyle:{color:'#c9d1d9'},top:0},
+    radar:{
+      indicator: dimNames.map((d,i)=>({name:d, max:maxPerDim[i]})),
+      shape:'circle',
+      axisName:{color:'#8b949e',fontSize:12},
+      splitArea:{areaStyle:{color:['#161b22','#1c2128']}},
+      splitLine:{lineStyle:{color:'#30363d'}},
+      axisLine:{lineStyle:{color:'#30363d'}},
+    },
+    series:[{
+      type:'radar',
+      data:[
+        {value:xVals,name:'答案X',lineStyle:{color:'#58a6ff'},areaStyle:{color:'rgba(88,166,255,0.15)'},itemStyle:{color:'#58a6ff'}},
+        {value:yVals,name:'答案Y',lineStyle:{color:'#f0883e'},areaStyle:{color:'rgba(240,136,62,0.15)'},itemStyle:{color:'#f0883e'}},
+      ]
+    }]
+  });
+
+  // 评分表
+  const scores = v.scores || [];
+  const isAvg = v.meta?.repeat_n > 1 || scores.some(s=>s.answer_x_std != null);
+  const tbody = document.getElementById('scoreBody');
+  tbody.innerHTML = scores.map(s=>{
+    const winnerTag = s.winner==='tie'?'<span class="tag t">平</span>':
+      s.winner==='answer_x'?'<span class="tag w">X胜</span>':'<span class="tag l">Y胜</span>';
+    const xClass = s.winner==='answer_x'?'winner-cell':s.winner==='answer_y'?'loser-cell':'tie-cell';
+    const yClass = s.winner==='answer_y'?'winner-cell':s.winner==='answer_x'?'loser-cell':'tie-cell';
+    const fmt = (sc, sd) => isAvg && sd ? `${sc}/10<span style="color:#8b949e;font-size:11px">±${sd}</span>` : `${sc}/10`;
+    return `<tr>
+      <td><strong>${s.id}</strong></td>
+      <td>${s.dimension}</td>
+      <td class="${xClass}">${fmt(s.answer_x, s.answer_x_std)}</td>
+      <td class="${yClass}">${fmt(s.answer_y, s.answer_y_std)}</td>
+      <td>${winnerTag}</td>
+      <td><details><summary style="cursor:pointer;color:#8b949e">展开</summary><div class="basis">${esc(s.basis||'')}</div></details></td>
+    </tr>`;
+  }).join('');
+
+  // 结论
+  document.getElementById('conclusionText').textContent = v.conclusion || '无结论';
+
+  // 答卷原文
+  document.getElementById('ansXPre').textContent = (ansA.answers||[]).map(a=>`[${a.id}]\n${a.raw_answer}`).join('\n\n');
+  document.getElementById('ansYPre').textContent = (ansB.answers||[]).map(a=>`[${a.id}]\n${a.raw_answer}`).join('\n\n');
+}
+
+function int(n){return Math.round(n)}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;')}
+
+// 导出原始 JSON
+async function exportJson(){
+  try{
+    const r = await fetch(`/api/eval/${jobId}/report`);
+    const data = await r.json();
+    const blob = new Blob([JSON.stringify(data,null,2)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `eval-${jobId}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }catch(e){
+    alert('导出失败: '+e);
+  }
+}
+</script>
+</body>
+</html>
