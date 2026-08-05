@@ -153,7 +153,7 @@ async def test_connection(config: StartRequest):
     for label, cfg in [("model_a", config.model_a), ("model_b", config.model_b)]:
         try:
             url = cfg.url.rstrip("/") + "/chat/completions"
-            payload = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 8}
+            payload = {"model": cfg.name, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 8}
             headers = {"Authorization": f"Bearer {cfg.key}", "Content-Type": "application/json"}
             async with httpx.AsyncClient() as client:
                 resp = await client.post(url, json=payload, headers=headers, timeout=15)

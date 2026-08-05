@@ -23,12 +23,14 @@ async def _call_one(
     url: str,
     api_key: str,
     prompt: str,
+    model_name: str = "",
     temperature: float = 0.7,
     max_tokens: int = 4096,
     top_p: float | None = None,
 ) -> dict[str, Any]:
     """向单个模型发请求并返回 api_info 结构。"""
     payload: dict[str, Any] = {
+        "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -104,7 +106,7 @@ async def execute_task(
 
     raw_answer, api_info = await _call_one(
         client, config["url"].rstrip("/") + "/chat/completions", config["key"], prompt,
-        temperature=temperature, max_tokens=max_tokens, top_p=top_p,
+        model_name=config["name"], temperature=temperature, max_tokens=max_tokens, top_p=top_p,
     )
     api_info["repeat_index"] = repeat_index
 

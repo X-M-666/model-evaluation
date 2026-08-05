@@ -30,6 +30,8 @@ async def _call_judge_model(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if judge_config.get("name"):
+        payload["model"] = judge_config["name"]
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     try:
         resp = await client.post(url, json=payload, headers=headers, timeout=180)
