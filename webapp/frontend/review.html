@@ -69,7 +69,7 @@ h3{font-size:15px;color:#c9d1d9;margin-bottom:8px}
 
 <div class="sticky-bar" id="stickyBar" style="display:none">
   <span class="progress-text" id="progressText"></span>
-  <button class="btn" id="submitBtn" onclick="submitReview()" disabled>提交评审</button>
+  <button class="btn" id="submitBtn" disabled>提交评审</button>
 </div>
 </div>
 
@@ -79,6 +79,18 @@ const jobId = params.get('job');
 let DATA = null;
 const DRAFT_KEY = 'review-draft-' + jobId;
 
+function getToken(){ return localStorage.getItem('duel_token') || ''; }
+async function apiFetch(url, opts={}){
+  const headers = Object.assign({}, opts.headers);
+  const token = getToken();
+  if(token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(url, Object.assign({}, opts, {headers}));
+  if(r.status === 401){
+    throw new Error('未授权：请在首页顶部设置访问令牌');
+  }
+  return r;
+}
+
 if(!jobId){
   document.getElementById('content').innerHTML='<div class="loading">缺少 job 参数，<a href="/">返回首页</a></div>';
 }else{
@@ -87,7 +99,7 @@ if(!jobId){
 
 async function loadReview(){
   try{
-    const r = await fetch(`/api/eval/${jobId}/review`);
+    const r = await apiFetch(`/api/eval/${jobId}/review`);
     if(!r.ok) throw new Error((await r.json()).detail || '加载失败');
     DATA = await r.json();
     render();
@@ -144,7 +156,11 @@ function answerBox(label, ans, side){
     runsHtml = `<div class="runs">两次运行（稳定性校验）：${ans.repeat_runs.map((r,i)=>`<div class="run"><strong>第${i+1}次：</strong>${esc(r)||'(空)'}</div>`).join('')}</div>`;
   }
   const cv = ans.code_verify;
-  const cvHtml = cv ? `<div class="code-verify"><span class="badge ${cv.passed===cv.total?'dim':'err'}">沙箱验证 ${cv.passed}/${cv.total} 用例通过</span></div>` : '';
+  const cvText = cv
+    ? (cv.status==='run' ? `代码验真 ${cv.passed}/${cv.total} 用例通过` : (cv.status==='error' ? '代码验真执行异常（可能已部分执行）' : '代码验真未执行'))
+    : '代码验真未执行';
+  const cvClass = cv ? (cv.status==='run' ? (cv.passed===cv.total?'dim':'err') : (cv.status==='error' ? 'err' : 'dim')) : 'dim';
+  const cvHtml = cv ? `<div class="code-verify"><span class="badge ${cvClass}">${cvText}</span></div>` : '';
   return `<div class="answer-box">
     <div class="label ${side}">${label} ${statusBadge}</div>
     <pre>${esc(ans.raw_answer||'(无回答)')}</pre>
@@ -234,13 +250,15 @@ async function submitReview(){
   const btn = document.getElementById('submitBtn');
   btn.disabled = true; btn.textContent = '提交中...';
   try{
-    const r = await fetch(`/api/eval/${jobId}/review`, {
+    const r = await apiFetch(`/api/eval/${jobId}/review`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({scores}),
     });
     if(!r.ok){
       const err = await r.json();
-      throw new Error(err.detail || '提交失败');
+      const msg = typeof err.detail === 'object' && err.detail
+        ? (err.detail.message || '提交失败') : (err.detail || '提交失败');
+      throw new Error(msg);
     }
     btn.textContent = '已提交，正在生成报告...';
     localStorage.removeItem(DRAFT_KEY);
@@ -251,7 +269,9 @@ async function submitReview(){
   }
 }
 
-function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+document.getElementById('submitBtn').addEventListener('click', submitReview);
 </script>
 </body>
 </html>

@@ -163,7 +163,7 @@ def prepare_mock_job(seed: int | None = None) -> dict[str, Any]:
             }
             if is_code:
                 passed = random.choice([4, 5, 5, 5])  # 大多数全过
-                entry["code_verify"] = {"passed": passed, "total": 5}
+                entry["code_verify"] = {"status": "run", "passed": passed, "total": 5}
             ans_dict["answers"].append(entry)
 
     save_answers(job_id, "a", answers_a)

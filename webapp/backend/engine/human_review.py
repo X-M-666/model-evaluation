@@ -174,57 +174,139 @@ def build_round_verdict(
     }
 
 
+def _stable_scores(round_verdict: dict[str, Any]) -> list[dict[str, Any]]:
+    """把一轮 verdict 的 X/Y 分数按该轮 reveal 归一化为稳定模型分数。
+
+    每轮的 X/Y 身份独立随机（answer_x_file 可为 "a" 或 "b"），
+    跨轮统计必须以此处归一化后的 model_a/model_b 为主键。
+
+    Returns:
+        [{"id": ..., "dimension": ..., "model_a": float, "model_b": float}, ...]
+    """
+    revealed = round_verdict.get("revealed", {})
+    x_file = revealed.get("answer_x_file", "a")
+    rows = []
+    for s in round_verdict.get("scores", []):
+        if x_file == "a":
+            model_a, model_b = s["answer_x"], s["answer_y"]
+        else:
+            model_a, model_b = s["answer_y"], s["answer_x"]
+        rows.append({
+            "id": s["id"],
+            "dimension": s.get("dimension", "自定义"),
+            "model_a": model_a,
+            "model_b": model_b,
+        })
+    return rows
+
+
+def _stable_names(round_verdict: dict[str, Any]) -> dict[str, str]:
+    """从一轮 reveal 反查稳定模型名：{"a": 模型A名, "b": 模型B名}。"""
+    revealed = round_verdict.get("revealed", {})
+    if revealed.get("answer_x_file") == "a":
+        return {
+            "a": revealed.get("answer_x", "模型A"),
+            "b": revealed.get("answer_y", "模型B"),
+        }
+    return {
+        "b": revealed.get("answer_x", "模型A"),
+        "a": revealed.get("answer_y", "模型B"),
+    }
+
+
 def build_final_verdict(
     round_verdicts: list[dict[str, Any]],
     repeat_n: int,
 ) -> dict[str, Any]:
-    """多轮聚合（repeat_n>1 时取平均分与标准差）；单轮直接返回。"""
+    """多轮聚合（repeat_n>1 时取平均分与标准差）；单轮直接返回。
+
+    跨轮统计始终以稳定模型（model_a/model_b）为主键：每轮先按该轮
+    reveal 归一化，再聚合均值/标准差/胜负/维度汇总；胜方在稳定空间
+    判定后，用固定的展示映射（最后一轮 reveal）把结果投影回
+    answer_x/answer_y 展示字段，保证报告与前端无需感知身份变化。
+    """
     if repeat_n <= 1:
         v = round_verdicts[0]
         v["meta"] = {**v.get("meta", {}), "repeat_n": 1}
         for s in v.get("scores", []):
             s.pop("_invalid", None)
+            s["answer_x_median"] = s.get("answer_x", 0)
+            s["answer_y_median"] = s.get("answer_y", 0)
+        v["meta"]["round_reveals"] = [
+            {
+                "answer_x_file": v.get("revealed", {}).get("answer_x_file", "a"),
+                "answer_y_file": v.get("revealed", {}).get("answer_y_file", "b"),
+            }
+        ]
         return v
 
     last = round_verdicts[-1]
-    scores_map: dict[str, list[dict]] = {}
+    names = _stable_names(last)
+    stable_map: dict[str, list[dict]] = {}
     for v in round_verdicts:
-        for s in v.get("scores", []):
-            scores_map.setdefault(s["id"], []).append(s)
+        for r in _stable_scores(v):
+            stable_map.setdefault(r["id"], []).append(r)
 
     avg_scores: list[dict[str, Any]] = []
     dim_totals: dict[str, dict[str, float]] = {}
-    for tid, round_scores in scores_map.items():
-        x_vals = [s["answer_x"] for s in round_scores]
-        y_vals = [s["answer_y"] for s in round_scores]
-        x_mean = statistics.mean(x_vals)
-        y_mean = statistics.mean(y_vals)
-        winner = "tie" if abs(x_mean - y_mean) < EPS else (
-            "answer_x" if x_mean > y_mean else "answer_y"
-        )
+    for tid, round_scores in stable_map.items():
+        a_vals = [r["model_a"] for r in round_scores]
+        b_vals = [r["model_b"] for r in round_scores]
+        a_mean = statistics.mean(a_vals)
+        b_mean = statistics.mean(b_vals)
         dim = round_scores[0]["dimension"]
         if dim not in dim_totals:
-            dim_totals[dim] = {"x": 0.0, "y": 0.0}
-        dim_totals[dim]["x"] += x_mean
-        dim_totals[dim]["y"] += y_mean
+            dim_totals[dim] = {"a": 0.0, "b": 0.0}
+        dim_totals[dim]["a"] += a_mean
+        dim_totals[dim]["b"] += b_mean
         avg_scores.append({
             "id": tid,
             "dimension": dim,
-            "answer_x": round(x_mean, 2),
-            "answer_y": round(y_mean, 2),
-            "answer_x_std": round(statistics.stdev(x_vals), 2) if len(x_vals) > 1 else 0,
-            "answer_y_std": round(statistics.stdev(y_vals), 2) if len(y_vals) > 1 else 0,
-            "winner": winner,
-            "basis": f"{repeat_n}轮人工评审平均（原始{len(round_scores)}轮数据）",
-            "arbiter_note": "",
+            "model_a": round(a_mean, 2),
+            "model_b": round(b_mean, 2),
+            "model_a_std": round(statistics.stdev(a_vals), 2) if len(a_vals) > 1 else 0,
+            "model_b_std": round(statistics.stdev(b_vals), 2) if len(b_vals) > 1 else 0,
+            "model_a_median": round(statistics.median(a_vals), 2),
+            "model_b_median": round(statistics.median(b_vals), 2),
         })
 
-    total_x = round(sum(d["x"] for d in dim_totals.values()), 2)
-    total_y = round(sum(d["y"] for d in dim_totals.values()), 2)
+    total_a = round(sum(d["a"] for d in dim_totals.values()), 2)
+    total_b = round(sum(d["b"] for d in dim_totals.values()), 2)
+    if total_a > total_b:
+        winner_model = names["a"]
+    elif total_b > total_a:
+        winner_model = names["b"]
+    else:
+        winner_model = "tie"
+
+    x_file = last.get("revealed", {}).get("answer_x_file", "a")
+
+    def _project(avg: dict[str, Any], field_a: str, field_b: str) -> float:
+        return avg[field_a] if x_file == "a" else avg[field_b]
+
+    for avg in avg_scores:
+        avg["answer_x"] = round(_project(avg, "model_a", "model_b"), 2)
+        avg["answer_y"] = round(_project(avg, "model_b", "model_a"), 2)
+        avg["answer_x_std"] = round(_project(avg, "model_a_std", "model_b_std"), 2)
+        avg["answer_y_std"] = round(_project(avg, "model_b_std", "model_a_std"), 2)
+        avg["answer_x_median"] = round(_project(avg, "model_a_median", "model_b_median"), 2)
+        avg["answer_y_median"] = round(_project(avg, "model_b_median", "model_a_median"), 2)
+        avg["winner"] = "tie" if abs(avg["answer_x"] - avg["answer_y"]) < EPS else (
+            "answer_x" if avg["answer_x"] > avg["answer_y"] else "answer_y"
+        )
+        avg["basis"] = f"{repeat_n}轮人工评审平均（原始{len(stable_map[avg['id']])}轮数据）"
+        avg["arbiter_note"] = ""
+
+    per_dimension = {
+        d: {
+            "answer_x": round(vals["a"] if x_file == "a" else vals["b"], 2),
+            "answer_y": round(vals["b"] if x_file == "a" else vals["a"], 2),
+        }
+        for d, vals in dim_totals.items()
+    }
+    total_x = round(total_a if x_file == "a" else total_b, 2)
+    total_y = round(total_b if x_file == "a" else total_a, 2)
     revealed = last.get("revealed", {})
-    winner_model = revealed.get("answer_x") if total_x > total_y else (
-        revealed.get("answer_y") if total_y > total_x else "tie"
-    )
 
     return {
         "meta": {
@@ -233,9 +315,16 @@ def build_final_verdict(
             "invalid": 0,
             "tie_arbitrated": 0,
             "repeat_n": repeat_n,
+            "round_reveals": [
+                {
+                    "answer_x_file": rv.get("revealed", {}).get("answer_x_file", "a"),
+                    "answer_y_file": rv.get("revealed", {}).get("answer_y_file", "b"),
+                }
+                for rv in round_verdicts
+            ],
         },
         "scores": avg_scores,
-        "per_dimension": dim_totals,
+        "per_dimension": per_dimension,
         "totals": {"answer_x": total_x, "answer_y": total_y},
         "revealed": revealed,
         "conclusion": f"经过{repeat_n}轮人工评审取平均",

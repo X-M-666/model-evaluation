@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>评测报告 - 模型对决</title>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script src="/static/echarts.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
@@ -55,7 +55,7 @@ td{color:#c9d1d9}
 <div style="margin-bottom:16px">
 <a href="/">← 返回配置</a>
 <span style="margin:0 8px;color:#30363d">|</span>
-<a href="#" onclick="exportJson();return false;">导出 JSON</a>
+<a href="#" id="exportJsonLink">导出 JSON</a>
 </div>
 
 <div class="card winner-box" id="winnerCard"></div>
@@ -95,9 +95,8 @@ td{color:#c9d1d9}
 </div>
 
 <div class="card">
-<h2>答卷详情（最后一轮）</h2>
-<details><summary style="cursor:pointer;color:#8b949e">展开答案X 原文</summary><pre id="ansXPre" style="white-space:pre-wrap;font-size:13px;margin-top:10px;color:#8b949e"></pre></details>
-<details><summary style="cursor:pointer;color:#8b949e;margin-top:8px">展开答案Y 原文</summary><pre id="ansYPre" style="white-space:pre-wrap;font-size:13px;margin-top:10px;color:#8b949e"></pre></details>
+<h2>答卷详情</h2>
+<div id="ansRounds"></div>
 </div>
 </div>
 
@@ -105,6 +104,18 @@ td{color:#c9d1d9}
 const params = new URLSearchParams(window.location.search);
 const jobId = params.get('job');
 const C = {x:'#58a6ff', y:'#f0883e'};
+
+function getToken(){ return localStorage.getItem('duel_token') || ''; }
+async function apiFetch(url, opts={}){
+  const headers = Object.assign({}, opts.headers);
+  const token = getToken();
+  if(token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(url, Object.assign({}, opts, {headers}));
+  if(r.status === 401){
+    throw new Error('未授权：请在首页顶部设置访问令牌');
+  }
+  return r;
+}
 
 if(!jobId){
   document.querySelector('.wrap').innerHTML='<div class="loading">缺少 job 参数，<a href="/">返回首页</a></div>';
@@ -114,24 +125,24 @@ if(!jobId){
 
 async function loadReport(){
   try{
-    const r = await fetch(`/api/eval/${jobId}/report`);
+    const r = await apiFetch(`/api/eval/${jobId}/report`);
     if(!r.ok) throw new Error('报告未找到或尚未完成');
     const data = await r.json();
     renderReport(data);
   }catch(e){
     try{
-      const r2 = await fetch(`/api/eval/${jobId}/status`);
+      const r2 = await apiFetch(`/api/eval/${jobId}/status`);
       const s = await r2.json();
       if(s.state==='reviewing'){
-        document.querySelector('.wrap').innerHTML=`<div class="loading">该评测等待人工评审，<a href="/review.html?job=${jobId}">立即去评审 →</a></div>`;
+        document.querySelector('.wrap').innerHTML=`<div class="loading">该评测等待人工评审，<a href="/review.html?job=${esc(jobId)}">立即去评审 →</a></div>`;
         return;
       }
       if(s.state!=='completed'){
-        document.querySelector('.wrap').innerHTML=`<div class="loading">评测进行中（${s.state}），请稍后刷新</div>`;
+        document.querySelector('.wrap').innerHTML=`<div class="loading">评测进行中（${esc(s.state)}），请稍后刷新</div>`;
         return;
       }
     }catch(_){}
-    document.querySelector('.wrap').innerHTML=`<div class="loading">加载失败: ${e}，<a href="/">返回首页</a></div>`;
+    document.querySelector('.wrap').innerHTML=`<div class="loading">加载失败: ${esc(e)}，<a href="/">返回首页</a></div>`;
   }
 }
 
@@ -183,11 +194,8 @@ function renderReport(data){
     document.getElementById('analysisCard').style.display='none';
   }
 
-  renderScoreTable(v);
-  const ansA = data.answers_a || {};
-  const ansB = data.answers_b || {};
-  document.getElementById('ansXPre').textContent = (ansA.answers||[]).map(a=>`[${a.id}]\n${a.raw_answer}`).join('\n\n');
-  document.getElementById('ansYPre').textContent = (ansB.answers||[]).map(a=>`[${a.id}]\n${a.raw_answer}`).join('\n\n');
+  renderScoreTable(v, data.round_scores);
+  renderAnswers(data);
 }
 
 function renderCharts(rep){
@@ -195,7 +203,7 @@ function renderCharts(rep){
   const s = rep.summary || {};
 
   const baseOpt = (legend, xAxisName, yAxisName) => ({
-    tooltip:{trigger:'axis'},
+    tooltip:{trigger:'axis',renderMode:'richText'},
     legend:{data:legend,textStyle:{color:'#c9d1d9'},top:0},
     grid:{left:50,right:20,top:36,bottom:40},
     xAxis:{type:'category',data:[],axisLabel:{color:'#8b949e'},axisLine:{lineStyle:{color:'#30363d'}}},
@@ -223,7 +231,7 @@ function renderCharts(rep){
       const el = document.getElementById('chartDim');
       el.parentElement.querySelector('h2').textContent = '维度聚合得分（雷达图）';
       echarts.init(el).setOption({
-        tooltip:{},
+        tooltip:{renderMode:'richText'},
         legend:{data:['答案X','答案Y'],textStyle:{color:'#c9d1d9'},top:0},
         radar:{
           indicator:d.dimensions.map(name=>({name,max:Math.max(...d.x,...d.y,10)})),
@@ -285,7 +293,7 @@ function renderCharts(rep){
     const xP = d.map(q=>q.x_passed), xT = d.map(q=>q.x_total);
     const yP = d.map(q=>q.y_passed), yT = d.map(q=>q.y_total);
     echarts.init(document.getElementById('chartCode')).setOption({
-      tooltip:{trigger:'axis',formatter:ps=>{
+      tooltip:{trigger:'axis',renderMode:'richText',formatter:ps=>{
         const q = d[ps[0].dataIndex];
         return `${q.id}<br/>答案X 通过: ${q.x_passed}/${q.x_total}<br/>答案Y 通过: ${q.y_passed}/${q.y_total}`;
       }},
@@ -314,7 +322,7 @@ function renderCharts(rep){
       data: pts.map(p=>[p.latency_ms, p.completion_tokens, p.score, p.name]),
     });
     echarts.init(document.getElementById('chartScatter')).setOption({
-      tooltip:{formatter: p=>{
+      tooltip:{renderMode:'richText',formatter: p=>{
         const d2 = p.data;
         return `${d2[3]}: ${d2[0]} ms · ${d2[1]} tokens · 得分 ${d2[2]}`;
       }},
@@ -331,7 +339,7 @@ function renderCharts(rep){
     const d = ch.win_distribution;
     const total = d.win_x + d.win_y + d.ties;
     echarts.init(document.getElementById('chartWin')).setOption({
-      tooltip:{trigger:'item',formatter:'{b}: {c} 题 ({d}%)'},
+      tooltip:{trigger:'item',renderMode:'richText',formatter:'{b}: {c} 题 ({d}%)'},
       legend:{textStyle:{color:'#c9d1d9'},bottom:0},
       series:[{
         type:'pie',radius:['40%','68%'],center:['50%','45%'],
@@ -372,33 +380,82 @@ function renderAnalysis(sections){
   `).join('');
 }
 
-function renderScoreTable(v){
+function renderAnswers(data){
+  const rounds = data.rounds;
+  const box = document.getElementById('ansRounds');
+  const ansText = (ans, label) => {
+    const rows = (ans && ans.answers) ? ans.answers : [];
+    const meta = a => {
+      const api = a.api_info || {};
+      const bits = [];
+      if(api.latency_ms) bits.push(api.latency_ms + ' ms');
+      if(api.prompt_tokens != null || api.completion_tokens != null) bits.push(`tokens ${api.prompt_tokens||0}+${api.completion_tokens||0}`);
+      if(api.status && api.status !== 'ok') bits.push('状态:' + api.status);
+      if(a.code_verify && a.code_verify.status === 'run') bits.push(`代码通过 ${a.code_verify.passed}/${a.code_verify.total}`);
+      return bits.length ? `<div class="basis">${esc(bits.join(' · '))}</div>` : '';
+    };
+    return rows.map(a=>`<pre style="white-space:pre-wrap;font-size:13px;margin-top:10px;color:#8b949e">[${esc(a.id)}]${meta(a)}\n${esc(a.raw_answer||'(无回答)')}</pre>`).join('\n') || '<div class="basis">无数据</div>';
+  };
+  if(rounds && rounds.length){
+    box.innerHTML = rounds.map(r=>`
+      <details${rounds.length>1?'':''}>
+        <summary style="cursor:pointer;color:#8b949e;margin-top:8px">第 ${r.round} 轮 · 答案X 原文（${esc(r.answers_x?.model||'答案X')}）</summary>
+        ${ansText(r.answers_x)}
+      </details>
+      <details${rounds.length>1?'':''}>
+        <summary style="cursor:pointer;color:#8b949e;margin-top:8px">第 ${r.round} 轮 · 答案Y 原文（${esc(r.answers_y?.model||'答案Y')}）</summary>
+        ${ansText(r.answers_y)}
+      </details>
+    `).join('');
+    return;
+  }
+  // 旧响应无 rounds 字段时兜底 A/B
+  const ansX = data.answers_x || data.answers_a || {};
+  const ansY = data.answers_y || data.answers_b || {};
+  box.innerHTML = `
+    <details><summary style="cursor:pointer;color:#8b949e">展开答案X 原文</summary>${ansText(ansX)}</details>
+    <details><summary style="cursor:pointer;color:#8b949e;margin-top:8px">展开答案Y 原文</summary>${ansText(ansY)}</details>`;
+}
+
+function renderScoreTable(v, roundScores){
   const scores = v.scores || [];
   const isAvg = v.meta?.repeat_n > 1;
+  const hasRoundDetail = Array.isArray(roundScores) && roundScores.length > 1;
   const tbody = document.getElementById('scoreBody');
   tbody.innerHTML = scores.map(s=>{
     const winnerTag = s.winner==='tie'?'<span class="tag t">平</span>':
       s.winner==='answer_x'?'<span class="tag w">X胜</span>':'<span class="tag l">Y胜</span>';
     const xClass = s.winner==='answer_x'?'winner-cell':s.winner==='answer_y'?'loser-cell':'tie-cell';
     const yClass = s.winner==='answer_y'?'winner-cell':s.winner==='answer_x'?'loser-cell':'tie-cell';
-    const fmtS = (sc, sd) => isAvg && sd ? `${sc}/10<sup style="color:#8b949e">±${sd}</sup>` : `${sc}/10`;
+    const fmtS = (sc, sd, md) => {
+      let t = `${sc}/10`;
+      if(isAvg && sd) t += `<sup style="color:#8b949e">±${sd}</sup>`;
+      if(isAvg && md != null) t += `<span style="font-size:11px;color:#8b949e"> 中位 ${md}</span>`;
+      return t;
+    };
+    const roundLines = hasRoundDetail ? roundScores.map(rs=>{
+      const rsx = (rs.scores||[]).find(x=>x.id===s.id);
+      if(!rsx) return '';
+      const wTag = rsx.winner==='tie'?'平':rsx.winner==='answer_x'?'X胜':'Y胜';
+      return `<div class="basis">第 ${rs.round} 轮：X ${rsx.answer_x} 分 / Y ${rsx.answer_y} 分（${wTag}）</div>`;
+    }).join('') : '';
     return `<tr>
       <td><strong>${esc(s.id)}</strong></td>
       <td>${esc(s.dimension)}</td>
-      <td class="${xClass}">${fmtS(s.answer_x, s.answer_x_std)}</td>
-      <td class="${yClass}">${fmtS(s.answer_y, s.answer_y_std)}</td>
+      <td class="${xClass}">${fmtS(s.answer_x, s.answer_x_std, s.answer_x_median)}</td>
+      <td class="${yClass}">${fmtS(s.answer_y, s.answer_y_std, s.answer_y_median)}</td>
       <td>${winnerTag}</td>
-      <td><details><summary style="cursor:pointer;color:#8b949e">展开</summary><div class="basis">${esc(s.basis||'')}</div></details></td>
+      <td><details><summary style="cursor:pointer;color:#8b949e">展开</summary><div class="basis">${esc(s.basis||'')}</div>${roundLines}</details></td>
     </tr>`;
   }).join('');
 }
 
 function fmt(n){ return Math.round(n*100)/100; }
-function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
 async function exportJson(){
   try{
-    const r = await fetch(`/api/eval/${jobId}/report`);
+    const r = await apiFetch(`/api/eval/${jobId}/report`);
     const data = await r.json();
     const blob = new Blob([JSON.stringify(data,null,2)], {type:'application/json'});
     const a = document.createElement('a');
@@ -410,6 +467,12 @@ async function exportJson(){
     alert('导出失败: '+e);
   }
 }
+
+const exportLink = document.getElementById('exportJsonLink');
+if(exportLink) exportLink.addEventListener('click', e=>{
+  e.preventDefault();
+  exportJson();
+});
 </script>
 </body>
 </html>

@@ -92,10 +92,10 @@ def parse_markdown(raw: str) -> dict[str, Any]:
         elif stripped.startswith("## "):
             _flush()
             cur_dim = stripped[3:].strip() or "自定义"
-        elif stripped.startswith("### "):
+        elif stripped == "###" or stripped.startswith("### "):
             _flush()
             auto_no += 1
-            cur_id = stripped[4:].strip() or f"T{auto_no}"
+            cur_id = stripped[3:].strip() or f"T{auto_no}"
         elif stripped.startswith(">"):
             if not tasks and not cur_id:
                 description = (description + " " + stripped[1:].strip()).strip()

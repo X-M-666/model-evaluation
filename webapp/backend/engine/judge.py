@@ -43,6 +43,16 @@ async def _call_judge_model(
         return None
 
 
+def _fmt_code_verify(cv: dict) -> str:
+    """格式化代码验真结果：未执行/异常时明确标注，避免误读为 0/N。"""
+    if not cv or cv.get("status") != "run":
+        if cv and cv.get("status") == "error":
+            return f"执行异常（可能已部分执行）：{cv.get('reason') or '未知错误'}"
+        reason = cv.get("reason", "") if isinstance(cv, dict) else ""
+        return f"未执行（{reason or '已禁用'}）"
+    return f"{cv.get('passed', '?')}/{cv.get('total', '?')}"
+
+
 def _build_blind_prompt(
     task: dict[str, Any],
     answer_x: dict[str, Any],
@@ -83,8 +93,8 @@ def _build_blind_prompt(
 
     prompt += f"""
 【代码验真结果】
-答案X 通过率：{code_verify_x.get('passed', '?')}/{code_verify_x.get('total', '?')}
-答案Y 通过率：{code_verify_y.get('passed', '?')}/{code_verify_y.get('total', '?')}
+答案X 通过率：{_fmt_code_verify(code_verify_x)}
+答案Y 通过率：{_fmt_code_verify(code_verify_y)}
 
 【答案X】
 {answer_x.get('raw_answer', '(无回答)')}

@@ -23,6 +23,10 @@ class StartRequest(BaseModel):
     dataset_name: str | None = Field(None, description="自定义评测集名称，None=用内置题库")
     repeat_n: int = Field(1, ge=1, le=20, description="重复评测次数，取平均")
     num_questions: int | None = Field(None, ge=1, le=7, description="内置题库题目数量（仅内置题库模式生效，3/5/7，None=全维度）")
+    code_verify_mode: str = Field(
+        "off", pattern=r"^(off|native-sandbox)$",
+        description="代码验真模式：off=仅展示与语法检查（默认，不执行）；native-sandbox=Windows 原生隔离（AppContainer+Job Object）",
+    )
 
 
 class StartResponse(BaseModel):

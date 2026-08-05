@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from backend.security import redact_sensitive
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".eval" / "history"
 
@@ -44,6 +47,7 @@ def save_config(job_id: str, config: dict) -> None:
         "seed": config.get("seed"),
         "dataset_name": config.get("dataset_name"),
         "repeat_n": config.get("repeat_n", 1),
+        "code_verify_mode": config.get("code_verify_mode", "off"),
         "model_a_key_masked": "***",
         "model_b_key_masked": "***",
     }
@@ -89,6 +93,13 @@ def save_review(job_id: str, review: dict) -> Path:
     """保存用户已提交的人工评审（草稿/结果）。"""
     p = _job_dir(job_id) / "review.json"
     p.write_text(json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def save_round_verdicts(job_id: str, round_verdicts: list[dict]) -> Path:
+    """持久化每轮 verdict（含原始 X/Y 分数与该轮 reveal 映射），保证结果可审计可重算。"""
+    p = _job_dir(job_id) / "round-verdicts.json"
+    p.write_text(json.dumps(round_verdicts, ensure_ascii=False, indent=2), encoding="utf-8")
     return p
 
 
@@ -139,13 +150,13 @@ def get_job_status(job_id: str) -> dict[str, Any] | None:
     verdict = None
     if "verdict.json" in files:
         verdict = json.loads((d / "verdict.json").read_text(encoding="utf-8"))
-    return {
+    return redact_sensitive({
         "job_id": job_id,
         "config": cfg,
         "state": _job_state(d),
         "verdict": verdict,
         "files": files,
-    }
+    })
 
 
 def list_jobs() -> list[dict[str, Any]]:
@@ -156,13 +167,13 @@ def list_jobs() -> list[dict[str, Any]]:
             cfg_path = d / "config.json"
             if cfg_path.exists():
                 cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                jobs.append({
+                jobs.append(redact_sensitive({
                     "job_id": d.name,
                     "state": _job_state(d),
                     "model_a": cfg.get("model_a_name", "?"),
                     "model_b": cfg.get("model_b_name", "?"),
                     "created_at": cfg.get("created_at", ""),
-                })
+                }))
     return jobs
 
 
@@ -181,7 +192,7 @@ def get_job_files(job_id: str) -> dict[str, Any] | None:
         return None
     result = {}
     names = ["tasks.json", "answers-a.json", "answers-b.json", "verdict.json",
-             "report.json", "config.json"]
+             "report.json", "config.json", "round-verdicts.json"]
     names += sorted(p.name for p in d.glob("answers-*-r*.json"))
     for name in names:
         p = d / name
@@ -190,12 +201,21 @@ def get_job_files(job_id: str) -> dict[str, Any] | None:
                 result[name] = json.loads(p.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 result[name] = None
-    return result
+    return redact_sensitive(result)
 
 
 # ---- 数据集管理 ----
 
 DATASETS_DIR = Path(__file__).resolve().parent.parent / "data" / "datasets"
+
+# Windows 文件名非法字符（含路径分隔、控制字符），全部替换为下划线
+_INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _safe_dataset_name(name: str) -> str:
+    """将数据集名消毒为安全文件名（保留展示用 name 原文，仅文件层面替换）。"""
+    safe = _INVALID_FS_CHARS.sub("_", str(name)).strip().rstrip(".").strip()
+    return safe or "dataset"
 
 
 def _ensure_datasets_dir():
@@ -205,16 +225,14 @@ def _ensure_datasets_dir():
 def save_dataset(name: str, data: dict) -> Path:
     """保存评测集到 data/datasets/{safe_name}.json（永久保存）。"""
     _ensure_datasets_dir()
-    safe_name = name.replace("/", "_").replace("\\", "_").replace("..", "_")
-    p = DATASETS_DIR / f"{safe_name}.json"
+    p = DATASETS_DIR / f"{_safe_dataset_name(name)}.json"
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return p
 
 
 def load_dataset(name: str) -> dict | None:
     """读取评测集。"""
-    safe_name = name.replace("/", "_").replace("\\", "_").replace("..", "_")
-    p = DATASETS_DIR / f"{safe_name}.json"
+    p = DATASETS_DIR / f"{_safe_dataset_name(name)}.json"
     if not p.exists():
         return None
     return json.loads(p.read_text(encoding="utf-8"))
@@ -243,8 +261,7 @@ def list_datasets() -> list[dict[str, Any]]:
 
 def delete_dataset(name: str) -> bool:
     """删除评测集。"""
-    safe_name = name.replace("/", "_").replace("\\", "_").replace("..", "_")
-    p = DATASETS_DIR / f"{safe_name}.json"
+    p = DATASETS_DIR / f"{_safe_dataset_name(name)}.json"
     if not p.exists():
         return False
     p.unlink()

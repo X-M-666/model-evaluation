@@ -61,6 +61,16 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <h1>模型对决评测平台</h1>
 <p class="sub">输入两个模型的 API 配置，自动出题、调用、<strong>人工双盲评审</strong>并展示对比报告</p>
 
+<div class="card" style="padding:12px 24px">
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <label style="margin:0;flex:none">访问令牌（管理员共享部署时必填）</label>
+    <input id="token-input" type="password" placeholder="MODEL_DUEL_TOKEN 的值" style="flex:1;min-width:200px;padding:6px 12px" />
+    <button id="token-save" class="btn-upload">保存</button>
+    <span id="auth-hint" class="test-err" style="margin:0"></span>
+  </div>
+  <p class="hint" style="margin-top:6px">令牌仅保存在本机浏览器，单机使用无需填写</p>
+</div>
+
 <!-- 模型 A -->
 <div class="card">
 <h2>模型 A 配置</h2>
@@ -70,7 +80,7 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <input id="a-key" type="password" placeholder="sk-..." />
 <label>模型名称</label>
 <input id="a-name" placeholder="gpt-4o" />
-<div class="collapse-toggle" onclick="toggleCollapse('params-a')">▶ 高级参数</div>
+<div class="collapse-toggle" data-target="params-a" role="button" tabindex="0">▶ 高级参数</div>
 <div class="collapse-body" id="params-a">
   <div class="param-row">
     <label>Temperature<div class="hint">0-2，默认0.7</div><input id="a-temp" type="number" value="0.7" min="0" max="2" step="0.1"></label>
@@ -89,7 +99,7 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <input id="b-key" type="password" placeholder="sk-..." />
 <label>模型名称</label>
 <input id="b-name" placeholder="claude-sonnet-4-20250514" />
-<div class="collapse-toggle" onclick="toggleCollapse('params-b')">▶ 高级参数</div>
+<div class="collapse-toggle" data-target="params-b" role="button" tabindex="0">▶ 高级参数</div>
 <div class="collapse-body" id="params-b">
   <div class="param-row">
     <label>Temperature<div class="hint">0-2，默认0.7</div><input id="b-temp" type="number" value="0.7" min="0" max="2" step="0.1"></label>
@@ -104,8 +114,8 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <h2>评测集</h2>
 <div class="dataset-section">
   <div class="radio-group">
-    <label><input type="radio" name="ds-mode" value="builtin" checked onchange="switchDatasetMode()"> 内置题库（可选 3/5/7 题）</label>
-    <label><input type="radio" name="ds-mode" value="custom" onchange="switchDatasetMode()"> 自定义评测集</label>
+    <label><input type="radio" name="ds-mode" value="builtin" checked> 内置题库（可选 3/5/7 题）</label>
+    <label><input type="radio" name="ds-mode" value="custom"> 自定义评测集</label>
   </div>
 
   <!-- 内置题库选项 -->
@@ -129,17 +139,17 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
   <!-- 自定义评测集选项 -->
   <div id="custom-opts" style="display:none;margin-top:14px">
     <label>选择文件上传（JSON / CSV / Markdown / TXT）</label>
-    <input type="file" id="ds-file" accept=".json,.csv,.md,.markdown,.txt" style="padding:6px 0" onchange="handleFileUpload()" />
+    <input type="file" id="ds-file" accept=".json,.csv,.md,.markdown,.txt" style="padding:6px 0" />
     <div style="margin-top:6px;font-size:12px;color:#8b949e">
       格式参考：
-      <a href="#" onclick="downloadTemplate('json');return false">JSON 模板</a> ·
-      <a href="#" onclick="downloadTemplate('csv');return false">CSV 模板</a> ·
-      <a href="#" onclick="downloadTemplate('md');return false">Markdown 模板</a> ·
-      <a href="#" onclick="downloadTemplate('txt');return false">TXT 模板</a>
+      <a href="#" data-fmt="json">JSON 模板</a> ·
+      <a href="#" data-fmt="csv">CSV 模板</a> ·
+      <a href="#" data-fmt="md">Markdown 模板</a> ·
+      <a href="#" data-fmt="txt">TXT 模板</a>
     </div>
     <label>或粘贴 JSON 到文本框</label>
     <textarea id="ds-json" placeholder='{"name":"我的测试集","tasks":[{"prompt":"题目","expected":"示例答案"}]}'></textarea>
-    <button class="btn-upload" onclick="uploadJson()">上传文本框内容</button>
+    <button class="btn-upload" id="uploadJsonBtn">上传文本框内容</button>
     <div id="upload-result" style="margin-top:8px;font-size:13px"></div>
 
     <label style="margin-top:16px">已有评测集</label>
@@ -158,11 +168,24 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <label>重复次数（>1 时自动跑 N 次取平均）</label>
 <input id="repeat-n" type="number" value="1" min="1" max="20" style="width:120px" />
 <span class="hint" style="margin-left:10px">稳定性测试建议设为 3~5</span>
+<div style="margin-top:14px">
+  <label>代码题验真模式
+    <select id="code-verify-mode">
+      <option value="off" selected>仅展示 + 语法检查（默认，不执行代码）</option>
+      <option value="native-sandbox">原生隔离执行（AppContainer + Job Object，实验性）</option>
+    </select>
+  </label>
+  <div class="hint" id="code-verify-hint" style="margin-top:6px"></div>
+  <div id="code-verify-warn" style="display:none;margin-top:8px;padding:10px;border:1px solid #f85149;border-radius:6px;background:rgba(248,81,73,.08);color:#f85149;font-size:13px">
+    模型输出属于不可信外部输入，自动执行其代码存在安全风险。仅在确认本机环境（Windows 原生隔离）
+    已通过自检（python -m scripts.sandbox_selfcheck）时开启。
+  </div>
+</div>
 </div>
 
 <!-- 操作按钮 -->
 <div class="test-row">
-<button class="btn btn-secondary" id="testBtn" onclick="testConn()">验证连通性</button>
+<button class="btn btn-secondary" id="testBtn">验证连通性</button>
 <span id="testResult"></span>
 </div>
 <div class="progress" id="progress">
@@ -170,8 +193,8 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <span id="progressText">准备中...</span>
 </div>
 <div>
-<button class="btn" id="startBtn" onclick="startEval()">开始评测</button>
-<button class="btn-mock" id="mockBtn" onclick="startMock()">测试结果案例</button>
+<button class="btn" id="startBtn">开始评测</button>
+<button class="btn-mock" id="mockBtn">测试结果案例</button>
 </div>
 
 <!-- 历史记录 -->
@@ -186,13 +209,30 @@ const API = '';
 let dims = [];
 let selectedDataset = '';
 
+// ---- 访问令牌（共享部署模式；单机模式可为空） ----
+function getToken(){ return localStorage.getItem('duel_token') || ''; }
+async function apiFetch(url, opts={}){
+  const headers = Object.assign({}, opts.headers);
+  const token = getToken();
+  if(token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(url, Object.assign({}, opts, {headers}));
+  if(r.status === 401){
+    document.getElementById('auth-hint').textContent = '未授权：请填写正确的访问令牌';
+  }
+  return r;
+}
+
 // ---- 初始化 ----
-fetch(API+'/api/dims').then(r=>r.json()).then(d=>{
-  dims = d.dims;
+apiFetch(API+'/api/dims').then(r=>r.json()).then(d=>{
+  dims = d.dims || [];
   const box = document.getElementById('dims-box');
   box.innerHTML = dims.map(dim=>`<label style="display:inline-block;margin-right:14px;margin-bottom:6px;cursor:pointer;color:#c9d1d9">
     <input type="checkbox" value="${dim}" checked style="margin-right:4px"> ${dim}
   </label>`).join('');
+  loadHistory();
+  loadDatasets();
+}).catch(()=>{
+  document.getElementById('dims-box').textContent = '';
   loadHistory();
   loadDatasets();
 });
@@ -217,22 +257,24 @@ function getSelectedDims(){
 
 // ---- 数据集管理 ----
 function loadDatasets(){
-  fetch(API+'/api/datasets').then(r=>r.json()).then(d=>{
+  apiFetch(API+'/api/datasets').then(r=>r.json()).then(d=>{
     const list = document.getElementById('dataset-list');
     const sel = document.getElementById('ds-select');
     if(!d.datasets||!d.datasets.length){
       list.innerHTML='<em>暂无自定义评测集</em>';
       sel.innerHTML='<option value="">（未选择）</option>';
+      window.__dsList = [];
       return;
     }
-    list.innerHTML = d.datasets.map(ds=>`
+    window.__dsList = d.datasets;
+    list.innerHTML = d.datasets.map((ds,i)=>`
       <div class="ds-item">
         <div class="ds-info">
           <strong>${esc(ds.name)}</strong>
-          <span>${ds.task_count}题 · ${ds.dimensions.join(', ')}</span>
+          <span>${ds.task_count}题 · ${esc(ds.dimensions.join(', '))}</span>
           ${ds.description ? '<span>'+esc(ds.description)+'</span>' : ''}
         </div>
-        <button class="btn-danger" onclick="deleteDataset('${esc(ds.name)}')">删除</button>
+        <button class="btn-danger" data-idx="${i}">删除</button>
       </div>
     `).join('');
     sel.innerHTML = '<option value="">（使用内置题库）</option>' +
@@ -246,18 +288,18 @@ async function handleFileUpload(){
   const form = new FormData();
   form.append('file', file);
   const res = document.getElementById('upload-result');
-  res.innerHTML = '<span class="spinner"></span> 上传中...';
+  setLoading(res, '上传中...');
   try{
-    const r = await fetch(API+'/api/datasets/upload', {method:'POST', body:form});
+    const r = await apiFetch(API+'/api/datasets/upload', {method:'POST', body:form});
     const d = await r.json();
     if(d.ok){
-      res.innerHTML = `<span class="test-ok">上传成功：${d.name}（${d.task_count}题，覆盖${d.dimensions.length}维度）</span>`;
+      setMsg(res, `上传成功：${d.name}（${d.task_count}题，覆盖${d.dimensions.length}维度）`, 'test-ok');
       loadDatasets();
     } else {
-      res.innerHTML = `<span class="test-err">上传失败: ${d.detail||JSON.stringify(d)}</span>`;
+      setMsg(res, `上传失败: ${d.detail||JSON.stringify(d)}`, 'test-err');
     }
   }catch(e){
-    res.innerHTML = `<span class="test-err">上传失败: ${e}</span>`;
+    setMsg(res, '上传失败: '+e, 'test-err');
   }
 }
 
@@ -265,28 +307,28 @@ async function uploadJson(){
   const content = document.getElementById('ds-json').value.trim();
   if(!content){ alert('请先粘贴 JSON 内容'); return; }
   const res = document.getElementById('upload-result');
-  res.innerHTML = '<span class="spinner"></span> 解析中...';
+  setLoading(res, '解析中...');
   try{
-    const r = await fetch(API+'/api/datasets/upload-json', {
+    const r = await apiFetch(API+'/api/datasets/upload-json', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({content}),
     });
     const d = await r.json();
     if(d.ok){
-      res.innerHTML = `<span class="test-ok">上传成功：${d.name}（${d.task_count}题）</span>`;
+      setMsg(res, `上传成功：${d.name}（${d.task_count}题）`, 'test-ok');
       document.getElementById('ds-json').value = '';
       loadDatasets();
     } else {
-      res.innerHTML = `<span class="test-err">上传失败: ${d.detail||JSON.stringify(d)}</span>`;
+      setMsg(res, `上传失败: ${d.detail||JSON.stringify(d)}`, 'test-err');
     }
   }catch(e){
-    res.innerHTML = `<span class="test-err">上传失败: ${e}</span>`;
+    setMsg(res, '上传失败: '+e, 'test-err');
   }
 }
 
 async function deleteDataset(name){
   if(!confirm(`确定删除评测集「${name}」？`)) return;
-  await fetch(API+'/api/datasets/'+encodeURIComponent(name), {method:'DELETE'});
+  await apiFetch(API+'/api/datasets/'+encodeURIComponent(name), {method:'DELETE'});
   loadDatasets();
 }
 
@@ -346,21 +388,23 @@ function downloadTemplate(fmt){
 async function testConn(){
   const btn = document.getElementById('testBtn');
   const res = document.getElementById('testResult');
-  btn.disabled = true; res.innerHTML = '<span class="spinner"></span> 验证中...';
+  btn.disabled = true; setLoading(res, '验证中...');
   const body = {
     model_a:{url:g('a-url'),key:g('a-key'),name:g('a-name'),temperature:0.7,max_tokens:4096},
     model_b:{url:g('b-url'),key:g('b-key'),name:g('b-name'),temperature:0.7,max_tokens:4096},
   };
   try{
-    const r = await fetch(API+'/api/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const r = await apiFetch(API+'/api/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d = await r.json();
-    let html = '';
+    res.textContent = '';
     for(const[k,v] of Object.entries(d)){
-      html += `<div class="${v.ok?'test-ok':'test-err'}">${k}: ${v.ok?'OK '+v.model:'FAIL '+v.error}</div>`;
+      const div = document.createElement('div');
+      div.className = v.ok ? 'test-ok' : 'test-err';
+      div.textContent = `${k}: ${v.ok ? 'OK '+v.model : 'FAIL '+v.error}`;
+      res.appendChild(div);
     }
-    res.innerHTML = html;
   }catch(e){
-    res.innerHTML = `<div class="test-err">请求失败: ${e}</div>`;
+    setMsg(res, '请求失败: '+e, 'test-err');
   }
   btn.disabled = false;
 }
@@ -390,10 +434,11 @@ async function startEval(){
     dataset_name: dsName || null,
     repeat_n: parseInt(g('repeat-n')) || 1,
     num_questions: dsMode==='builtin' ? parseInt(document.getElementById('num-questions').value) : null,
+    code_verify_mode: g('code-verify-mode') || 'off',
   };
 
   try{
-    const r = await fetch(API+'/api/eval/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const r = await apiFetch(API+'/api/eval/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!r.ok){
       const err = await r.json();
       throw new Error(err.detail || '请求失败');
@@ -401,7 +446,8 @@ async function startEval(){
     const d = await r.json();
     const jobId = d.job_id;
     progText.textContent = `任务已创建: ${jobId}，连接实时进度...`;
-    const evtSource = new EventSource(API+`/api/eval/${jobId}/events`);
+    const evtToken = getToken() ? '?token='+encodeURIComponent(getToken()) : '';
+    const evtSource = new EventSource(API+`/api/eval/${jobId}/events${evtToken}`);
     evtSource.onmessage = (e) => {
       const evt = JSON.parse(e.data);
       const round = evt.round ? `[${evt.round}] ` : '';
@@ -432,7 +478,7 @@ async function startMock(){
   const btn = document.getElementById('mockBtn');
   btn.disabled = true; btn.textContent = '生成中...';
   try{
-    const r = await fetch(API+'/api/eval/mock',{method:'POST'});
+    const r = await apiFetch(API+'/api/eval/mock',{method:'POST'});
     const d = await r.json();
     // 与真实评测一致：先进入人工双盲评审，提交后才显示结果
     window.location='/review.html?job='+d.job_id;
@@ -443,43 +489,117 @@ async function startMock(){
 }
 
 function g(id){ return document.getElementById(id).value.trim(); }
-function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+// ---- 安全渲染：外部数据一律走 textContent ----
+function setMsg(el, text, cls){
+  el.textContent = '';
+  const span = document.createElement('span');
+  if(cls) span.className = cls;
+  span.textContent = text;
+  el.appendChild(span);
+}
+function setLoading(el, text){
+  el.textContent = '';
+  const sp = document.createElement('span');
+  sp.className = 'spinner';
+  el.appendChild(sp);
+  el.appendChild(document.createTextNode(' '+text));
+}
+
+// ---- 代码验真模式 ----
+async function onCodeVerifyModeChange(){
+  const mode = g('code-verify-mode');
+  const warn = document.getElementById('code-verify-warn');
+  const hint = document.getElementById('code-verify-hint');
+  warn.style.display = mode === 'native-sandbox' ? 'block' : 'none';
+  hint.textContent = '';
+  if(mode === 'native-sandbox'){
+    try{
+      const r = await apiFetch(API+'/api/code-runner/status');
+      const d = await r.json();
+      const ns = d.modes && d.modes['native-sandbox'];
+      hint.innerHTML = ns && ns.available
+        ? '<span style="color:#3fb950">✓ 原生隔离已就绪</span>'
+        : '<span style="color:#f85149">✗ 原生隔离不可用：' + esc((ns && ns.detail) || '未知') + '</span>';
+    }catch(e){
+      hint.textContent = '';
+    }
+  }
+}
 
 // ---- 历史记录 ----
 async function deleteJob(jobId){
   if(!confirm('确定要删除这条评测记录吗？此操作不可恢复。')) return;
-  await fetch(API+'/api/history/'+jobId, {method:'DELETE'});
+  await apiFetch(API+'/api/history/'+jobId, {method:'DELETE'});
   loadHistory();
 }
 
 async function loadHistory(){
   try{
-    const r = await fetch(API+'/api/history');
+    const r = await apiFetch(API+'/api/history');
     const d = await r.json();
     const el = document.getElementById('historyList');
-    if(!d.jobs||!d.jobs.length){ el.innerHTML='<em>暂无历史记录</em>'; return; }
-    el.innerHTML = d.jobs.slice(0,10).map(j=>{
+    if(!d.jobs||!d.jobs.length){ el.innerHTML='<em>暂无历史记录</em>'; window.__jobsList = []; return; }
+    window.__jobsList = d.jobs.slice(0,10);
+    el.innerHTML = d.jobs.slice(0,10).map((j,i)=>{
       const stateTag = j.state==='completed' ? '<span class="tag done">completed</span>'
         : j.state==='reviewing' ? '<span class="tag">reviewing</span>'
-        : '<span class="tag pending">'+j.state+'</span>';
+        : '<span class="tag pending">'+esc(j.state)+'</span>';
       const link = j.state==='reviewing'
-        ? `<a href="/review.html?job=${j.job_id}" style="color:#f0883e;text-decoration:none">去评审</a>`
-        : `<a href="/report.html?job=${j.job_id}" style="color:#58a6ff;text-decoration:none">查看</a>`;
+        ? `<a href="/review.html?job=${esc(j.job_id)}" style="color:#f0883e;text-decoration:none">去评审</a>`
+        : `<a href="/report.html?job=${esc(j.job_id)}" style="color:#58a6ff;text-decoration:none">查看</a>`;
       return `
       <div class="history-row">
         <div>
           ${stateTag}
           <strong>${esc(j.model_a)}</strong> vs <strong>${esc(j.model_b)}</strong>
-          <span style="color:#8b949e;font-size:12px;margin-left:8px">${j.created_at.slice(0,16)}</span>
+          <span style="color:#8b949e;font-size:12px;margin-left:8px">${esc(j.created_at.slice(0,16))}</span>
         </div>
         <div>
           ${link}
-          <button class="btn-danger" onclick="deleteJob('${j.job_id}')">删除</button>
+          <button class="btn-danger" data-idx="${i}">删除</button>
         </div>
       </div>`;
     }).join('');
   }catch(e){}
 }
+
+// ---- 事件绑定（CSP 禁用内联事件处理器，统一在此挂载） ----
+document.querySelectorAll('.collapse-toggle').forEach(el=>{
+  el.addEventListener('click', ()=>toggleCollapse(el.dataset.target));
+});
+document.getElementById('ds-file').addEventListener('change', handleFileUpload);
+document.querySelectorAll('a[data-fmt]').forEach(a=>{
+  a.addEventListener('click', e=>{ e.preventDefault(); downloadTemplate(a.dataset.fmt); });
+});
+document.getElementById('uploadJsonBtn').addEventListener('click', uploadJson);
+document.getElementById('code-verify-mode').addEventListener('change', onCodeVerifyModeChange);
+document.querySelectorAll('input[name="ds-mode"]').forEach(r=>{
+  r.addEventListener('change', switchDatasetMode);
+});
+document.getElementById('testBtn').addEventListener('click', testConn);
+document.getElementById('startBtn').addEventListener('click', startEval);
+document.getElementById('mockBtn').addEventListener('click', startMock);
+document.getElementById('dataset-list').addEventListener('click', e=>{
+  const btn = e.target.closest('.btn-danger');
+  if(!btn) return;
+  const ds = (window.__dsList||[])[parseInt(btn.dataset.idx,10)];
+  if(ds) deleteDataset(ds.name);
+});
+document.getElementById('historyList').addEventListener('click', e=>{
+  const btn = e.target.closest('.btn-danger');
+  if(!btn) return;
+  const j = (window.__jobsList||[])[parseInt(btn.dataset.idx,10)];
+  if(j) deleteJob(j.job_id);
+});
+document.getElementById('token-input').value = getToken();
+document.getElementById('token-save').addEventListener('click', ()=>{
+  const v = document.getElementById('token-input').value.trim();
+  localStorage.setItem('duel_token', v);
+  document.getElementById('auth-hint').textContent = v ? '令牌已保存，正在刷新...' : '已清除令牌，正在刷新...';
+  setTimeout(()=>{ window.location.reload(); }, 600);
+});
 </script>
 </body>
 </html>

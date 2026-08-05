@@ -8,6 +8,12 @@ webapp/data/
 webapp/server*.log
 webapp/server.err.log
 
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.coverage.*
+
 # 编辑器
 .vscode/
 .idea/

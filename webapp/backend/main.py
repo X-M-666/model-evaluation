@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -23,39 +25,89 @@ from backend.engine.human_review import (
     make_reveal, resolve_round, build_review_view,
     build_round_verdict, build_final_verdict,
 )
-from backend.engine.report_builder import build_report
+from backend.engine.report_builder import build_report, reveal_answers
 from backend.engine.parsers import get_parser, supported_extensions
 from backend.engine.datasets import validate_json_dataset
+from backend.access import security_middleware
+from backend.ssrf import validate_upstream_url, UpstreamUrlError
 from backend.storage import (
     create_job_id, save_config, save_task_set, save_answers,
     save_verdict, save_error, save_report, save_reveal, load_reveal,
-    save_review, load_review,
+    save_review, load_review, save_round_verdicts,
     get_job_status, list_jobs, get_job_files,
     save_dataset, load_dataset, list_datasets, delete_dataset,
 )
 from backend.schemas import StartRequest, StartResponse, ReviewSubmission
+from backend.security import redact_sensitive, sanitize_config
 
 app = FastAPI(title="模型对决评测平台", version="0.3.0")
+app.middleware("http")(security_middleware)
 
 _jobs: dict[str, dict] = {}
+
+# 资源限制（issue #8）：并发执行任务上限 / 上传大小 / 数据集题数
+MAX_ACTIVE_JOBS = 2
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_JSON_BYTES = 2 * 1024 * 1024
+MAX_DATASET_TASKS = 200
+
+
+async def _read_body_limited(request: Request, limit: int) -> bytes:
+    """流式读取请求体，累计超过 limit 立即 400（防大 body 先占满内存再拒绝）。
+
+    Content-Length 存在时先做快速预检；分块传输（无 Content-Length）走流式截断。
+    """
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > limit:
+        raise HTTPException(400, f"请求体过大：最大 {limit // (1024 * 1024)}MB")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(400, f"请求体过大：最大 {limit // (1024 * 1024)}MB")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
+# CSP：仅放行本站内联脚本（nonce 每请求轮换）；内联事件处理器一律禁用，
+# 前端已改为 addEventListener 挂载。style-src 保留 'unsafe-inline'（页面内联样式）。
+CSP_DIRECTIVES = (
+    "default-src 'self'; "
+    "script-src 'self' 'nonce-{nonce}'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+)
+
+
+def _page_response(name: str) -> HTMLResponse:
+    """托管前端页面并注入 CSP：为全部 <script> 附加请求级 nonce。"""
+    html = (FRONTEND_DIR / name).read_text(encoding="utf-8")
+    nonce = secrets.token_urlsafe(16)
+    html = re.sub(r"<script\b", f'<script nonce="{nonce}"', html)
+    return HTMLResponse(
+        html,
+        headers={"Content-Security-Policy": CSP_DIRECTIVES.format(nonce=nonce)},
+    )
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
+    return _page_response("index.html")
 
 
 @app.get("/report.html", response_class=HTMLResponse)
 async def report_page():
-    return (FRONTEND_DIR / "report.html").read_text(encoding="utf-8")
+    return _page_response("report.html")
 
 
 @app.get("/review.html", response_class=HTMLResponse)
 async def review_page():
-    return (FRONTEND_DIR / "review.html").read_text(encoding="utf-8")
+    return _page_response("review.html")
 
 
 @app.get("/api/dims")
@@ -63,12 +115,30 @@ async def get_dims():
     return {"dims": DIMENSIONS}
 
 
+# ---- 代码验真模式状态 ----
+
+@app.get("/api/code-runner/status")
+async def code_runner_status():
+    """报告当前可用的代码验真模式（off 恒可用；native-sandbox 视环境而定）。"""
+    from backend.engine.isolation.runners import MODES, get_runner
+
+    modes = {}
+    for m in MODES:
+        runner = get_runner(m)
+        available, detail = runner.is_available()
+        modes[m] = {"available": available, "detail": detail}
+    return {"default_mode": "off", "modes": modes}
+
+
 # ---- 数据集管理 API ----
 
 @app.post("/api/datasets/upload")
 async def upload_dataset(file: UploadFile = File(...)):
     """上传评测集文件（JSON / CSV / Markdown / TXT），按扩展名路由解析。"""
-    content = await file.read()
+    # 截断读取：最多读 5MB+1 字节，超限立即拒绝，不将大文件整体读入内存
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, f"文件过大：最大 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB")
     filename = file.filename or "unknown"
     try:
         text = content.decode("utf-8")
@@ -87,6 +157,8 @@ async def upload_dataset(file: UploadFile = File(...)):
         data = parser(text)
     except ValueError as e:
         raise HTTPException(400, f"数据集格式错误: {e}")
+    if len(data.get("tasks", [])) > MAX_DATASET_TASKS:
+        raise HTTPException(400, f"题目数量超过上限 {MAX_DATASET_TASKS}")
 
     # 用文件名（不含扩展名）作为数据集名称
     name = Path(filename).stem
@@ -107,15 +179,25 @@ async def upload_dataset(file: UploadFile = File(...)):
 @app.post("/api/datasets/upload-json")
 async def upload_dataset_json(request: Request):
     """通过 JSON body 上传评测集（用于文本框粘贴）。"""
-    body = await request.json()
-    raw = body.get("content", "")
-    if not raw:
+    body_bytes = await _read_body_limited(request, MAX_JSON_BYTES)
+    try:
+        body = json.loads(body_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(400, "请求体不是合法 JSON")
+    if not isinstance(body, dict):
         raise HTTPException(400, "缺少 content 字段")
+    raw = body.get("content", "")
+    if not isinstance(raw, str) or not raw:
+        raise HTTPException(400, "缺少 content 字段")
+    if len(raw) > MAX_JSON_BYTES:
+        raise HTTPException(400, f"JSON 内容过大：最大 {MAX_JSON_BYTES // (1024 * 1024)}MB")
 
     try:
         data = validate_json_dataset(raw)
     except ValueError as e:
         raise HTTPException(400, f"数据集格式错误: {e}")
+    if len(data.get("tasks", [])) > MAX_DATASET_TASKS:
+        raise HTTPException(400, f"题目数量超过上限 {MAX_DATASET_TASKS}")
 
     name = data.get("name", f"评测集_{int(time.time())}")
     save_dataset(name, data)
@@ -152,10 +234,12 @@ async def test_connection(config: StartRequest):
     results = {}
     for label, cfg in [("model_a", config.model_a), ("model_b", config.model_b)]:
         try:
+            # SSRF 防护：仅允许公网 http/https 目标（内网场景需显式开关放行）
+            validate_upstream_url(cfg.url)
             url = cfg.url.rstrip("/") + "/chat/completions"
             payload = {"model": cfg.name, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 8}
             headers = {"Authorization": f"Bearer {cfg.key}", "Content-Type": "application/json"}
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(follow_redirects=False) as client:
                 resp = await client.post(url, json=payload, headers=headers, timeout=15)
                 body = resp.json()
                 if resp.status_code >= 400:
@@ -165,6 +249,8 @@ async def test_connection(config: StartRequest):
                     results[label] = {"ok": True, "model": body.get("model", cfg.name),
                                       "prompt_tokens": usage.get("prompt_tokens", 0),
                                       "completion_tokens": usage.get("completion_tokens", 0)}
+        except UpstreamUrlError as e:
+            results[label] = {"ok": False, "error": f"目标地址校验失败: {e}"}
         except httpx.TimeoutException:
             results[label] = {"ok": False, "error": "连接超时（>15s）"}
         except httpx.ConnectError as e:
@@ -179,8 +265,35 @@ async def test_connection(config: StartRequest):
 @app.post("/api/eval/start", response_model=StartResponse)
 async def start_eval(req: StartRequest):
     """启动一轮评测。支持 dataset_name（自定义评测集）和 repeat_n（重复次数）。"""
+    # SSRF 防护：评测启动即校验上游目标（executor 每次调用前不再重复解析）
+    try:
+        validate_upstream_url(req.model_a.url)
+        validate_upstream_url(req.model_b.url)
+    except UpstreamUrlError as e:
+        raise HTTPException(400, f"模型 URL 校验失败: {e}")
+
+    # 并发限制：执行中任务数（mock 不消耗外部资源，不计入）
+    active = sum(
+        1 for j in _jobs.values()
+        if j.get("state") in ("pending", "executing")
+        and not str(j.get("config", {}).get("model_a", {}).get("url", "")).startswith("mock")
+    )
+    if active >= MAX_ACTIVE_JOBS:
+        raise HTTPException(429, f"当前已有 {active} 个评测任务在执行，请等待完成后再启动")
+
     job_id = create_job_id()
     seed = req.seed if req.seed is not None else int(time.time()) % 100000
+
+    # 代码验真模式校验：native-sandbox 必须真实可用，避免静默跳过验真
+    if req.code_verify_mode == "native-sandbox":
+        from backend.engine.isolation.runners import get_runner
+
+        available, detail = get_runner("native-sandbox").is_available()
+        if not available:
+            raise HTTPException(
+                400,
+                f"原生沙箱当前不可用：{detail}（可先运行 python -m scripts.sandbox_selfcheck 检查环境）",
+            )
 
     # 构建任务集：自定义评测集 or 内置题库
     if req.dataset_name:
@@ -196,6 +309,7 @@ async def start_eval(req: StartRequest):
         return {
             "name": mc.name, "url": mc.url, "key": mc.key,
             "temperature": mc.temperature, "max_tokens": mc.max_tokens, "top_p": mc.top_p,
+            "code_verify_mode": req.code_verify_mode,
         }
 
     config_data = {
@@ -206,6 +320,7 @@ async def start_eval(req: StartRequest):
         "dataset_name": req.dataset_name,
         "repeat_n": req.repeat_n,
         "num_questions": req.num_questions,
+        "code_verify_mode": req.code_verify_mode,
     }
     save_config(job_id, config_data)
     save_task_set(job_id, task_set)
@@ -298,31 +413,83 @@ async def _run_eval(job_id: str):
     await _push_event(job_id, {"state": "reviewing"})
 
 
-def _finalize_job(job_id: str, verdict: dict, review_data: dict):
-    """人工评审提交后：写 verdict/review/report，置为 completed。"""
-    _jobs[job_id]["verdict"] = verdict
+def _finalize_job(
+    job_id: str,
+    verdict: dict,
+    review_data: dict,
+    round_verdicts: list[dict] | None,
+    cfg: dict,
+    task_set: dict,
+    answers_a: dict,
+    answers_b: dict,
+    rounds_answers: list[dict] | None = None,
+):
+    """人工评审提交后：写 verdict/review/round-verdicts/report，置为 completed。
+
+    数据一律来自显式参数（由 _load_job_state 恢复），不依赖进程内 _jobs，
+    服务重启后（_jobs 清空）磁盘态任务仍可完成提交闭环。
+    """
     save_verdict(job_id, verdict)
     save_review(job_id, review_data)
-
-    cfg = _jobs[job_id]["config"]
-    task_set = _jobs[job_id]["task_set"]
-    report = build_report(
-        cfg, task_set,
-        _jobs[job_id]["answers_a"], _jobs[job_id]["answers_b"], verdict,
-    )
+    if round_verdicts:
+        save_round_verdicts(job_id, round_verdicts)
+    report = build_report(cfg, task_set, answers_a, answers_b, verdict, rounds_answers)
     save_report(job_id, {
-        "config": cfg,
+        "config": sanitize_config(cfg),
         "tasks": task_set,
-        "answers_a": _jobs[job_id]["answers_a"],
-        "answers_b": _jobs[job_id]["answers_b"],
+        "answers_a": answers_a,
+        "answers_b": answers_b,
         "verdict": verdict,
         "report": report,
     })
-    _jobs[job_id]["state"] = "completed"
-    _jobs[job_id]["progress"] = "done"
+    if job_id in _jobs:
+        j = _jobs[job_id]
+        j["verdict"] = verdict
+        j["answers_a"] = answers_a
+        j["answers_b"] = answers_b
+        j["rounds_answers"] = rounds_answers or j.get("rounds_answers")
+        j["round_verdicts"] = round_verdicts
+        j["state"] = "completed"
+        j["progress"] = "done"
 
 
 # ---- 人工双盲评审 ----
+
+def _validate_review_scores(
+    task_set: dict, repeat_n: int, scores_by_round: dict[int, list[dict]]
+) -> list[dict]:
+    """校验评分集合（issue #9）：每个 (round, task_id) 恰好一次、题号归属任务集、轮次在 1..repeat_n。
+
+    返回结构化错误列表（空列表=完整有效）：
+      round_out_of_range: {"type","round"}       轮次不在 1..repeat_n
+      unknown_task:       {"type","round","id"}  题号不在任务集
+      duplicate_task:     {"type","round","id"}  同轮同题重复
+      missing_task:       {"type","round","ids"} 该轮缺失题目
+      missing_round:      {"type","round","ids"} 整轮缺失（含该轮全部题目）
+    """
+    task_ids = {t["id"] for t in task_set["tasks"]}
+    expected = set(range(1, repeat_n + 1))
+    errors: list[dict] = []
+    for round_no, items in sorted(scores_by_round.items()):
+        if round_no not in expected:
+            errors.append({"type": "round_out_of_range", "round": round_no})
+            continue
+        seen: set[str] = set()
+        for s in items:
+            sid = s["id"]
+            if sid not in task_ids:
+                errors.append({"type": "unknown_task", "round": round_no, "id": sid})
+            elif sid in seen:
+                errors.append({"type": "duplicate_task", "round": round_no, "id": sid})
+            else:
+                seen.add(sid)
+        missing = sorted(task_ids - seen)
+        if missing:
+            errors.append({"type": "missing_task", "round": round_no, "ids": missing})
+    for round_no in sorted(expected - set(scores_by_round)):
+        errors.append({"type": "missing_round", "round": round_no, "ids": sorted(task_ids)})
+    return errors
+
 
 def _load_job_state(job_id: str) -> tuple[dict, dict, dict, int] | None:
     """从内存或磁盘恢复评审所需状态（config/task_set/rounds_answers/repeat_n）。"""
@@ -389,6 +556,9 @@ async def eval_review_submit(job_id: str, req: ReviewSubmission):
         raise HTTPException(404, "job not found")
     cfg, task_set, rounds_answers, repeat_n = restored
 
+    if load_review(job_id) is not None:
+        raise HTTPException(409, "该任务已提交评分，请勿重复提交")
+
     scores_by_round: dict[int, list[dict]] = {}
     for s in req.scores:
         scores_by_round.setdefault(s.round, []).append(s.model_dump())
@@ -396,7 +566,19 @@ async def eval_review_submit(job_id: str, req: ReviewSubmission):
     if not scores_by_round:
         raise HTTPException(400, "未提交任何打分")
 
-    reveal = load_reveal(job_id) or make_reveal(repeat_n)
+    # 完整性/唯一性/归属校验（issue #9）：任一 (round, task_id) 缺失、重复、
+    # 未知题号或轮次越界，整个请求 400 拒绝，不写任何文件、不改任务状态
+    errors = _validate_review_scores(task_set, repeat_n, scores_by_round)
+    if errors:
+        raise HTTPException(400, {
+            "message": f"评分集合不完整或存在冲突（{len(errors)} 处），请核对后重新提交",
+            "errors": errors,
+        })
+
+    reveal = load_reveal(job_id)
+    if reveal is None:
+        reveal = make_reveal(repeat_n)
+        save_reveal(job_id, reveal)
     round_verdicts = []
     for r_idx, round_ans in enumerate(rounds_answers):
         x_model, y_model, x_pool, y_pool = resolve_round(
@@ -410,7 +592,11 @@ async def eval_review_submit(job_id: str, req: ReviewSubmission):
         round_verdicts.append(v)
 
     verdict = build_final_verdict(round_verdicts, repeat_n)
-    _finalize_job(job_id, verdict, {"scores": [s.model_dump() for s in req.scores]})
+    answers_a, answers_b = rounds_answers[-1]["a"], rounds_answers[-1]["b"]
+    _finalize_job(
+        job_id, verdict, {"scores": [s.model_dump() for s in req.scores]},
+        round_verdicts, cfg, task_set, answers_a, answers_b, rounds_answers,
+    )
     await _push_event(job_id, {"state": "completed"})
     return StartResponse(job_id=job_id)
 
@@ -485,6 +671,47 @@ async def eval_events(job_id: str):
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
+def _rounds_view(
+    rounds_answers: list[dict],
+    reveal: dict | None,
+) -> list[dict]:
+    """把全部轮次答卷按各轮 reveal 归一化为 answers_x/answers_y（供前端按轮展示）。"""
+    result = []
+    for r_idx, round_ans in enumerate(rounds_answers):
+        x_model, y_model, x_pool, y_pool = resolve_round(
+            reveal, r_idx, round_ans["a"], round_ans["b"]
+        )
+        result.append({
+            "round": r_idx + 1,
+            "answers_x": {
+                "model": x_model,
+                "answers": [e for entries in x_pool.values() for e in entries],
+            },
+            "answers_y": {
+                "model": y_model,
+                "answers": [e for entries in y_pool.values() for e in entries],
+            },
+        })
+    return result
+
+
+def _round_scores_view(round_verdicts: list[dict] | None) -> list[dict]:
+    """每轮每题原始打分（供报告逐题表展开每轮分数明细）。"""
+    result = []
+    for r_idx, rv in enumerate(round_verdicts or []):
+        scores = [
+            {
+                "id": s.get("id", ""),
+                "answer_x": s.get("answer_x", 0),
+                "answer_y": s.get("answer_y", 0),
+                "winner": s.get("winner", "tie"),
+            }
+            for s in rv.get("scores", [])
+        ]
+        result.append({"round": r_idx + 1, "scores": scores})
+    return result
+
+
 @app.get("/api/eval/{job_id}/report")
 async def eval_report(job_id: str):
     files = get_job_files(job_id)
@@ -492,14 +719,25 @@ async def eval_report(job_id: str):
         if job_id in _jobs:
             j = _jobs[job_id]
             if j["verdict"]:
+                rounds_answers = j.get("rounds_answers") or [
+                    {"a": j["answers_a"], "b": j["answers_b"]}
+                ]
+                answers_x, answers_y = reveal_answers(
+                    j["answers_a"], j["answers_b"], j["verdict"],
+                )
                 payload = {
                     "job_id": job_id, "config": j["config"], "tasks": j["task_set"],
-                    "answers_a": j["answers_a"], "answers_b": j["answers_b"], "verdict": j["verdict"],
+                    "answers_a": j["answers_a"], "answers_b": j["answers_b"],
+                    "answers_x": answers_x, "answers_y": answers_y,
+                    "rounds": _rounds_view(rounds_answers, j.get("reveal")),
+                    "round_scores": _round_scores_view(j.get("round_verdicts")),
+                    "verdict": j["verdict"],
                 }
                 payload["report"] = build_report(
-                    j["config"], j["task_set"], j["answers_a"], j["answers_b"], j["verdict"],
+                    j["config"], j["task_set"], j["answers_a"], j["answers_b"],
+                    j["verdict"], rounds_answers,
                 )
-                return payload
+                return redact_sensitive(payload)
         raise HTTPException(404, "job not found or not completed")
 
     report_dict = files.get("report.json")
@@ -509,22 +747,40 @@ async def eval_report(job_id: str):
     answers_b = files.get("answers-b.json")
     cfg = files.get("config.json")
 
+    # 从磁盘恢复全部轮次答卷（多轮时 answers-a-r{n}.json；旧记录回退单轮）
+    rounds_answers: list[dict] = []
+    repeat_n = int((cfg or {}).get("repeat_n", 1))
+    for r in range(1, max(repeat_n, 1) + 1):
+        ra = files.get(f"answers-a-r{r}.json")
+        rb = files.get(f"answers-b-r{r}.json")
+        if ra is None or rb is None:
+            break
+        rounds_answers.append({"a": ra, "b": rb})
+    if not rounds_answers:
+        rounds_answers = [{"a": answers_a, "b": answers_b}]
+
     # 旧记录（无 report 字段）时即时生成，保持历史可读
     rich = None
     if isinstance(report_dict, dict):
         rich = report_dict.get("report")
     if rich is None and verdict and tasks:
         try:
-            rich = build_report(cfg, tasks, answers_a, answers_b, verdict)
+            rich = build_report(cfg, tasks, answers_a, answers_b, verdict, rounds_answers)
         except Exception:
             rich = None
 
+    answers_x, answers_y = reveal_answers(answers_a, answers_b, verdict)
+    reveal = load_reveal(job_id)
     return {
         "job_id": job_id,
         "config": cfg,
         "tasks": tasks,
         "answers_a": answers_a,
         "answers_b": answers_b,
+        "answers_x": answers_x,
+        "answers_y": answers_y,
+        "rounds": _rounds_view(rounds_answers, reveal),
+        "round_scores": _round_scores_view(files.get("round-verdicts.json")),
         "verdict": verdict,
         "report": rich,
     }

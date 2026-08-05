@@ -197,7 +197,7 @@ QUESTION_POOL: dict[str, list[dict[str, Any]]] = {
             "test_cases": [
                 {"input": "你好你好世界世界世界！", "expected": "世 3\n界 3\n你 2\n好 2"},
                 {"input": "abcd", "expected": "EMPTY"},
-                {"input": "的的地得地地得", "expected": "地 3\n的 2\n得 2"},
+                {"input": "的的地得地地得", "expected": "地 3\n得 2\n的 2"},
                 {"input": "一一二二三三四四五五六六七七", "expected": "一 2\n七 2\n三 2\n二 2\n五 2"},
                 {"input": "abc你好，世界 123", "expected": "世 1\n你 1\n好 1\n界 1"},
             ],

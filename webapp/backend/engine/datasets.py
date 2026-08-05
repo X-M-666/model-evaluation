@@ -92,7 +92,6 @@ def parse_csv_dataset(content: str) -> dict[str, Any]:
         raise ValueError("CSV 为空或格式错误")
 
     headers = [h.strip().lower() for h in reader.fieldnames]
-    original_headers = [h.strip() for h in reader.fieldnames]
 
     # 检测格式
     has_prompt = "prompt" in headers
@@ -105,20 +104,19 @@ def parse_csv_dataset(content: str) -> dict[str, Any]:
     if not has_expected:
         raise ValueError("CSV 缺少 expected 列")
 
-    # 建立列名映射（大小写不敏感）
-    col_map = {h: original_headers[i] for i, h in enumerate(headers)}
-
     tasks = []
-    for i, row in enumerate(reader):
-        prompt = (row.get(col_map.get("prompt", "prompt"), "") or "").strip()
-        expected = (row.get(col_map.get("expected", "expected"), "") or "").strip()
+    for i, raw_row in enumerate(reader):
+        # 列名大小写/空白不敏感：统一 strip+小写后按规范名取值
+        row = {k.strip().lower(): v for k, v in raw_row.items()}
+        prompt = (row.get("prompt", "") or "").strip()
+        expected = (row.get("expected", "") or "").strip()
         if not prompt:
             continue
 
-        task_id = (row.get(col_map.get("id", "id"), "") or "").strip() or f"T{i+1}"
-        dimension = (row.get(col_map.get("dimension", "dimension"), "") or "").strip() or "自定义"
-        rubric = (row.get(col_map.get("rubric_note", "rubric_note"), "") or "").strip()
-        difficulty = (row.get(col_map.get("difficulty", "difficulty"), "") or "").strip() or "进阶"
+        task_id = (row.get("id", "") or "").strip() or f"T{i+1}"
+        dimension = (row.get("dimension", "") or "").strip() or "自定义"
+        rubric = (row.get("rubric_note", "") or "").strip()
+        difficulty = (row.get("difficulty", "") or "").strip() or "进阶"
 
         if not rubric:
             rubric = "【仅评审可见】满分10分。根据回答与期望答案的匹配程度评分。"

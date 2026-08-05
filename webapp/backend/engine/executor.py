@@ -17,6 +17,20 @@ import httpx
 MAX_RETRIES = 1
 RETRY_BASE_DELAY = 3.0
 
+# 代码验真并发上限：避免多个 AppContainer/子进程同时压垮宿主
+_CODE_SEM = asyncio.Semaphore(2)
+
+
+async def _build_code_verify_safe(mode: str, raw_answer: str, task: dict[str, Any]) -> dict[str, Any]:
+    """带信号量与异常兜底地构建 code_verify（沙箱异常不中断整轮评测）。"""
+    from backend.engine.isolation.runners import build_code_verify
+
+    async with _CODE_SEM:
+        try:
+            return await asyncio.to_thread(build_code_verify, mode, raw_answer, task)
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "error", "reason": f"执行异常（可能已部分执行）: {exc}"}
+
 
 async def _call_one(
     client: httpx.AsyncClient,
@@ -87,9 +101,7 @@ async def execute_task(
     is_repeat_task: bool,
     repeat_index: int = 1,
 ) -> dict[str, Any]:
-    """执行单个任务。config 含 url/key/name/temperature/max_tokens/top_p。"""
-    from backend.engine.sandbox import extract_code, verify_code_task
-
+    """执行单个任务。config 含 url/key/name/temperature/max_tokens/top_p/code_verify_mode。"""
     tid = task["id"]
     prompt = task["prompt"]
     is_code_task = task["dimension"] == "代码能力"
@@ -111,16 +123,15 @@ async def execute_task(
     api_info["repeat_index"] = repeat_index
 
     code_verify = None
-    if is_code_task and raw_answer is not None:
-        code = extract_code(raw_answer)
-        if code and task.get("test_cases"):
-            code_verify = verify_code_task(code, task["test_cases"])
+    if is_code_task and raw_answer is not None and task.get("test_cases"):
+        mode = config.get("code_verify_mode", "off")
+        code_verify = await _build_code_verify_safe(mode, raw_answer, task)
 
     ans_entry: dict[str, Any] = {
         "id": tid, "raw_answer": raw_answer or "", "api_info": api_info,
     }
     if code_verify is not None:
-        ans_entry["code_verify"] = {"passed": code_verify["passed"], "total": code_verify["total"]}
+        ans_entry["code_verify"] = code_verify
     return ans_entry
 
 
