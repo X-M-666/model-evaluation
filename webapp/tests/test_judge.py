@@ -85,6 +85,14 @@ def test_fmt_code_verify_missing_status_defaults():
     assert "已禁用" in _fmt_code_verify({"passed": 5, "total": 5})
 
 
+def test_fmt_code_verify_non_dict_guard():
+    # 非 dict 真值入参（异常上游数据）不应抛 AttributeError（补强方案 #10）
+    assert _fmt_code_verify("字符串") == "未执行（已禁用）"
+    assert _fmt_code_verify(123) == "未执行（已禁用）"
+    assert _fmt_code_verify([1, 2]) == "未执行（已禁用）"
+    assert _fmt_code_verify(None) == "未执行（已禁用）"
+
+
 # ---- _build_blind_prompt ----
 
 def test_blind_prompt_uses_answer_x_y_labels():

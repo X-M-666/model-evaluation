@@ -23,6 +23,8 @@ from urllib.parse import urlsplit
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from backend import audit
+
 # 单机模式允许的 Host（testserver 为 TestClient 默认别名）
 SINGLE_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "testserver"})
 
@@ -108,6 +110,7 @@ async def security_middleware(request: Request, call_next):
         if not ok and path.endswith("/events"):
             ok = secrets.compare_digest(request.query_params.get("token", ""), token)
         if not ok:
+            audit.auth_failed(path)
             return JSONResponse({"detail": "未授权：需要有效的访问令牌"}, status_code=401)
         # token 已校验通过：从 scope 中剥离，避免进入 uvicorn 访问日志
         if path.endswith("/events") and request.query_params.get("token"):

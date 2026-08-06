@@ -54,7 +54,8 @@ $env:MODEL_DUEL_RATE_LIMIT = "30"                  # 可选：每 IP 每分钟�
 - 评测接口并发上限 2 个任务（防资源耗尽），文件上传上限 5MB、JSON 粘贴上限 2MB、数据集上限 200 题；超限请求在读取阶段即被截断，不会整体读入内存
 - SSE 进度流的令牌通过 URL 查询参数传递，服务端会在校验通过后将其从请求中剥离，避免出现在 uvicorn 访问日志中
 - **SSRF 防护**：模型 URL 仅允许公网 http/https 目标（自动解析全部 IP，拒绝回环/私网/链路本地/云元数据地址，如 `127.0.0.1`、`169.254.169.254`、`192.168.x.x`、`::1`）；内网网关/代理场景需显式设置 `MODEL_DUEL_ALLOW_PRIVATE_UPSTREAM=1` 放行私网目标
-- 生产环境建议置于反向代理后并启用 HTTPS（Origin 校验以浏览器视角的 Host 为准）
+- 生产环境**建议**置于反向代理后并启用 HTTPS（Origin 校验以浏览器视角的 Host 为准）；共享模式下**必须**启用 TLS 或置于可信反向代理之后，否则令牌与模型凭据会以明文在局域网传输
+- **审计日志**：关键操作（评测启动、评审提交、历史/数据集删除、鉴权失败）以 JSONL 追加至 `.eval/audit.log`，仅记录白名单字段并经递归脱敏，**永不包含 API Key**
 
 ## 使用说明
 
@@ -93,7 +94,7 @@ $env:MODEL_DUEL_RATE_LIMIT = "30"                  # 可选：每 IP 每分钟�
 
 ## API Key 安全
 
-- API Key 仅保存在后端内存中，**不落盘、不写入日志**
+- API Key 仅保存在后端内存中，**不落盘**；审计日志只记录事件白名单字段（时间/事件/对象/来源），写入前统一递归脱敏，不含任何 Key 明文
 - 持久化与对外响应统一经过递归脱敏：`report.json` 与历史/报告接口响应均不包含 `key` 字段
 - 历史记录的 config 文件中 Key 一律以 `***` 打码
 - 已运行过真实评测的用户：如担心旧历史泄露，请**先轮换相关 API Key**，再执行以下命令清洗历史文件（脱敏重写，`--dry-run` 可预览）：
@@ -131,8 +132,8 @@ python -m pytest tests --cov=backend --cov-report=term-missing
 
 分层说明：
 
-- **纯函数单元测试**：`test_parsers.py` / `test_datasets.py`（四种评测集格式的正常、边界与恶意输入）、`test_storage.py`（配置脱敏落盘、状态推断、损坏 JSON、数据集名消毒）、`test_report_builder.py`（报告构建空数据/异常状态）、`test_human_review.py`（X/Y 身份映射）、`test_ssrf.py`、`test_security.py`（Key 不落盘/不外泄）
-- **FastAPI 集成测试**：`test_access_control.py` / `test_limits.py`（认证、Host/Origin 校验、限流、并发、上传大小）、`test_recovery.py`（磁盘态任务重启后可评审）、`test_review_validation.py`（评分完整性/唯一性）、`test_report_reveal.py` / `test_report_rounds.py`（reveal 映射与多轮聚合语义）
+- **纯函数单元测试**：`test_parsers.py` / `test_datasets.py`（四种评测集格式的正常、边界与恶意输入）、`test_storage.py`（配置脱敏落盘、状态推断、损坏 JSON、数据集名消毒）、`test_tasks.py`（内置题库七维度完整性、T/TB 双题、代码/效率题用例形态、任务集生成与数据集转换）、`test_report_builder.py`（报告构建空数据/异常状态）、`test_human_review.py`（X/Y 身份映射）、`test_ssrf.py`、`test_security.py`（Key 不落盘/不外泄）
+- **FastAPI 集成测试**：`test_access_control.py` / `test_limits.py`（认证、Host/Origin 校验、限流、并发、上传大小）、`test_recovery.py`（磁盘态任务重启后可评审）、`test_review_validation.py`（评分完整性/唯一性）、`test_report_reveal.py` / `test_report_rounds.py`（reveal 映射与多轮聚合语义）、`test_audit.py`（审计日志白名单字段、递归脱敏、关键操作事件）
 - **浏览器端到端（本地）**：`test_xss_playwright.py` 需额外安装 `playwright` 与浏览器（`pip install playwright; python -m playwright install chromium`），未安装时自动跳过；CI 不运行此层
 
 约定：

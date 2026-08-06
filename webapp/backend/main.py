@@ -28,6 +28,7 @@ from backend.engine.human_review import (
 from backend.engine.report_builder import build_report, reveal_answers
 from backend.engine.parsers import get_parser, supported_extensions
 from backend.engine.datasets import validate_json_dataset
+from backend import audit
 from backend.access import security_middleware
 from backend.ssrf import validate_upstream_url, UpstreamUrlError
 from backend.storage import (
@@ -164,6 +165,7 @@ async def upload_dataset(file: UploadFile = File(...)):
     name = Path(filename).stem
     data["name"] = name
     save_dataset(name, data)
+    audit.dataset_uploaded(name)
 
     tasks = data.get("tasks", [])
     dims = list({t.get("dimension", "自定义") for t in tasks})
@@ -201,6 +203,7 @@ async def upload_dataset_json(request: Request):
 
     name = data.get("name", f"评测集_{int(time.time())}")
     save_dataset(name, data)
+    audit.dataset_uploaded(name)
 
     tasks = data.get("tasks", [])
     dims = list({t.get("dimension", "自定义") for t in tasks})
@@ -223,6 +226,7 @@ async def remove_dataset(name: str):
     ok = delete_dataset(name)
     if not ok:
         raise HTTPException(404, "dataset not found")
+    audit.dataset_deleted(name)
     return {"ok": True}
 
 
@@ -341,6 +345,7 @@ async def start_eval(req: StartRequest):
     }
 
     asyncio.create_task(_run_eval(job_id))
+    audit.eval_started(job_id)
     return StartResponse(job_id=job_id)
 
 
@@ -598,6 +603,7 @@ async def eval_review_submit(job_id: str, req: ReviewSubmission):
         round_verdicts, cfg, task_set, answers_a, answers_b, rounds_answers,
     )
     await _push_event(job_id, {"state": "completed"})
+    audit.review_submitted(job_id)
     return StartResponse(job_id=job_id)
 
 
@@ -628,6 +634,7 @@ async def mock_eval():
         "repeat_n": data["repeat_n"],
     }
     await _push_event(job_id, {"state": "reviewing"})
+    audit.eval_started(job_id, actor="mock")
     return {"job_id": job_id, "mock": True}
 
 
@@ -794,6 +801,7 @@ async def delete_history(job_id: str):
     ok = delete_job(job_id)
     if not ok:
         raise HTTPException(404, "job not found")
+    audit.history_deleted(job_id)
     return {"ok": True}
 
 

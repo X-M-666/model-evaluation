@@ -53,6 +53,18 @@
   `AssignProcessToJobObject` 可能失败，此时返回明确错误并回退 `off`，不影响主服务。
 - 主服务默认仅监听 `127.0.0.1`；对外暴露接口前请先确认隔离后端可用。
 
+## 部署与审计
+
+- **共享模式必须启用 TLS（或置于可信反向代理之后）**：局域网共享模式下若直接明文传输，
+  访问令牌与模型 API Key 可被同网段嗅探；Origin 校验以浏览器视角的 Host 为准，
+  反向代理须保持 Host 头一致。单机模式（默认 `127.0.0.1`）无需额外部署。
+- **审计日志**：关键操作（评测启动、评审提交、历史/数据集删除、鉴权失败）以 JSONL 追加到
+  `.eval/audit.log`。仅记录白名单字段（`ts/event/job_id/target/path/actor`），写入前统一
+  递归脱敏，API Key 等敏感内容永不进入日志；审计模块异常静默，不影响主流程。
+- **非 Windows 平台**：`native-sandbox` 仅支持 Windows（AppContainer 与 Job Object 为系统
+  内建能力），非 Windows 上自动回退 `off`（仅语法检查 + 展示），**不存在**"无隔离直接执行"
+  的路径；代码验真在 Linux/macOS 上不可用属预期行为。
+
 ## 验收对照
 
 见 `webapp/tests/test_sandbox.py` 与 `webapp/scripts/sandbox_selfcheck.py`，

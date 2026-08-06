@@ -45,11 +45,12 @@ async def _call_judge_model(
 
 def _fmt_code_verify(cv: dict) -> str:
     """格式化代码验真结果：未执行/异常时明确标注，避免误读为 0/N。"""
-    if not cv or cv.get("status") != "run":
-        if cv and cv.get("status") == "error":
+    if not isinstance(cv, dict):
+        return "未执行（已禁用）"
+    if cv.get("status") != "run":
+        if cv.get("status") == "error":
             return f"执行异常（可能已部分执行）：{cv.get('reason') or '未知错误'}"
-        reason = cv.get("reason", "") if isinstance(cv, dict) else ""
-        return f"未执行（{reason or '已禁用'}）"
+        return f"未执行（{cv.get('reason') or '已禁用'}）"
     return f"{cv.get('passed', '?')}/{cv.get('total', '?')}"
 
 
