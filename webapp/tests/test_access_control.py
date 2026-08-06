@@ -1,17 +1,25 @@
 # -*- coding: utf-8 -*-
-"""访问控制测试（issue #8）：认证 / Host 校验 / Origin 校验 / 写限流。"""
+"""访问控制测试（issue #8）：认证 / Host 校验 / Origin 校验 / 写限流。
+
+SSE ticket 相关（issue #13 / R2-004）：长期 Token 不再经 URL 传递，
+/events 仅接受 Authorization header 或短时单次 ticket。
+"""
 from __future__ import annotations
+
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from backend import main as main_module
 from backend import access
+from backend import sse_ticket
 
 
 @pytest.fixture
 def client():
     access._hits.clear()
+    sse_ticket._tickets.clear()
     return TestClient(main_module.app)
 
 
@@ -117,25 +125,94 @@ def test_shared_mode_cross_origin_still_rejected(shared_client):
     assert r.status_code == 403
 
 
-def test_shared_mode_sse_accepts_query_token(shared_client, monkeypatch):
-    # 先创建一个 job（mock），随后验证 events 路由的两种鉴权方式
-    r = shared_client.post(
-        "/api/eval/mock", headers={"Authorization": "Bearer secret-token-123"}
-    )
+def test_shared_mode_sse_bearer_and_ticket(shared_client):
+    """SSE 路由鉴权：Bearer header 合法；短时单次 ticket 合法；长期 Token 经 URL 一律拒绝。"""
+    headers = {"Authorization": "Bearer secret-token-123"}
+    r = shared_client.post("/api/eval/mock", headers=headers)
     assert r.status_code == 200
     job_id = r.json()["job_id"]
-    # 放入终止事件使 SSE 流尽快返回（默认 heartbeat 30s 会挂住测试）
-    def terminal_get(path, headers=None):
-        main_module._jobs[job_id]["sse_queue"].put_nowait({"type": "test", "state": "error"})
-        return shared_client.get(path, headers=headers)
 
+    # 放入终止事件使 SSE 流尽快返回（默认 heartbeat 30s 会挂住测试）
+    def terminal_get(path, req_headers=None):
+        main_module._jobs[job_id]["sse_queue"].put_nowait({"type": "test", "state": "error"})
+        return shared_client.get(path, headers=req_headers)
+
+    # 无凭据且未携带 ticket：401 + 审计（Bearer 失败路径）
     assert shared_client.get(f"/api/eval/{job_id}/events").status_code == 401
-    assert terminal_get(
-        f"/api/eval/{job_id}/events",
-        headers={"Authorization": "Bearer secret-token-123"},
-    ).status_code == 200
-    assert terminal_get(f"/api/eval/{job_id}/events?token=secret-token-123").status_code == 200
-    assert shared_client.get(f"/api/eval/{job_id}/events?token=wrong").status_code == 401
+    # 长期 Token 出现在 URL 中一律拒绝（R2-004 回归断言，未带 ticket 参数）
+    assert shared_client.get(f"/api/eval/{job_id}/events?token=secret-token-123").status_code == 401
+    # Bearer header 仍合法
+    assert terminal_get(f"/api/eval/{job_id}/events", req_headers=headers).status_code == 200
+
+
+def test_shared_mode_sse_ticket_flow(shared_client):
+    """签发 ticket → 凭 ticket 连接 events → 重放同一 ticket 被静默拒绝。"""
+    from backend import audit
+
+    headers = {"Authorization": "Bearer secret-token-123"}
+    job_id = shared_client.post("/api/eval/mock", headers=headers).json()["job_id"]
+
+    # 签发接口需要认证
+    assert shared_client.post(f"/api/eval/{job_id}/events/ticket").status_code == 401
+    r = shared_client.post(f"/api/eval/{job_id}/events/ticket", headers=headers)
+    assert r.status_code == 200
+    ticket = r.json()["ticket"]
+    assert ticket and r.json()["ttl_seconds"] > 0
+
+    # 伪造 ticket：静默 204（R3-001 残余 2），不记审计
+    n_events_before = len(audit.read_events())
+    assert shared_client.get(f"/api/eval/{job_id}/events?ticket=forged").status_code == 204
+    assert len(audit.read_events()) == n_events_before, "ticket 认证失败不应产生审计噪声"
+
+    # 正确 ticket → 200，且 ticket 已消耗（条目即删）
+    main_module._jobs[job_id]["sse_queue"].put_nowait({"type": "test", "state": "error"})
+    assert shared_client.get(f"/api/eval/{job_id}/events?ticket={ticket}").status_code == 200
+    assert ticket not in sse_ticket._tickets
+    # 重放同一 ticket → 204（单次，条目已删除）
+    assert shared_client.get(f"/api/eval/{job_id}/events?ticket={ticket}").status_code == 204
+
+
+def test_shared_mode_sse_ticket_expired(shared_client):
+    headers = {"Authorization": "Bearer secret-token-123"}
+    job_id = shared_client.post("/api/eval/mock", headers=headers).json()["job_id"]
+    ticket = shared_client.post(
+        f"/api/eval/{job_id}/events/ticket", headers=headers
+    ).json()["ticket"]
+    sse_ticket._tickets[ticket]["exp"] = time.monotonic() - 1
+    assert shared_client.get(f"/api/eval/{job_id}/events?ticket={ticket}").status_code == 204
+    assert ticket not in sse_ticket._tickets
+
+
+def test_shared_mode_sse_ticket_scope_mismatch(shared_client):
+    """A job 的 ticket 不能访问 B job 的 events（静默 204）。"""
+    headers = {"Authorization": "Bearer secret-token-123"}
+    job_a = shared_client.post("/api/eval/mock", headers=headers).json()["job_id"]
+    job_b = shared_client.post("/api/eval/mock", headers=headers).json()["job_id"]
+    ticket = shared_client.post(
+        f"/api/eval/{job_a}/events/ticket", headers=headers
+    ).json()["ticket"]
+    assert shared_client.get(f"/api/eval/{job_b}/events?ticket={ticket}").status_code == 204
+    # 作用域不匹配不消耗 ticket：正确 job 仍可用（R3-001 保持语义）
+    main_module._jobs[job_a]["sse_queue"].put_nowait({"type": "test", "state": "error"})
+    assert shared_client.get(f"/api/eval/{job_a}/events?ticket={ticket}").status_code == 200
+
+
+def test_shared_mode_sse_ticket_unknown_or_terminal_job(shared_client):
+    headers = {"Authorization": "Bearer secret-token-123"}
+    # 不存在的 job
+    assert shared_client.post(
+        "/api/eval/no-such-job/events/ticket", headers=headers
+    ).status_code == 404
+    # 终态 job（completed / error）拒绝签发，避免客户端挂在心跳上
+    job_id = shared_client.post("/api/eval/mock", headers=headers).json()["job_id"]
+    main_module._jobs[job_id]["state"] = "completed"
+    assert shared_client.post(
+        f"/api/eval/{job_id}/events/ticket", headers=headers
+    ).status_code == 409
+    main_module._jobs[job_id]["state"] = "error"
+    assert shared_client.post(
+        f"/api/eval/{job_id}/events/ticket", headers=headers
+    ).status_code == 409
 
 
 def test_shared_mode_rate_limit_write(shared_client):
@@ -162,6 +239,20 @@ def test_strip_query_token_unit():
     assert access._strip_query_param(b"token=x&a=1", b"token") == b"a=1"
     assert access._strip_query_param(b"a=1&b=2", b"token") == b"a=1&b=2"
     assert access._strip_query_param(b"token=&token=2", b"token") == b""
+
+
+def test_strip_query_ticket_unit():
+    assert access._strip_query_param(b"ticket=xyz", b"ticket") == b""
+    assert access._strip_query_param(b"a=1&ticket=xyz", b"ticket") == b"a=1"
+    assert access._strip_query_param(b"ticket=xyz&a=1", b"ticket") == b"a=1"
+    assert access._strip_query_param(b"a=1&b=2", b"ticket") == b"a=1&b=2"
+
+
+def test_job_id_from_events_path_unit():
+    assert access._job_id_from_events_path("/api/eval/abc123/events") == "abc123"
+    assert access._job_id_from_events_path("/api/eval/a/b/events") == ""
+    assert access._job_id_from_events_path("/api/eval/abc123/events/ticket") == ""
+    assert access._job_id_from_events_path("/api/dims") == ""
 
 
 def test_rate_limit_tracking_cap(monkeypatch):

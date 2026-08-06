@@ -79,7 +79,10 @@ def native_runner():
     runner = get_runner("native-sandbox")
     available, detail = runner.is_available()
     if not available:
-        pytest.skip(f"native-sandbox 不可用：{detail}（先运行 python -m scripts.sandbox_selfcheck）")
+        pytest.skip(
+            f"native-sandbox 不可用：{detail}"
+            "（先配置 MODEL_DUEL_SANDBOX_PYTHON 并运行 python -m scripts.sandbox_selfcheck）"
+        )
     return runner
 
 
@@ -189,6 +192,62 @@ def test_native_process_bomb_killed(native_runner):
     assert res["timed_out"] is False, "进程炸弹应被进程数配额拒绝，而非等墙钟超时"
 
 
+# 慢速输出脚本：避免单次大写入在 watcher 轮询前完成导致测试竞态
+# （生产环境恶意代码持续写入同样会被 0.1s 轮询捕获）
+_SLOW_STDOUT = (
+    "import sys, time\n"
+    "for _ in range(200):\n"
+    "    sys.stdout.write('x' * 6000)\n"
+    "    sys.stdout.flush()\n"
+    "    time.sleep(0.02)\n"
+    "print('done')\n"
+)
+_SLOW_STDERR = (
+    "import sys, time\n"
+    "for _ in range(200):\n"
+    "    sys.stderr.write('y' * 6000)\n"
+    "    sys.stderr.flush()\n"
+    "    time.sleep(0.02)\n"
+    "print('done')\n"
+)
+
+
+def test_native_output_overflow_stdout_killed(native_runner):
+    """输出配额（补强点3）：超限 stdout 在配额内被终止，不撑爆宿主磁盘。"""
+    res = native_runner.run(_SLOW_STDOUT)
+    assert res["ok"] is False
+    assert res.get("output_overflow") is True, res
+    assert res["timed_out"] is False
+    assert "配额" in (res.get("error") or "")
+
+
+def test_native_output_overflow_stderr_killed(native_runner):
+    """输出配额（补强点3）：超限 stderr 同样被终止。"""
+    res = native_runner.run(_SLOW_STDERR)
+    assert res["ok"] is False
+    assert res.get("output_overflow") is True, res
+
+
+def test_native_output_quota_configurable(native_runner):
+    """输出配额可配置：小配额下小输出也会被终止（验证配额参数生效）。"""
+    from backend.engine.isolation import windows_native
+
+    res = windows_native.run_code(_SLOW_STDOUT, limits={"max_output_bytes": 8 * 1024})
+    assert res["ok"] is False
+    assert res.get("output_overflow") is True, res
+
+
+def test_native_large_but_within_quota_output_ok(native_runner):
+    """配额内的大输出（100KB < 1MB）不被误杀；展示截断 max_output_chars 生效。"""
+    from backend.engine.isolation import windows_native
+
+    res = native_runner.run("print('x' * 100_000)")
+    assert res["ok"] is True
+    assert res.get("output_overflow") is False
+    assert len(res["stdout"]) <= windows_native.DEFAULT_LIMITS["max_output_chars"]
+    assert res["stdout"].startswith("xxxxx")
+
+
 def test_native_env_not_inherited(native_runner):
     os.environ["ARENA_TEST_SECRET"] = "secret-123"
     try:
@@ -222,7 +281,7 @@ def test_native_concurrent_isolation(native_runner):
     """
     from backend.engine.isolation import bootstrap
 
-    exe = bootstrap.ensure_runtime()
+    exe = bootstrap.resolve_runtime()
     wd_a = Path(tempfile.mkdtemp(prefix="arena_xrun_a_"))
     wd_b = Path(tempfile.mkdtemp(prefix="arena_xrun_b_"))
     results: dict[str, dict] = {}

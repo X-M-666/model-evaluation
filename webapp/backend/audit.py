@@ -52,6 +52,11 @@ def history_deleted(job_id: str, actor: str = "local") -> None:
     _append({"event": "history_deleted", "job_id": job_id, "actor": actor})
 
 
+def eval_cancelled(job_id: str, actor: str = "local") -> None:
+    """运行中评测被删除时记录取消事件（issue #14 / R2-005）。"""
+    _append({"event": "eval_cancelled", "job_id": job_id, "actor": actor})
+
+
 def dataset_uploaded(name: str, actor: str = "local") -> None:
     _append({"event": "dataset_uploaded", "target": name, "actor": actor})
 

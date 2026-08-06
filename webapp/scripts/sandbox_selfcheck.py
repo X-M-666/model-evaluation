@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""代码隔离环境自检：检测模式可用性、引导运行时、实测逃逸与资源限制。
+"""代码隔离环境自检：检测模式可用性、校验配置运行时、实测逃逸与资源限制。
 
-用法（在 webapp/ 目录下）：
+用法（在 webapp/ 目录下，须先配置 MODEL_DUEL_SANDBOX_PYTHON）：
     python -m scripts.sandbox_selfcheck
 """
 from __future__ import annotations
@@ -61,14 +61,16 @@ def main() -> int:
         available, detail = runner.is_available()
         print(f"    {m}: {'可用' if available else '不可用'} — {detail}")
 
-    # 2) 运行时引导
-    print("\n[2] 运行时引导")
-    try:
-        exe = bootstrap.ensure_runtime(quiet=True)
-        print(f"    embeddable python: {exe}")
-    except Exception as exc:
-        print(f"    引导失败: {exc}")
+    # 2) 运行时配置校验
+    print("\n[2] 运行时配置校验")
+    ready, detail = bootstrap.runtime_ready()
+    print(f"    {bootstrap.RUNTIME_ENV}: {detail}")
+    if not ready:
+        print(f"    运行时不可用：应用不会自动下载 Python。")
+        print(f"    请部署方预装自包含 Python（完整安装或 embeddable 发行包），")
+        print(f"    并将 {bootstrap.RUNTIME_ENV} 设为 python.exe 的绝对路径后重试。")
         return 1
+    exe = bootstrap.resolve_runtime()
 
     # 3) 逃逸/资源实测（native-sandbox）
     runner = get_runner("native-sandbox")
@@ -121,11 +123,11 @@ def main() -> int:
         res = windows_native.run_code(
             "import os; print(os.environ.get('ARENA_TEST_SECRET'))")
         leaked = "secret-123" in res["stdout"]
-        return not leaked, ("泄露！" if leaked else "宿主环境变量未继承 ✓")
+        return not leaked, ("泄露！" if leaked else "宿主环境变量未继承")
 
     ok, detail = _check("环境不继承", env_check)
     all_ok = all_ok and ok
-    print(f"    {'✓' if ok else '✗'} 环境不继承: {detail}")
+    print(f"    {'[OK]' if ok else '[FAIL]'} 环境不继承: {detail}")
 
     # 5) 并发隔离（互异 SID）
     def concurrent_check() -> tuple[bool, str]:
@@ -157,11 +159,11 @@ def main() -> int:
             return False, "任务 B 读到了任务 A 的工作目录文件（SID 未隔离）"
         if "DENIED" not in res.get("b", {}).get("stdout", ""):
             return False, f"任务 B 读取结果异常: {res['b']}"
-        return True, "并发任务 SID 互异，跨任务工作目录互相不可读 ✓"
+        return True, "并发任务 SID 互异，跨任务工作目录互相不可读"
 
     ok, detail = _check("并发隔离", concurrent_check)
     all_ok = all_ok and ok
-    print(f"    {'✓' if ok else '✗'} 并发隔离: {detail}")
+    print(f"    {'[OK]' if ok else '[FAIL]'} 并发隔离: {detail}")
 
     print("\n== 自检" + ("通过" if all_ok else "发现失败项") + " ==")
     return 0 if all_ok else 1

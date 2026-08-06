@@ -10,7 +10,11 @@ import re
 
 import pytest
 
-from backend.engine.datasets import parse_csv_dataset, validate_json_dataset
+from backend.engine.datasets import (
+    DatasetValidationError,
+    parse_csv_dataset,
+    validate_json_dataset,
+)
 
 AUTO_NAME = re.compile(r"^评测集_\d{8}_\d{6}$")
 CSV_NAME = re.compile(r"^CSV评测集_\d{8}_\d{6}$")
@@ -188,6 +192,101 @@ def test_csv_empty_prompt_row_skipped_id_keeps_row_index():
     assert [t["id"] for t in data["tasks"]] == ["T2"]
 
 
-def test_csv_duplicate_ids_allowed():
-    data = parse_csv_dataset("id,prompt,expected\nDUP,q1,e1\nDUP,q2,e2\n")
-    assert [t["id"] for t in data["tasks"]] == ["DUP", "DUP"]
+def test_csv_duplicate_ids_rejected():
+    """重复显式 id（issue #15）→ 拒绝并指出重复位置与 id 值。"""
+    with pytest.raises(DatasetValidationError, match=r"tasks\[1\]\.id.*重复.*'DUP'"):
+        parse_csv_dataset("id,prompt,expected\nDUP,q1,e1\nDUP,q2,e2\n")
+
+
+# ---------------- 类型边界 / ID 唯一性（issue #15 / R2-006） ----------------
+
+def test_json_non_string_name_rejected():
+    with pytest.raises(DatasetValidationError, match=r"^name: 必须是字符串"):
+        validate_json_dataset('{"name":123,"tasks":[{"prompt":"p","expected":"e"}]}')
+
+
+def test_json_non_string_description_rejected():
+    with pytest.raises(DatasetValidationError, match=r"^description: 必须是字符串"):
+        validate_json_dataset('{"description":[1],"tasks":[{"prompt":"p","expected":"e"}]}')
+
+
+def test_json_non_string_prompt_rejected():
+    with pytest.raises(DatasetValidationError, match=r"tasks\[0\]\.prompt: 必须是字符串"):
+        validate_json_dataset('{"tasks":[{"prompt":123}]}')
+
+
+def test_json_non_string_expected_rejected():
+    with pytest.raises(DatasetValidationError, match=r"tasks\[0\]\.expected: 必须是字符串"):
+        validate_json_dataset('{"tasks":[{"prompt":"p","expected":["e"]}]}')
+
+
+def test_json_non_string_id_rejected():
+    with pytest.raises(DatasetValidationError, match=r"tasks\[0\]\.id: 必须是字符串"):
+        validate_json_dataset('{"tasks":[{"id":123,"prompt":"p","expected":"e"}]}')
+
+
+def test_json_explicit_empty_id_rejected():
+    with pytest.raises(DatasetValidationError, match=r"tasks\[0\]\.id: 去空白后不能为空"):
+        validate_json_dataset('{"tasks":[{"id":"","prompt":"p","expected":"e"}]}')
+
+
+def test_json_duplicate_ids_rejected_with_position():
+    with pytest.raises(DatasetValidationError, match=r"tasks\[2\]\.id: 与 tasks\[0\]\.id 重复（'X'）"):
+        validate_json_dataset(
+            '{"tasks":[{"id":"X","prompt":"p1","expected":"e1"},'
+            '{"id":"Y","prompt":"p2","expected":"e2"},'
+            '{"id":"X","prompt":"p3","expected":"e3"}]}'
+        )
+
+
+def test_json_auto_id_avoids_explicit_id():
+    """显式 id=T2 在后续任务：自动编号必须避让，不产生重复（issue #15 方向 3）。"""
+    data = validate_json_dataset('{"tasks":[{"id":"T2","prompt":"p1","expected":"e1"},'
+                                 '{"prompt":"p2","expected":"e2"}]}')
+    assert [t["id"] for t in data["tasks"]] == ["T2", "T3"]
+
+
+def test_json_explicit_id_after_auto_avoids_collision():
+    """显式 id=T1 出现在自动编号任务之后：预扫机制保证自动编号不与之冲突。"""
+    data = validate_json_dataset('{"tasks":[{"prompt":"p1","expected":"e1"},'
+                                 '{"id":"T1","prompt":"p2","expected":"e2"}]}')
+    assert [t["id"] for t in data["tasks"]] == ["T2", "T1"]
+
+
+def test_json_test_cases_non_list_rejected():
+    with pytest.raises(DatasetValidationError, match=r"tasks\[0\]\.test_cases: 必须是数组"):
+        validate_json_dataset('{"tasks":[{"prompt":"p","test_cases":{"input":"i"}}]}')
+
+
+def test_json_test_cases_entry_not_object_rejected():
+    with pytest.raises(DatasetValidationError, match=r"tasks\[0\]\.test_cases\[0\]: 必须是对象"):
+        validate_json_dataset('{"tasks":[{"prompt":"p","test_cases":["x"]}]}')
+
+
+def test_json_test_cases_entry_non_string_expected_rejected():
+    with pytest.raises(DatasetValidationError, match=r"tasks\[0\]\.test_cases\[0\]\.expected: 必须是字符串"):
+        validate_json_dataset('{"tasks":[{"prompt":"p","test_cases":[{"input":"i","expected":5}]}]}')
+
+
+def test_json_task_count_over_limit_rejected():
+    tasks = ",".join(f'{{"id":"T{i}","prompt":"p{i}","expected":"e{i}"}}' for i in range(201))
+    with pytest.raises(DatasetValidationError, match="题目数量超过上限 200"):
+        validate_json_dataset(f'{{"tasks":[{tasks}]}}')
+
+
+def test_json_duplicate_ids_across_headers_and_sources_rejected():
+    """同一重复 id 在简化/完整格式混合出现同样被拒（格式一致性）。"""
+    payload = '{"tasks":[{"id":"X","prompt":"p1","expected":"e1"},{"id":"X","prompt":"p2","expected":"e2"}]}'
+    with pytest.raises(DatasetValidationError):
+        validate_json_dataset(payload)
+
+
+def test_csv_blank_id_cell_rejected_when_id_column_present():
+    """id 列存在但单元格为空 → 显式空 id 拒绝（issue #15）。"""
+    with pytest.raises(DatasetValidationError, match=r"tasks\[1\]\.id: 去空白后不能为空"):
+        parse_csv_dataset("id,prompt,expected\nA,q1,e1\n,q2,e2\n")
+
+
+def test_csv_no_id_column_auto_numbering_ok():
+    data = parse_csv_dataset("prompt,expected\nq1,e1\nq2,e2\n")
+    assert [t["id"] for t in data["tasks"]] == ["T1", "T2"]

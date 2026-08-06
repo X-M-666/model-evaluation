@@ -118,6 +118,75 @@ def test_dataset_task_count_at_limit_ok(client):
     assert r.status_code == 200
 
 
+# ---------------- 数据集字段校验（issue #15 / R2-006） ----------------
+
+def _upload_json(client, inner: str):
+    body = json.dumps({"content": inner}).encode()
+    return client.post(
+        "/api/datasets/upload-json",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+
+
+def test_upload_json_non_string_name_400(client):
+    r = _upload_json(client, '{"name":123,"tasks":[{"prompt":"p","expected":"e"}]}')
+    assert r.status_code == 400
+    assert "name" in r.json()["detail"]
+    assert "500" not in r.text
+
+
+def test_upload_json_non_string_prompt_400(client):
+    r = _upload_json(client, '{"tasks":[{"prompt":123}]}')
+    assert r.status_code == 400
+    assert "tasks[0].prompt" in r.json()["detail"]
+
+
+def test_upload_json_duplicate_ids_400_no_persist(client):
+    inner = '{"name":"dup","tasks":[{"id":"X","prompt":"p1","expected":"e1"},' \
+            '{"id":"X","prompt":"p2","expected":"e2"}]}'
+    r = _upload_json(client, inner)
+    assert r.status_code == 400
+    assert "重复" in r.json()["detail"]
+    assert "dup" not in {d["name"] for d in main_module.list_datasets()}
+
+
+def test_upload_json_explicit_empty_id_400(client):
+    r = _upload_json(client, '{"tasks":[{"id":"","prompt":"p","expected":"e"}]}')
+    assert r.status_code == 400
+    assert "tasks[0].id" in r.json()["detail"]
+
+
+def test_upload_csv_blank_id_cell_400(client):
+    csv_text = "id,prompt,expected\nA,q1,e1\n,q2,e2\n"
+    r = client.post("/api/datasets/upload", files={"file": ("blankid.csv", csv_text.encode())})
+    assert r.status_code == 400
+    assert "tasks[1].id" in r.json()["detail"]
+
+
+def test_upload_markdown_duplicate_ids_400(client):
+    md_text = "### X\n**题目：** p\n**期望：** e\n### X\n**题目：** q\n**期望：** e2\n"
+    r = client.post("/api/datasets/upload", files={"file": ("dup.md", md_text.encode())})
+    assert r.status_code == 400
+    assert "重复" in r.json()["detail"]
+
+
+def test_upload_filename_stem_too_long_400(client):
+    """超长文件名 stem 在名称覆盖时被拒（避免上传成功/启动评测失败不一致）。"""
+    body = b'{"name":"ok","tasks":[{"prompt":"x","expected":"y"}]}'
+    r = client.post("/api/datasets/upload", files={"file": ("a" * 201 + ".json", body)})
+    assert r.status_code == 400
+    assert "name" in r.json()["detail"]
+
+
+def test_upload_whitespace_filename_stem_falls_back(client):
+    """纯空白 stem 回退解析器生成名，上传仍成功。"""
+    body = b'{"name":"ok","tasks":[{"prompt":"x","expected":"y"}]}'
+    r = client.post("/api/datasets/upload", files={"file": ("   .json", body)})
+    assert r.status_code == 200
+    assert r.json()["name"] == "ok"
+
+
 # ---------------- 并发上限 ----------------
 
 PUBLIC_URL = "https://8.8.8.8/v1"
@@ -153,7 +222,8 @@ def test_concurrency_pending_counts(client):
     assert r.status_code == 429
 
 
-def test_concurrency_mock_not_counted(client):
+def test_concurrency_mock_not_counted(client, monkeypatch):
+    monkeypatch.setattr(main_module, "_run_eval", _stub_run_eval)
     main_module._jobs.clear()
     for i in range(2):
         main_module._jobs[f"mock-job-{i}"] = {
@@ -166,8 +236,18 @@ def test_concurrency_mock_not_counted(client):
     main_module._jobs.clear()
 
 
-def test_concurrency_under_limit_ok(client):
+def test_concurrency_under_limit_ok(client, monkeypatch):
+    monkeypatch.setattr(main_module, "_run_eval", _stub_run_eval)
     main_module._jobs.clear()
     r = client.post("/api/eval/start", json=_payload())
     assert r.status_code == 200
     main_module._jobs.clear()
+
+
+async def _stub_run_eval(job_id):
+    """桩化后台评测任务：200 路径测试只验证并发计数门禁，不发起真实模型调用。
+
+    返回 200 后 main 会用 asyncio.create_task 启动 _run_eval（独立事件循环），
+    不清除桩会导致真实连接 8.8.8.8 或任务抛 KeyError（issue #11 复审 R2-002）。
+    """
+    pass

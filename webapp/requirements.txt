@@ -1,6 +1,9 @@
 fastapi>=0.111
 uvicorn[standard]>=0.30
-httpx>=0.27
+# httpx>=0.27,<0.29：SSRF 防护通过 httpcore network_backend 扩展点注入校验层
+# （httpx 0.27 起移除 _connect_tcp 钩子）。上界锁定 httpcore 1.x 接口族，
+# 升级时须回归 test_ssrf.py 全部用例
+httpx>=0.27,<0.29
 pydantic>=2.7
 python-multipart>=0.0.7
 pytest>=8.0

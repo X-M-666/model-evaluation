@@ -6,6 +6,9 @@
   （localhost/127.0.0.1/::1/testserver），阻止 DNS rebinding 与局域网直连。
 - 共享模式（已设置 MODEL_DUEL_TOKEN）：全部 /api/* 需 Bearer token（compare_digest
   恒定时间比较）；跳过 Host 校验（局域网 IP 访问合法）；启用写请求限流。
+- SSE 进度流（/events）：EventSource 无法携带自定义 header，改用短时单次
+  ticket（POST /api/eval/{job_id}/events/ticket 签发，见 sse_ticket.py），
+  长期 Token 不再出现在任何 URL 中。
 
 Origin 校验仅作用于写方法（POST/PUT/DELETE/PATCH）：Origin 存在则必须与请求
 Host 同源；无 Origin 时 Referer 必须同源；两者皆无（curl/TestClient）放行，
@@ -21,14 +24,18 @@ from collections import deque
 from urllib.parse import urlsplit
 
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from backend import audit
+from backend import sse_ticket
 
 # 单机模式允许的 Host（testserver 为 TestClient 默认别名）
 SINGLE_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "testserver"})
 
 _HOST_PORT_RE = re.compile(r"^(\[[^]]*\]|[^\[\]:]+)(?::\d{1,5})?$")
+
+# 从 /api/eval/{job_id}/events 提取 job_id（ticket 作用域校验用）
+_EVENTS_JOB_RE = re.compile(r"^/api/eval/([^/]+)/events$")
 
 WRITE_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
 
@@ -85,6 +92,12 @@ def _rate_limit(ip: str) -> bool:
     return True
 
 
+def _job_id_from_events_path(path: str) -> str:
+    """从 /api/eval/{job_id}/events 提取 job_id，格式不符返回空串。"""
+    m = _EVENTS_JOB_RE.match(path)
+    return m.group(1) if m else ""
+
+
 def _strip_query_param(qs: bytes, name: bytes) -> bytes:
     """从 query string 中移除指定参数（uvicorn access log 读取 scope["query_string"]）。"""
     if not qs:
@@ -99,6 +112,20 @@ async def security_middleware(request: Request, call_next):
     if not (path.startswith("/api/") or path in DOCS_PATHS):
         return await call_next(request)
 
+    # 认证材料剥离（R3-001 残余 1）：无论认证成败、无论部署模式，
+    # ticket / token 查询参数都不进入 uvicorn/代理访问日志。
+    # 先取值再剥离——request.query_params 是 cached_property，
+    # 首次访问缓存原始解析结果，后续 consume 仍能拿到 ticket。
+    ticket = request.query_params.get("ticket", "")
+    if ticket:
+        request.scope["query_string"] = _strip_query_param(
+            request.scope.get("query_string", b""), b"ticket"
+        )
+    if "token" in request.query_params:
+        request.scope["query_string"] = _strip_query_param(
+            request.scope.get("query_string", b""), b"token"
+        )
+
     token = os.environ.get("MODEL_DUEL_TOKEN", "")
     shared = bool(token)
 
@@ -106,17 +133,17 @@ async def security_middleware(request: Request, call_next):
     if shared:
         auth = request.headers.get("authorization", "")
         ok = auth.startswith("Bearer ") and secrets.compare_digest(auth[7:].strip(), token)
-        # EventSource 无法携带自定义 header，允许 SSE 路由使用查询参数 token
-        if not ok and path.endswith("/events"):
-            ok = secrets.compare_digest(request.query_params.get("token", ""), token)
+        if not ok and path.endswith("/events") and ticket:
+            # EventSource 无法禁用自动重连：断线重连会复用已消费 ticket。
+            # 对 ticket 认证失败静默 204、不记审计（R3-001 残余 2）——
+            # ticket 为 128 位随机单次凭证，重放/伪造无利用价值；
+            # 未携带 ticket 的请求仍走下方 401 + 审计。
+            ok = sse_ticket.consume(ticket, _job_id_from_events_path(path))
+            if not ok:
+                return Response(status_code=204)
         if not ok:
             audit.auth_failed(path)
             return JSONResponse({"detail": "未授权：需要有效的访问令牌"}, status_code=401)
-        # token 已校验通过：从 scope 中剥离，避免进入 uvicorn 访问日志
-        if path.endswith("/events") and request.query_params.get("token"):
-            request.scope["query_string"] = _strip_query_param(
-                request.scope.get("query_string", b""), b"token"
-            )
     elif not _host_allowed(request.headers.get("host", "")):
         return JSONResponse({"detail": "非法 Host 头"}, status_code=403)
 

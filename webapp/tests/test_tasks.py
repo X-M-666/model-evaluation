@@ -15,6 +15,7 @@ import re
 
 import pytest
 
+from backend.engine.datasets import DatasetValidationError
 from backend.engine.tasks import (
     DIMENSIONS,
     QUESTION_POOL,
@@ -236,3 +237,36 @@ def test_dataset_multiple_dimensions_total():
     ]
     ts = build_task_set_from_dataset(_raw_dataset(tasks))
     assert ts["meta"]["total"] == 3
+
+
+# ---- build_task_set_from_dataset：篡改数据拒绝（issue #15 / R2-006） ----
+
+def test_dataset_duplicate_ids_rejected():
+    tasks = [
+        {"id": "X", "prompt": "p1"},
+        {"id": "X", "prompt": "p2"},
+    ]
+    with pytest.raises(DatasetValidationError, match="重复"):
+        build_task_set_from_dataset(_raw_dataset(tasks))
+
+
+def test_dataset_non_string_prompt_rejected():
+    tasks = [{"id": "X", "prompt": 123}]
+    with pytest.raises(DatasetValidationError, match=r"tasks\[0\]\.prompt: 必须是字符串"):
+        build_task_set_from_dataset(_raw_dataset(tasks))
+
+
+def test_dataset_non_string_id_rejected():
+    tasks = [{"id": 123, "prompt": "p"}]
+    with pytest.raises(DatasetValidationError, match=r"tasks\[0\]\.id: 必须是字符串"):
+        build_task_set_from_dataset(_raw_dataset(tasks))
+
+
+def test_dataset_auto_ids_avoid_explicit_collision():
+    """篡改/手工数据集：缺省 id 自动补全时不得与显式 id 冲突。"""
+    tasks = [
+        {"id": "T2", "prompt": "p1"},
+        {"prompt": "p2"},
+    ]
+    ts = build_task_set_from_dataset(_raw_dataset(tasks))
+    assert [t["id"] for t in ts["tasks"]] == ["T2", "T3"]

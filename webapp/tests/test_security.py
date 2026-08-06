@@ -128,3 +128,55 @@ def test_e2e_no_key_persisted_or_returned(client):
         assert resp.status_code == 200, f"{endpoint} -> {resp.status_code}"
         assert SENTINEL not in resp.text, f"{endpoint} 响应含明文 Key"
         _assert_no_sensitive(resp.json())
+
+
+def test_legacy_plaintext_config_never_leaks_via_report_api(client):
+    """回归（补强点2 / issue #1 验收3）：修复前遗留的明文 config.json
+    （save_config 打码之前的旧记录）不得经报告接口泄露。
+
+    构造一份修复前风格的 config.json（model_a.key / model_b.key 为明文），
+    请求报告/历史/状态接口，断言响应中既无 key 字段也无明文值。
+    """
+    from backend.storage import create_job_id
+
+    job_id = create_job_id()
+    job_dir = storage.BASE_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    legacy_cfg = {
+        "created_at": "2026-01-01T00:00:00Z",
+        "model_a": {"name": "LegacyA", "url": "https://a/v1", "key": SENTINEL,
+                    "temperature": 0.7, "max_tokens": 4096},
+        "model_b": {"name": "LegacyB", "url": "https://b/v1", "key": SENTINEL,
+                    "temperature": 0.7, "max_tokens": 4096},
+        "repeat_n": 1,
+    }
+    (job_dir / "config.json").write_text(
+        json.dumps(legacy_cfg, ensure_ascii=False), encoding="utf-8")
+    # 手工构造"已完成"状态所需的最小文件集（report 分支从磁盘恢复）
+    (job_dir / "tasks.json").write_text(
+        json.dumps({"tasks": [{"id": "T1", "dimension": "知识能力",
+                               "prompt": "p", "test_cases": []}]}, ensure_ascii=False),
+        encoding="utf-8")
+    answers = {"model": "LegacyA", "api": {"name": "LegacyA", "url": "https://a/v1"},
+               "answers": [{"id": "T1", "raw_answer": "x", "api_info": {"status": "ok"}}]}
+    (job_dir / "answers-a.json").write_text(
+        json.dumps(answers, ensure_ascii=False), encoding="utf-8")
+    (job_dir / "answers-b.json").write_text(
+        json.dumps(answers, ensure_ascii=False), encoding="utf-8")
+    (job_dir / "verdict.json").write_text(
+        json.dumps({"scores": [{"id": "T1", "answer_x": 5, "answer_y": 5, "winner": "tie"}],
+                    "totals": {"answer_x": 5, "answer_y": 5},
+                    "revealed": {"answer_x": "LegacyA", "answer_y": "LegacyB",
+                                 "answer_x_file": "a", "answer_y_file": "b"}},
+                   ensure_ascii=False), encoding="utf-8")
+
+    for endpoint in (
+        f"/api/eval/{job_id}/report",
+        f"/api/history/{job_id}",
+        f"/api/eval/{job_id}/status",
+    ):
+        resp = client.get(endpoint)
+        assert resp.status_code == 200, f"{endpoint} -> {resp.status_code}"
+        assert SENTINEL not in resp.text, f"{endpoint} 响应含明文 Key"
+        _assert_no_sensitive(resp.json())

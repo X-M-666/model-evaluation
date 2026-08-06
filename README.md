@@ -52,7 +52,7 @@ $env:MODEL_DUEL_RATE_LIMIT = "30"                  # 可选：每 IP 每分钟�
 - 写请求（POST/PUT/DELETE）校验 Origin/Referer 与 Host 同源，阻止跨站请求伪造（CSRF）
 - 写请求限流：共享模式下每 IP 每分钟最多 30 次（`MODEL_DUEL_RATE_LIMIT` 可调）
 - 评测接口并发上限 2 个任务（防资源耗尽），文件上传上限 5MB、JSON 粘贴上限 2MB、数据集上限 200 题；超限请求在读取阶段即被截断，不会整体读入内存
-- SSE 进度流的令牌通过 URL 查询参数传递，服务端会在校验通过后将其从请求中剥离，避免出现在 uvicorn 访问日志中
+- SSE 进度流（EventSource 无法携带自定义 header）：前端先通过已认证的 `POST /api/eval/{job_id}/events/ticket` 换取**短时（默认 60 秒）、单次、仅限该任务 events 路由**的随机 ticket，URL 只携带 ticket，用后即焚；长期管理员令牌不出现在 URL、Referer 或访问日志中，反向代理 / WAF / APM 日志不会记录长期令牌（`MODEL_DUEL_SSE_TICKET_TTL` 可调有效期）。ticket 认证失败（如浏览器断线自动重连复用已消费 ticket）静默返回 `204` 且不记审计，避免日志与审计噪声；未携带 ticket 的未认证请求仍返回 `401` 并记录审计
 - **SSRF 防护**：模型 URL 仅允许公网 http/https 目标（自动解析全部 IP，拒绝回环/私网/链路本地/云元数据地址，如 `127.0.0.1`、`169.254.169.254`、`192.168.x.x`、`::1`）；内网网关/代理场景需显式设置 `MODEL_DUEL_ALLOW_PRIVATE_UPSTREAM=1` 放行私网目标
 - 生产环境**建议**置于反向代理后并启用 HTTPS（Origin 校验以浏览器视角的 Host 为准）；共享模式下**必须**启用 TLS 或置于可信反向代理之后，否则令牌与模型凭据会以明文在局域网传输
 - **审计日志**：关键操作（评测启动、评审提交、历史/数据集删除、鉴权失败）以 JSONL 追加至 `.eval/audit.log`，仅记录白名单字段并经递归脱敏，**永不包含 API Key**
@@ -105,12 +105,31 @@ $env:MODEL_DUEL_RATE_LIMIT = "30"                  # 可选：每 IP 每分钟�
   ```
 - 评测记录可通过页面「删除」按钮移除
 
+## 任务生命周期（issue #14）
+
+- 状态机：`executing` →（作答完成）→ `reviewing` →（提交评分）→ `completed`；异常落 `error`。
+- 删除运行中评测（`DELETE /api/history/{job_id}`）为**同步语义**：先置 `cancelling`、取消后台任务并等待其安全终止（最长约 10 秒兜底），随后才移除内存状态与磁盘目录，返回 `200`；后台流程不会在删除后复活任何文件，上游模型请求随之中断。未知任务返回 `404`，已终态任务直接删除。
+- 任务被删除/取消后状态为 `cancelled`，其评审提交接口返回 `409`，避免已删除数据被重新写入。
+- 服务关闭时统一取消并回收全部后台任务。
+
 ## 代码验真与安全
 
 - 模型输出属于**不可信外部输入**，默认不对其执行：`code_verify_mode=off` 时仅展示代码并做语法检查
-- 显式选择 `native-sandbox` 后，代码题会在 **Windows AppContainer（文件/网络硬隔离）+ Job Object（内存/CPU/进程数配额）** 中逐用例执行，超时强杀进程树，不继承宿主环境变量
+- 显式选择 `native-sandbox` 后，代码题会在 **Windows AppContainer（文件/网络硬隔离）+ Job Object（内存/CPU/进程数配额）** 中逐用例执行，超时强杀进程树，不继承宿主环境变量；stdout/stderr 输出另有 1MB 磁盘配额（运行期监视，超限即终止进程，防止撑爆宿主磁盘，`limits.max_output_bytes` 可调）
+- **运行时由部署方预装并提供（issue #16）**：应用不会自行下载、解压、安装或更新 Python。设置环境变量 `MODEL_DUEL_SANDBOX_PYTHON` 为部署方预装 `python.exe` 的**绝对路径**；未配置或运行时非法时 `native-sandbox` 明确不可用（fail closed），不会联网下载，也不会从系统 PATH 中寻找替代解释器
+- **自包含单目录要求**：指向的必须是自包含运行时（stdlib 位于 `python.exe` 所在目录内，如完整安装根目录或 embeddable 发行包目录）；venv 等跨目录运行时在校验时被拒绝（AppContainer 仅授权该目录，沙箱内无法读取外部 stdlib）
+- **信任边界**：运行时的安装、补丁、来源与完整性验证由部署流程负责；应用仅引用配置路径，并校验路径/文件类型/版本/自包含性
 - 开启前请运行自检：`cd webapp; python -m scripts.sandbox_selfcheck`
 - 完整威胁模型见 [SECURITY.md](SECURITY.md)
+
+### 预装沙箱运行时（Windows）
+
+任选其一，均由部署方完成，应用不参与：
+
+1. **完整安装**：使用官方安装包安装 Python 后，将安装根目录 `python.exe` 的绝对路径写入 `MODEL_DUEL_SANDBOX_PYTHON`。
+2. **embeddable 发行包**：手动从 python.org 下载 `python-3.12.x-embed-amd64.zip`，解压到独立目录（如 `C:\arena\runtime\`），将其中 `python.exe` 的绝对路径写入 `MODEL_DUEL_SANDBOX_PYTHON`。下载后请自行核验制品完整性（官方 SHA-256 等）。
+
+版本升级或补丁时，由部署方重新放置运行时并重新执行自检；应用不感知也不自动更新。
 
 ## 自动化测试（issue #11）
 
@@ -133,15 +152,20 @@ python -m pytest tests --cov=backend --cov-report=term-missing
 分层说明：
 
 - **纯函数单元测试**：`test_parsers.py` / `test_datasets.py`（四种评测集格式的正常、边界与恶意输入）、`test_storage.py`（配置脱敏落盘、状态推断、损坏 JSON、数据集名消毒）、`test_tasks.py`（内置题库七维度完整性、T/TB 双题、代码/效率题用例形态、任务集生成与数据集转换）、`test_report_builder.py`（报告构建空数据/异常状态）、`test_human_review.py`（X/Y 身份映射）、`test_ssrf.py`、`test_security.py`（Key 不落盘/不外泄）
-- **FastAPI 集成测试**：`test_access_control.py` / `test_limits.py`（认证、Host/Origin 校验、限流、并发、上传大小）、`test_recovery.py`（磁盘态任务重启后可评审）、`test_review_validation.py`（评分完整性/唯一性）、`test_report_reveal.py` / `test_report_rounds.py`（reveal 映射与多轮聚合语义）、`test_audit.py`（审计日志白名单字段、递归脱敏、关键操作事件）
+- **FastAPI 集成测试**：`test_access_control.py` / `test_limits.py`（认证、Host/Origin 校验、限流、并发、上传大小）、`test_recovery.py`（磁盘态任务重启后可评审）、`test_review_validation.py`（评分完整性/唯一性）、`test_report_reveal.py` / `test_report_rounds.py`（reveal 映射与多轮聚合语义）、`test_audit.py`（审计日志白名单字段、递归脱敏、关键操作事件）、`test_proxy_logs.py`（真实 uvicorn 访问日志验证：ticket / 长期 Token 永不进入日志，含认证失败路径）
 - **浏览器端到端（本地）**：`test_xss_playwright.py` 需额外安装 `playwright` 与浏览器（`pip install playwright; python -m playwright install chromium`），未安装时自动跳过；CI 不运行此层
 
 约定：
 
-- 所有测试**零真实网络**：模型调用全部走内存 mock，请求经 TestClient/本机端口完成
+- 所有测试**零真实网络**：模型调用全部走内存 mock，请求经 TestClient/本机端口完成；
+  `conftest.py` 的全局网络封锁 fixture 会在未显式 mock 的真实外连（仅回环放行）发生时直接抛错并指出调用位置
 - 存储目录由 `conftest.py` 自动重定向到临时目录，**不污染 `.eval/` 与 `webapp/data/`**；失败日志不含敏感字段
 - 修复相关 Issue 时，先加入能失败的回归测试，再验证修复（红 → 绿）
-- CI（GitHub Actions）：pull request 与主分支推送时自动执行全部纯测试层并生成覆盖率报告
+- CI（GitHub Actions）：**Linux / macOS / Windows 三平台矩阵**，pull request 与主分支推送时自动执行。
+  Linux/macOS 运行公共测试（`-m "not native"`）；Windows 先将 setup-python 解释器路径写入
+  `MODEL_DUEL_SANDBOX_PYTHON`，再跑 `scripts.sandbox_selfcheck` 完整自检（校验配置运行时并实测
+  逃逸/配额），最后全量执行测试（含 Windows 原生隔离测试）
+
 
 ## 项目结构
 

@@ -446,31 +446,73 @@ async function startEval(){
     const d = await r.json();
     const jobId = d.job_id;
     progText.textContent = `任务已创建: ${jobId}，连接实时进度...`;
-    const evtToken = getToken() ? '?token='+encodeURIComponent(getToken()) : '';
-    const evtSource = new EventSource(API+`/api/eval/${jobId}/events${evtToken}`);
+    connectEvents(jobId, progText, btn);
+  }catch(e){
+    progText.textContent = '提交失败: '+e.message;
+    btn.disabled = false;
+  }
+}
+
+// ---- SSE 进度流：短时单次 ticket 连接（issue #13，长期 Token 不进 URL） ----
+let sseDone = false;
+let sseRetries = 0;
+const SSE_RETRY_MAX = 5;
+
+async function connectEvents(jobId, progText, btn){
+  sseDone = false;
+  sseRetries = 0;
+  let evtSource = null;
+  const onTerminal = () => { sseDone = true; if(evtSource) evtSource.close(); };
+  const open = async () => {
+    let ticket;
+    try{
+      const r = await apiFetch(API+`/api/eval/${jobId}/events/ticket`, {method:'POST'});
+      if(!r.ok){
+        const err = await r.json().catch(()=>({}));
+        progText.textContent = '进度连接失败: ' + (err.detail || '无法获取 SSE ticket');
+        btn.disabled = false;
+        return;
+      }
+      ticket = (await r.json()).ticket;
+    }catch(e){
+      progText.textContent = '进度连接失败: ' + e.message;
+      btn.disabled = false;
+      return;
+    }
+    evtSource = new EventSource(API+`/api/eval/${jobId}/events?ticket=${encodeURIComponent(ticket)}`);
+    evtSource.onopen = () => { sseRetries = 0; };
     evtSource.onmessage = (e) => {
       const evt = JSON.parse(e.data);
       const round = evt.round ? `[${evt.round}] ` : '';
       if(evt.state==='executing') progText.textContent = `${round}模型调用中 ${evt.progress||''}`;
       else if(evt.state==='reviewing'){
         progText.textContent = '模型作答完成，跳转人工双盲评审...';
-        evtSource.close();
+        onTerminal();
         setTimeout(()=>window.location='/review.html?job='+jobId, 500);
       }else if(evt.state==='completed'){
         progText.textContent = '完成，跳转报告页...';
-        evtSource.close();
+        onTerminal();
         setTimeout(()=>window.location='/report.html?job='+jobId, 600);
       }else if(evt.state==='error'){
         progText.textContent = '错误: '+evt.error;
-        evtSource.close();
+        onTerminal();
         btn.disabled = false;
       }
     };
-    evtSource.onerror = ()=>{ progText.textContent = '连接断开，刷新查看状态'; evtSource.close(); btn.disabled=false; };
-  }catch(e){
-    progText.textContent = '提交失败: '+e.message;
-    btn.disabled = false;
-  }
+    evtSource.onerror = () => {
+      evtSource.close();
+      if(sseDone) return;
+      if(sseRetries >= SSE_RETRY_MAX){
+        progText.textContent = '连接断开，刷新查看状态';
+        btn.disabled = false;
+        return;
+      }
+      sseRetries++;
+      progText.textContent = `连接断开，重连中(${sseRetries}/${SSE_RETRY_MAX})...`;
+      setTimeout(open, Math.min(16000, 1000 * Math.pow(2, sseRetries - 1)));
+    };
+  };
+  await open();
 }
 
 // ---- 模拟评测 ----
@@ -543,7 +585,7 @@ async function loadHistory(){
     if(!d.jobs||!d.jobs.length){ el.innerHTML='<em>暂无历史记录</em>'; window.__jobsList = []; return; }
     window.__jobsList = d.jobs.slice(0,10);
     el.innerHTML = d.jobs.slice(0,10).map((j,i)=>{
-      const stateTag = j.state==='completed' ? '<span class="tag done">completed</span>'
+      const stateTag = (j.state==='completed' || j.state==='cancelled') ? '<span class="tag done">'+esc(j.state)+'</span>'
         : j.state==='reviewing' ? '<span class="tag">reviewing</span>'
         : '<span class="tag pending">'+esc(j.state)+'</span>';
       const link = j.state==='reviewing'

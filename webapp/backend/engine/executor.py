@@ -13,6 +13,7 @@ import time
 from typing import Any
 
 import httpx
+from backend.ssrf import build_upstream_client
 
 MAX_RETRIES = 1
 RETRY_BASE_DELAY = 3.0
@@ -148,7 +149,8 @@ async def _execute_model(
 
     answers: list[dict[str, Any]] = []
     total = len(tasks)
-    async with httpx.AsyncClient() as client:
+    # 统一走 SSRF 校验客户端：连接前重新解析并按公网性过滤（DNS 重绑定防护）
+    async with build_upstream_client() as client:
         for i, task in enumerate(tasks):
             tid = task["id"]
             is_repeat_task = stability_repeat is not None and tid in stability_repeat

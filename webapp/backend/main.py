@@ -12,6 +12,7 @@ import re
 import secrets
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -27,10 +28,16 @@ from backend.engine.human_review import (
 )
 from backend.engine.report_builder import build_report, reveal_answers
 from backend.engine.parsers import get_parser, supported_extensions
-from backend.engine.datasets import validate_json_dataset
+from backend.engine.datasets import (
+    _as_str,
+    MAX_NAME_LEN,
+    DatasetValidationError,
+    validate_json_dataset,
+)
 from backend import audit
+from backend import sse_ticket
 from backend.access import security_middleware
-from backend.ssrf import validate_upstream_url, UpstreamUrlError
+from backend.ssrf import build_upstream_client, validate_upstream_url, UpstreamUrlError
 from backend.storage import (
     create_job_id, save_config, save_task_set, save_answers,
     save_verdict, save_error, save_report, save_reveal, load_reveal,
@@ -41,16 +48,58 @@ from backend.storage import (
 from backend.schemas import StartRequest, StartResponse, ReviewSubmission
 from backend.security import redact_sensitive, sanitize_config
 
-app = FastAPI(title="模型对决评测平台", version="0.3.0")
-app.middleware("http")(security_middleware)
-
-_jobs: dict[str, dict] = {}
-
-# 资源限制（issue #8）：并发执行任务上限 / 上传大小 / 数据集题数
+# 资源限制（issue #8）：并发执行任务上限 / 上传大小（数据集题数上限在 datasets.py 校验层统一生效）
 MAX_ACTIVE_JOBS = 2
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_JSON_BYTES = 2 * 1024 * 1024
-MAX_DATASET_TASKS = 200
+
+# 任务生命周期（issue #14 / R2-005）：运行中评测的删除必须先取消后台任务
+CANCEL_GRACE_SECONDS = 5
+TERMINAL_STATES = ("completed", "error", "cancelled")
+
+
+class JobCancelled(asyncio.CancelledError):
+    """协作取消标记：_run_eval 在持久化/状态转换检查点抛出。
+
+    绝不从 execute_all 内部（progress_cb 等）抛出——asyncio.gather 的
+    return_exceptions=True 会吞掉子协程的 CancelledError 并作为返回值返回。
+    """
+
+
+def _task_done(job_id: str, task: asyncio.Task):
+    """后台任务结束回调：回收引用并消费异常，避免未获取 Task 异常告警。"""
+    _tasks.pop(job_id, None)
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is not None:
+        print(f"[eval] job {job_id} 后台任务异常: {exc}", file=sys.stderr)
+
+
+async def _shutdown_cancel_all():
+    """服务关闭：统一取消并回收全部后台任务。"""
+    pending = list(_tasks.values())
+    for t in pending:
+        t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    _tasks.clear()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    yield
+    await _shutdown_cancel_all()
+
+
+app = FastAPI(title="模型对决评测平台", version="0.3.0", lifespan=lifespan)
+app.middleware("http")(security_middleware)
+
+_jobs: dict[str, dict] = {}
+_tasks: dict[str, asyncio.Task] = {}
 
 
 async def _read_body_limited(request: Request, limit: int) -> bytes:
@@ -119,8 +168,13 @@ async def get_dims():
 # ---- 代码验真模式状态 ----
 
 @app.get("/api/code-runner/status")
-async def code_runner_status():
-    """报告当前可用的代码验真模式（off 恒可用；native-sandbox 视环境而定）。"""
+async def code_runner_status(request: Request):
+    """报告当前平台的代码验真能力（issue #11 复审 R2-008）。
+
+    probe 为组件存在性快检（请求路径）；selfcheck 会真实创建受限进程，
+    较重，仅按 ?selfcheck=1 显式触发（自检脚本 / CI 用）。
+    """
+    from backend.engine.isolation import windows_native
     from backend.engine.isolation.runners import MODES, get_runner
 
     modes = {}
@@ -128,7 +182,18 @@ async def code_runner_status():
         runner = get_runner(m)
         available, detail = runner.is_available()
         modes[m] = {"available": available, "detail": detail}
-    return {"default_mode": "off", "modes": modes}
+    probe_ok, probe_detail = windows_native.probe()
+    result = {
+        "default_mode": "off",
+        "platform": sys.platform,
+        "modes": modes,
+        "native": {"probe_ok": probe_ok, "probe_detail": probe_detail},
+    }
+    if request.query_params.get("selfcheck") == "1":
+        selfcheck_ok, selfcheck_detail = windows_native.selfcheck()
+        result["native"]["selfcheck_ok"] = selfcheck_ok
+        result["native"]["selfcheck_detail"] = selfcheck_detail
+    return result
 
 
 # ---- 数据集管理 API ----
@@ -158,11 +223,16 @@ async def upload_dataset(file: UploadFile = File(...)):
         data = parser(text)
     except ValueError as e:
         raise HTTPException(400, f"数据集格式错误: {e}")
-    if len(data.get("tasks", [])) > MAX_DATASET_TASKS:
-        raise HTTPException(400, f"题目数量超过上限 {MAX_DATASET_TASKS}")
 
-    # 用文件名（不含扩展名）作为数据集名称
-    name = Path(filename).stem
+    # 用文件名（不含扩展名）作为数据集名称。名称覆盖发生在解析校验之后，
+    # 须对 stem 重新做名称校验：超长/非规范 stem 直接 400，避免上传成功
+    # 却在启动评测时被拒的体验不一致（issue #15）；空/纯空白 stem 回退解析器名。
+    stem = Path(filename).stem
+    try:
+        name = _as_str(stem, "name", max_len=MAX_NAME_LEN)
+    except DatasetValidationError as e:
+        raise HTTPException(400, f"数据集格式错误: {e}")
+    name = name or data.get("name") or "dataset"
     data["name"] = name
     save_dataset(name, data)
     audit.dataset_uploaded(name)
@@ -198,8 +268,6 @@ async def upload_dataset_json(request: Request):
         data = validate_json_dataset(raw)
     except ValueError as e:
         raise HTTPException(400, f"数据集格式错误: {e}")
-    if len(data.get("tasks", [])) > MAX_DATASET_TASKS:
-        raise HTTPException(400, f"题目数量超过上限 {MAX_DATASET_TASKS}")
 
     name = data.get("name", f"评测集_{int(time.time())}")
     save_dataset(name, data)
@@ -243,7 +311,8 @@ async def test_connection(config: StartRequest):
             url = cfg.url.rstrip("/") + "/chat/completions"
             payload = {"model": cfg.name, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 8}
             headers = {"Authorization": f"Bearer {cfg.key}", "Content-Type": "application/json"}
-            async with httpx.AsyncClient(follow_redirects=False) as client:
+            # 与正式评测同策略：连接前重新解析并过滤非公网 IP（DNS 重绑定防护）
+            async with build_upstream_client() as client:
                 resp = await client.post(url, json=payload, headers=headers, timeout=15)
                 body = resp.json()
                 if resp.status_code >= 400:
@@ -304,7 +373,10 @@ async def start_eval(req: StartRequest):
         dataset = load_dataset(req.dataset_name)
         if dataset is None:
             raise HTTPException(404, f"评测集 '{req.dataset_name}' 不存在")
-        task_set = build_task_set_from_dataset(dataset)
+        try:
+            task_set = build_task_set_from_dataset(dataset)
+        except DatasetValidationError as e:
+            raise HTTPException(400, f"数据集格式错误: {e}")
     else:
         task_set = build_task_set(dims=req.dims, seed=seed, num_questions=req.num_questions)
 
@@ -344,7 +416,9 @@ async def start_eval(req: StartRequest):
         "repeat_n": req.repeat_n,
     }
 
-    asyncio.create_task(_run_eval(job_id))
+    task = asyncio.create_task(_run_eval(job_id))
+    _tasks[job_id] = task
+    task.add_done_callback(lambda t, jid=job_id: _task_done(jid, t))
     audit.eval_started(job_id)
     return StartResponse(job_id=job_id)
 
@@ -362,27 +436,71 @@ def _mark_error(job_id: str, message: str):
         pass
 
 
+def _job_cancelled(job_id: str) -> bool:
+    """任务是否应停止：job 已从内存移除（并发删除）或处于 cancelling。"""
+    j = _jobs.get(job_id)
+    return j is None or j.get("state") == "cancelling"
+
+
+async def _request_cancel(job_id: str):
+    """将运行中任务置为 cancelling 并推送事件，随后由删除方调用 task.cancel()。"""
+    j = _jobs.get(job_id)
+    if j is None or j.get("state") == "cancelling":
+        return
+    j["state"] = "cancelling"
+    await _push_event(job_id, {"state": "cancelling"})
+
+
 async def _run_eval(job_id: str):
+    """后台执行入口：包装 _run_eval_impl，取消时统一收尾并终止任务。"""
+    try:
+        await _run_eval_impl(job_id)
+    except asyncio.CancelledError:
+        j = _jobs.get(job_id)
+        if j is not None:
+            j["state"] = "cancelled"
+        await _push_event(job_id, {"state": "cancelled"})
+        raise
+
+
+async def _run_eval_impl(job_id: str):
     """后台执行：出题→调用双模型→生成 X/Y 盲评映射→等待人工评审。
 
     评审阶段由用户在前端打分（POST /api/eval/{id}/review），
     本协程在作答完成后即退出，不再调用 AI 评审。
+
+    取消协议（issue #14 / R2-005）：每次持久化与状态转换前检查取消标记；
+    删除方先置 cancelling 再 task.cancel()，本协程在任何 await 点被中断，
+    故目录删除后不会复活任何文件。
     """
-    cfg = _jobs[job_id]["config"]
-    task_set = _jobs[job_id]["task_set"]
+    j = _jobs.get(job_id)
+    if j is None:
+        return
+    cfg = j["config"]
+    task_set = j["task_set"]
     total_tasks = task_set["meta"]["total"]
-    repeat_n = _jobs[job_id].get("repeat_n", 1)
+    repeat_n = j.get("repeat_n", 1)
 
     all_rounds: list[dict] = []
     for round_idx in range(repeat_n):
         round_label = f"第{round_idx+1}/{repeat_n}轮" if repeat_n > 1 else ""
 
-        _jobs[job_id]["state"] = "executing"
-        _jobs[job_id]["progress"] = f"0/{total_tasks}"
+        if _job_cancelled(job_id):
+            raise JobCancelled
+        j = _jobs.get(job_id)
+        if j is None:
+            raise JobCancelled
+        j["state"] = "executing"
+        j["progress"] = f"0/{total_tasks}"
         await _push_event(job_id, {"state": "executing", "progress": f"0/{total_tasks}", "round": round_label})
 
         async def progress_cb(label, done, total):
-            _jobs[job_id]["progress"] = f"{done}/{total}"
+            j = _jobs.get(job_id)
+            if j is None or j.get("state") == "cancelling":
+                if j is not None:
+                    j["cancel_requested"] = True
+                return
+            j["progress"] = f"{done}/{total}"
             await _push_event(job_id, {"state": "executing", "progress": f"{done}/{total}", "round": round_label})
 
         try:
@@ -390,31 +508,52 @@ async def _run_eval(job_id: str):
                 task_set, config_a=cfg["model_a"], config_b=cfg["model_b"], progress_cb=progress_cb,
             )
         except Exception as e:
-            _jobs[job_id]["state"] = "error"
-            _jobs[job_id]["error"] = f"模型调用失败: {e}"
+            if _job_cancelled(job_id):
+                raise JobCancelled
+            j = _jobs.get(job_id)
+            if j is None:
+                raise JobCancelled
+            j["state"] = "error"
+            j["error"] = f"模型调用失败: {e}"
             await _push_event(job_id, {"state": "error", "error": str(e)})
             _mark_error(job_id, f"模型调用失败: {e}")
             return
+
+        # execute_all 内部可能因取消标记而停止（gather 吞掉子协程异常），
+        # 返回后必须复查：取消态一律不得落盘（防目录复活）。
+        if _job_cancelled(job_id):
+            raise JobCancelled
+        if _jobs.get(job_id, {}).get("cancel_requested"):
+            raise JobCancelled
 
         # 保存本轮答卷（round 文件 + 覆盖当前答卷）
         save_answers(job_id, f"a-r{round_idx+1}", answers_a)
         save_answers(job_id, f"b-r{round_idx+1}", answers_b)
         save_answers(job_id, "a", answers_a)
         save_answers(job_id, "b", answers_b)
-        _jobs[job_id]["answers_a"] = answers_a
-        _jobs[job_id]["answers_b"] = answers_b
+        j = _jobs.get(job_id)
+        if j is None:
+            raise JobCancelled
+        j["answers_a"] = answers_a
+        j["answers_b"] = answers_b
         all_rounds.append({"a": answers_a, "b": answers_b})
 
-    _jobs[job_id]["rounds_answers"] = all_rounds
+    j = _jobs.get(job_id)
+    if j is None:
+        raise JobCancelled
+    j["rounds_answers"] = all_rounds
 
     # 生成并持久化 X/Y 身份映射（重启不丢）
     reveal = make_reveal(repeat_n)
     save_reveal(job_id, reveal)
-    _jobs[job_id]["reveal"] = reveal
+    j = _jobs.get(job_id)
+    if j is None:
+        raise JobCancelled
+    j["reveal"] = reveal
 
     # 进入人工评审阶段，等待用户打分
-    _jobs[job_id]["state"] = "reviewing"
-    _jobs[job_id]["progress"] = "0/0"
+    j["state"] = "reviewing"
+    j["progress"] = "0/0"
     await _push_event(job_id, {"state": "reviewing"})
 
 
@@ -559,6 +698,8 @@ async def eval_review_submit(job_id: str, req: ReviewSubmission):
     restored = _load_job_state(job_id)
     if restored is None:
         raise HTTPException(404, "job not found")
+    if _jobs.get(job_id, {}).get("state") in ("cancelling", "cancelled"):
+        raise HTTPException(409, "该任务已被取消或删除，无法提交评分")
     cfg, task_set, rounds_answers, repeat_n = restored
 
     if load_review(job_id) is not None:
@@ -655,6 +796,21 @@ async def eval_status(job_id: str):
     }
 
 
+@app.post("/api/eval/{job_id}/events/ticket")
+async def eval_events_ticket(job_id: str):
+    """为 SSE 进度流签发短时单次 ticket（issue #13）。
+
+    认证由中间件以 Authorization header 兜底；ticket 仅限该 job 的 /events
+    路由，使用一次后立即失效。终态 job 不再签发，避免客户端挂在心跳上。
+    """
+    if job_id not in _jobs:
+        raise HTTPException(404, "job not found")
+    if _jobs[job_id]["state"] in TERMINAL_STATES or _jobs[job_id]["state"] == "cancelling":
+        raise HTTPException(409, "job already finished")
+    ticket = sse_ticket.issue(job_id)
+    return {"ticket": ticket, "ttl_seconds": sse_ticket.TTL_SECONDS}
+
+
 @app.get("/api/eval/{job_id}/events")
 async def eval_events(job_id: str):
     if job_id not in _jobs:
@@ -670,7 +826,7 @@ async def eval_events(job_id: str):
                     yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
                     continue
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                if event.get("state") in ("completed", "error"):
+                if event.get("state") in TERMINAL_STATES:
                     break
         except asyncio.CancelledError:
             pass
@@ -754,6 +910,10 @@ async def eval_report(job_id: str):
     answers_b = files.get("answers-b.json")
     cfg = files.get("config.json")
 
+    # 纵深防御（issue #1 验收3）：修复前遗留的旧记录 config.json 可能含
+    # 明文 Key（save_config 打码只对新记录生效），报告接口同样须脱敏
+    cfg = redact_sensitive(cfg)
+
     # 从磁盘恢复全部轮次答卷（多轮时 answers-a-r{n}.json；旧记录回退单轮）
     rounds_answers: list[dict] = []
     repeat_n = int((cfg or {}).get("repeat_n", 1))
@@ -795,7 +955,30 @@ async def eval_report(job_id: str):
 
 @app.delete("/api/history/{job_id}")
 async def delete_history(job_id: str):
+    """删除历史记录。运行中的任务先取消并等待后台协程安全终止，再删内存与磁盘，
+    保证目录/文件不会由后台流程复活（issue #14 / R2-005）。
+
+    语义：运行中删除 = 置 cancelling → task.cancel() → 等待回收（含兜底超时）
+    → 完整清理后返回 200；未知任务 404；目录删除只发生在任务停止之后。
+    """
     from backend.storage import delete_job
+
+    task = _tasks.get(job_id)
+    if task is not None:
+        if not task.done():
+            await _request_cancel(job_id)
+            task.cancel()
+            for _ in range(2):
+                _, pending = await asyncio.wait({task}, timeout=CANCEL_GRACE_SECONDS)
+                if not pending:
+                    break
+            else:
+                # 极端场景（如阻塞线程未归位）：取消已送达，任务只能在下一个
+                # await 点退出，且所有持久化前都有取消检查，删除后不会复活。
+                print(f"[eval] job {job_id} 取消等待超时，继续删除（任务仍在回收）", file=sys.stderr)
+            audit.eval_cancelled(job_id)
+        _tasks.pop(job_id, None)
+
     if job_id in _jobs:
         _jobs.pop(job_id)
     ok = delete_job(job_id)

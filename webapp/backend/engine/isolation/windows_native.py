@@ -7,7 +7,8 @@
 - Job Object：内存上限、CPU 时间上限、活动进程数上限、KILL_ON_JOB_CLOSE；
   超时后 TerminateJobObject 强杀整棵进程树。
 - 环境变量白名单：不继承宿主凭据与多余环境变量。
-- 运行解释器为 bootstrap 提供的自包含 embeddable Python。
+- 运行解释器为部署方配置的自包含 Python 运行时（MODEL_DUEL_SANDBOX_PYTHON，
+  校验见 bootstrap；应用不下载、不解压、不更新任何运行时）。
 
 仅支持 Windows（win32）。标准用户即可运行，无需管理员。
 """
@@ -32,6 +33,7 @@ DEFAULT_LIMITS = {
     "cpu_time_sec": 5,
     "max_active_processes": 8,
     "max_output_chars": 4096,
+    "max_output_bytes": 1024 * 1024,  # stdout/stderr 单文件磁盘硬上限（Job Object 无 IO 配额）
 }
 
 APPCONTAINER_NAME = "arena.code-sandbox"
@@ -295,21 +297,51 @@ def _appcontainer_sid(name: str) -> tuple[ctypes.c_void_p, str]:
 
 # ---- 文件/ACL ----
 
-def _grant_sid(workdir: Path, sid_str: str, perms: str) -> None:
+def _grant_sid(workdir: Path, sid_str: str, perms: str, timeout: int = 30) -> None:
     """用 icacls 将目录 ACL 授予容器 SID（目录为当前用户所有，无需管理员）。"""
     import subprocess
 
     proc = subprocess.run(
         ["icacls", str(workdir), "/grant", f"*{sid_str}:{perms}", "/T", "/Q"],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=timeout,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"icacls 授权失败({workdir}): {proc.stderr.strip()}")
 
 
+#: 运行时目录授权缓存：key=(SID, 目录, mtime_ns)。ACL 持久化在目录上，
+#: 无需每次执行重复递归授权（完整安装树 icacls /T 可能超过 30s）。
+#: 目录被部署方替换（mtime 变化）时自动失效，下次执行重新授权。
+_GRANT_CACHE: set[tuple[str, str, int]] = set()
+_GRANT_LOCK = threading.Lock()
+
+
+def _grant_runtime_sid(runtime_dir: Path, sid_str: str) -> None:
+    """为容器 SID 授权运行时目录读取/执行（进程内缓存，仅首次实际执行）。"""
+    try:
+        stamp = (sid_str, str(runtime_dir), runtime_dir.stat().st_mtime_ns)
+    except OSError:
+        stamp = (sid_str, str(runtime_dir), 0)
+    with _GRANT_LOCK:
+        if stamp in _GRANT_CACHE:
+            return
+    _grant_sid(runtime_dir, sid_str, "(OI)(CI)RX", timeout=120)
+    with _GRANT_LOCK:
+        _GRANT_CACHE.add(stamp)
+
+
 def _build_env_block(env: dict[str, str]) -> bytes:
     data = "".join(f"{k}={v}\0" for k, v in env.items())
     return (data + "\0").encode("utf-16le")
+
+
+def _read_capped(path: Path, max_chars: int) -> str:
+    """限量读取子进程输出文件：最多读 max_chars+1 字符，避免大文件整体入内存。"""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            return fh.read(max_chars + 1)[:max_chars]
+    except OSError:
+        return ""
 
 
 # ---- 进程启动 ----
@@ -344,9 +376,31 @@ def probe() -> tuple[bool, str]:
         return False, f"AppContainer 初始化失败: {exc}"
     from backend.engine.isolation import bootstrap
 
-    if not bootstrap.runtime_ready():
-        return False, f"运行时不完整（{bootstrap.python_exe()}），请先运行 python -m scripts.sandbox_selfcheck"
+    ready, detail = bootstrap.runtime_ready()
+    if not ready:
+        return False, f"运行时不完整（{detail}），请按 README 配置 {bootstrap.RUNTIME_ENV} 后重试"
     return True, "AppContainer + Job Object 可用"
+
+
+def selfcheck() -> tuple[bool, str]:
+    """真实执行一次最小无害任务，验证受限进程可启动且输出回传正常。
+
+    与 probe() 的区别（R2-008 复审）：probe() 只验证组件存在（快检，
+    用于请求路径）；selfcheck() 实际创建受限进程，验证安全边界生效
+    （用于 sandbox_selfcheck 脚本与 Windows CI）。
+    """
+    ok, detail = probe()
+    if not ok:
+        return False, detail
+    try:
+        res = run_code("print(1+1)")
+    except Exception as exc:  # noqa: BLE001
+        return False, f"最小任务执行异常: {exc}"
+    if not res.get("ok"):
+        return False, f"最小任务执行失败: {res}"
+    if res.get("stdout", "").strip() != "2":
+        return False, f"stdout 异常: {res.get('stdout')!r}"
+    return True, "受限进程启动 + 输出回传正常"
 
 
 def _spawn(
@@ -356,7 +410,7 @@ def _spawn(
     stdin_text: str,
     limits: dict[str, Any],
 ) -> dict[str, Any]:
-    """以 AppContainer + Job Object 启动 embeddable python 执行 code。
+    """以 AppContainer + Job Object 启动部署方配置的 python 执行 code。
 
     通过文件传递代码/输入/输出（stdin 重定向自 input.txt，
     stdout/stderr 重定向至容器可写的 stdout.txt/stderr.txt），
@@ -403,10 +457,11 @@ def _spawn(
             # ---- 工作目录授权（容器 SID 可读写，其余路径仍被系统拒绝）----
             _grant_sid(workdir, sid_str, "(OI)(CI)RXWM")
 
-            # ---- 运行时授权：AppContainer 需可读取 embeddable python 目录----
-            # （python.exe 与 DLL 位于 %LOCALAPPDATA%\arena_python，宿主 ACL
-            # 不含容器 SID，否则子进程以 STATUS_DLL_NOT_FOUND 启动失败）
-            _grant_sid(python_exe.parent, sid_str, "(OI)(CI)RX")
+            # ---- 运行时授权：AppContainer 需可读取部署方配置的运行时目录----
+            # （python.exe 与 DLL 位于部署方配置的目录，宿主 ACL
+            # 不含容器 SID，否则子进程以 STATUS_DLL_NOT_FOUND 启动失败；
+            # 授权按目录缓存，避免每次执行都对完整安装树递归 icacls）
+            _grant_runtime_sid(python_exe.parent, sid_str)
 
             # ---- 标准输入/输出文件 ----
             h_in = _create_io_file(in_file, read=True)
@@ -479,13 +534,42 @@ def _spawn(
                         f"AssignProcessToJobObject 失败（宿主进程可能已处于不可嵌套的 Job）：WinError {err}")
                 kernel32.ResumeThread(pi.hThread)
 
-                # ---- 等待 / 超时强杀 ----
-                timeout_ms = int(float(limits.get("timeout_sec", 15)) * 1000)
-                wait = kernel32.WaitForSingleObject(pi.hProcess, timeout_ms)
-                timed_out = wait == WAIT_TIMEOUT
-                if timed_out:
-                    kernel32.TerminateJobObject(job, 1)
-                    kernel32.WaitForSingleObject(pi.hProcess, 5000)
+                # ---- 输出大小监视（Job Object 无 IO 配额，需自行兜底）----
+                # 恶意代码可无限写 stdout/stderr 填满宿主磁盘；监视线程
+                # 在运行期间轮询输出文件大小，超限即 TerminateJobObject 强杀。
+                max_bytes = int(limits.get("max_output_bytes", 1024 * 1024))
+                overflowed = False
+                stop = threading.Event()
+                watcher = None
+
+                def _watch_output():
+                    nonlocal overflowed
+                    while not stop.is_set():
+                        for p in (out_file, err_file):
+                            try:
+                                if p.stat().st_size > max_bytes:
+                                    overflowed = True
+                                    kernel32.TerminateJobObject(job, 1)
+                                    return
+                            except OSError:
+                                pass
+                        time.sleep(0.1)
+
+                try:
+                    watcher = threading.Thread(target=_watch_output, daemon=True)
+                    watcher.start()
+
+                    # ---- 等待 / 超时强杀 ----
+                    timeout_ms = int(float(limits.get("timeout_sec", 15)) * 1000)
+                    wait = kernel32.WaitForSingleObject(pi.hProcess, timeout_ms)
+                    timed_out = wait == WAIT_TIMEOUT
+                    if timed_out:
+                        kernel32.TerminateJobObject(job, 1)
+                        kernel32.WaitForSingleObject(pi.hProcess, 5000)
+                finally:
+                    stop.set()
+                    if watcher is not None:
+                        watcher.join(timeout=5)
                 # 无论正常退出与否都终止 Job，确保子孙进程不残留
                 kernel32.TerminateJobObject(job, 1)
                 rc = wintypes.DWORD()
@@ -501,13 +585,20 @@ def _spawn(
                 kernel32.DeleteProcThreadAttributeList(attr_buf)
 
             max_chars = int(limits.get("max_output_chars", 4096))
+            if overflowed:
+                error_msg = f"输出超出配额上限（{max_bytes} 字节）"
+            elif timed_out:
+                error_msg = "运行超时（超过隔离配额）"
+            else:
+                error_msg = None
             return {
-                "ok": not timed_out and rc.value == 0,
-                "stdout": out_file.read_text(encoding="utf-8", errors="replace")[:max_chars],
-                "stderr": err_file.read_text(encoding="utf-8", errors="replace")[:max_chars],
+                "ok": not timed_out and not overflowed and rc.value == 0,
+                "stdout": _read_capped(out_file, max_chars),
+                "stderr": _read_capped(err_file, max_chars),
                 "timed_out": timed_out,
+                "output_overflow": overflowed,
                 "returncode": rc.value,
-                "error": "运行超时（超过隔离配额）" if timed_out else None,
+                "error": error_msg,
             }
         finally:
             for h in handles:
@@ -528,7 +619,7 @@ def run_code(code: str, stdin_text: str = "", limits: dict[str, Any] | None = No
     from backend.engine.isolation import bootstrap
 
     limits = {**DEFAULT_LIMITS, **(limits or {})}
-    python_exe_path = bootstrap.ensure_runtime()
+    python_exe_path = bootstrap.resolve_runtime()
     workdir = Path(tempfile.mkdtemp(prefix="arena_iso_"))
     try:
         return _spawn(python_exe_path, workdir, code, stdin_text, limits)

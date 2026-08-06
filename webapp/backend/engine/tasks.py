@@ -9,6 +9,8 @@ from __future__ import annotations
 import random
 from typing import Any
 
+from backend.engine.datasets import validate_standard_dataset
+
 # 七大能力维度（与评测体系一致）
 DIMENSIONS = [
     "知识能力",
@@ -275,7 +277,12 @@ def build_task_set(
 
 
 def build_task_set_from_dataset(dataset: dict[str, Any]) -> dict[str, Any]:
-    """从上传的评测集构建任务集（结构与 build_task_set 输出一致）。"""
+    """从上传的评测集构建任务集（结构与 build_task_set 输出一致）。
+
+    issue #15（R2-006）：入口统一校验，拒绝类型非法 / 空 id / 重复 id 等
+    篡改数据集（磁盘文件可被手工编辑），校验失败在评测启动前以 400 返回。
+    """
+    dataset = validate_standard_dataset(dataset)
     tasks = dataset.get("tasks", [])
     if not tasks:
         raise ValueError("评测集 tasks 为空")

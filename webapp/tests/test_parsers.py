@@ -20,6 +20,7 @@ from backend.engine.parsers import (
     parse_txt,
     supported_extensions,
 )
+from backend.engine.datasets import DatasetValidationError
 
 XSS = '<script>alert("x")</script>'
 AUTO_NAME = re.compile(r"^评测集_\d{8}_\d{6}$")
@@ -188,6 +189,36 @@ def test_markdown_half_width_colon_labels():
     data = parse_markdown("### T1\n**题目:p**\n**期望:e**\n")
     assert data["tasks"][0]["prompt"] == "p"
     assert data["tasks"][0]["test_cases"][0]["expected"] == "e"
+
+
+def test_markdown_auto_id_avoids_explicit_id():
+    """空题号自动编号须避让显式 `### X`（issue #15 方向 3）。"""
+    data = parse_markdown("### T1\n**题目：** p\n**期望：** e\n### \n**题目：** q\n**期望：** e2\n")
+    assert [t["id"] for t in data["tasks"]] == ["T1", "T2"]
+
+
+def test_markdown_duplicate_explicit_ids_rejected():
+    with pytest.raises(DatasetValidationError, match=r"tasks\[1\]\.id: 与 tasks\[0\]\.id 重复（'X'）"):
+        parse_markdown("### X\n**题目：** p\n**期望：** e\n### X\n**题目：** q\n**期望：** e2\n")
+
+
+def test_markdown_auto_id_skips_explicit_id_in_later_block():
+    """自动编号须预扫全文显式 id：后方 `### T1` 也须避让（issue #15 方向 3）。"""
+    data = parse_markdown("### \n**题目：** p\n**期望：** e\n### T1\n**题目：** q\n**期望：** e2\n")
+    assert [t["id"] for t in data["tasks"]] == ["T2", "T1"]
+
+
+# ---------------- 多格式一致性（issue #15） ----------------
+
+def test_duplicate_ids_rejected_consistently_across_formats():
+    """等价无效输入（重复显式 id 'X'）在 JSON/CSV/Markdown 均抛同一校验类。"""
+    with pytest.raises(DatasetValidationError):
+        parse_json('{"tasks":[{"id":"X","prompt":"p1","expected":"e1"},'
+                   '{"id":"X","prompt":"p2","expected":"e2"}]}')
+    with pytest.raises(DatasetValidationError):
+        parse_csv("id,prompt,expected\nX,q1,e1\nX,q2,e2\n")
+    with pytest.raises(DatasetValidationError):
+        parse_markdown("### X\n**题目：** p\n**期望：** e\n### X\n**题目：** q\n**期望：** e2\n")
 
 
 # ---------------- parse_txt ----------------

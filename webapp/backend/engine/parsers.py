@@ -12,7 +12,12 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from backend.engine.datasets import parse_csv_dataset, validate_json_dataset
+from backend.engine.datasets import (
+    _next_free_id,
+    parse_csv_dataset,
+    validate_json_dataset,
+    validate_standard_dataset,
+)
 
 
 def parse_json(raw: str) -> dict[str, Any]:
@@ -61,6 +66,14 @@ def parse_markdown(raw: str) -> dict[str, Any]:
     cur_expected: list[str] = []
     cur_rubric: list[str] = []
     auto_no = 0
+    md_taken: set[str] = set()
+
+    # 预扫显式 `### X` id：自动编号须避开显式 id（issue #15）
+    md_explicit: set[str] = set()
+    for line in lines:
+        s = line.strip()
+        if (s == "###" or s.startswith("### ")) and s[3:].strip():
+            md_explicit.add(s[3:].strip())
 
     def _flush():
         nonlocal cur_id, cur_prompt, cur_expected, cur_rubric
@@ -95,7 +108,12 @@ def parse_markdown(raw: str) -> dict[str, Any]:
         elif stripped == "###" or stripped.startswith("### "):
             _flush()
             auto_no += 1
-            cur_id = stripped[3:].strip() or f"T{auto_no}"
+            label = stripped[3:].strip()
+            if label:
+                cur_id = label
+            else:
+                cur_id = _next_free_id(md_explicit, md_taken, f"T{auto_no}")
+                md_taken.add(cur_id)
         elif stripped.startswith(">"):
             if not tasks and not cur_id:
                 description = (description + " " + stripped[1:].strip()).strip()
@@ -115,7 +133,7 @@ def parse_markdown(raw: str) -> dict[str, Any]:
     if not name:
         name = f"评测集_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
-    return {"name": name, "description": description, "tasks": tasks}
+    return validate_standard_dataset({"name": name, "description": description, "tasks": tasks})
 
 
 def parse_txt(raw: str) -> dict[str, Any]:
@@ -183,7 +201,7 @@ def parse_txt(raw: str) -> dict[str, Any]:
     if not name:
         name = f"评测集_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
-    return {"name": name, "description": description, "tasks": tasks}
+    return validate_standard_dataset({"name": name, "description": description, "tasks": tasks})
 
 
 PARSER_REGISTRY: dict[str, Any] = {
