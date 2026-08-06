@@ -198,7 +198,7 @@ def test_native_env_not_inherited(native_runner):
     assert "secret-123" not in res["stdout"]
 
 
-def test_profile_pool_distinct_sids():
+def test_profile_pool_distinct_sids(native_runner):
     """并发运行必须从池中分配到互异的 profile/SID。"""
     p1 = windows_native._PROFILE_POOL.acquire()
     p2 = windows_native._PROFILE_POOL.acquire()
