@@ -1,5 +1,5 @@
-# -*- coding: utf-8 -*-
-"""模型对决评测平台 - 一键启动脚本（PowerShell）"""
+﻿# -*- coding: utf-8 -*-
+# 模型对决评测平台 - 一键启动脚本（PowerShell）
 param(
     [string]$ListenAddress = "127.0.0.1"
 )
