@@ -44,6 +44,7 @@ from backend.storage import (
     save_review, load_review, save_round_verdicts,
     get_job_status, list_jobs, get_job_files,
     save_dataset, load_dataset, list_datasets, delete_dataset,
+    is_valid_job_id,
 )
 from backend.schemas import StartRequest, StartResponse, ReviewSubmission
 from backend.security import redact_sensitive, sanitize_config
@@ -64,6 +65,14 @@ class JobCancelled(asyncio.CancelledError):
     绝不从 execute_all 内部（progress_cb 等）抛出——asyncio.gather 的
     return_exceptions=True 会吞掉子协程的 CancelledError 并作为返回值返回。
     """
+
+
+def _require_job_id(job_id: str) -> str:
+    """校验路由 job_id 为系统生成格式（issue #17：URL 编码 %2E%2E 解码后
+    可进入 {job_id}，未校验会拼入 BASE_DIR 造成路径穿越删除整个 .eval）。"""
+    if not is_valid_job_id(job_id):
+        raise HTTPException(400, "invalid job_id format")
+    return job_id
 
 
 def _task_done(job_id: str, task: asyncio.Task):
@@ -666,6 +675,7 @@ def _load_job_state(job_id: str) -> tuple[dict, dict, dict, int] | None:
 @app.get("/api/eval/{job_id}/review")
 async def eval_review_view(job_id: str):
     """返回人工评审页数据：题目 + 答案X/答案Y（模型身份完全隐藏）。"""
+    job_id = _require_job_id(job_id)
     restored = _load_job_state(job_id)
     if restored is None:
         raise HTTPException(404, "job not found")
@@ -695,6 +705,7 @@ async def eval_review_view(job_id: str):
 @app.post("/api/eval/{job_id}/review", response_model=StartResponse)
 async def eval_review_submit(job_id: str, req: ReviewSubmission):
     """提交人工打分：按轮构建 verdict → 聚合 → 生成报告 → completed。"""
+    job_id = _require_job_id(job_id)
     restored = _load_job_state(job_id)
     if restored is None:
         raise HTTPException(404, "job not found")
@@ -783,6 +794,7 @@ async def mock_eval():
 
 @app.get("/api/eval/{job_id}/status")
 async def eval_status(job_id: str):
+    job_id = _require_job_id(job_id)
     if job_id not in _jobs:
         j = get_job_status(job_id)
         if j is None:
@@ -803,6 +815,7 @@ async def eval_events_ticket(job_id: str):
     认证由中间件以 Authorization header 兜底；ticket 仅限该 job 的 /events
     路由，使用一次后立即失效。终态 job 不再签发，避免客户端挂在心跳上。
     """
+    job_id = _require_job_id(job_id)
     if job_id not in _jobs:
         raise HTTPException(404, "job not found")
     if _jobs[job_id]["state"] in TERMINAL_STATES or _jobs[job_id]["state"] == "cancelling":
@@ -813,6 +826,7 @@ async def eval_events_ticket(job_id: str):
 
 @app.get("/api/eval/{job_id}/events")
 async def eval_events(job_id: str):
+    job_id = _require_job_id(job_id)
     if job_id not in _jobs:
         raise HTTPException(404, "job not found")
     queue = _jobs[job_id]["sse_queue"]
@@ -877,6 +891,7 @@ def _round_scores_view(round_verdicts: list[dict] | None) -> list[dict]:
 
 @app.get("/api/eval/{job_id}/report")
 async def eval_report(job_id: str):
+    job_id = _require_job_id(job_id)
     files = get_job_files(job_id)
     if files is None:
         if job_id in _jobs:
@@ -963,6 +978,7 @@ async def delete_history(job_id: str):
     """
     from backend.storage import delete_job
 
+    job_id = _require_job_id(job_id)
     task = _tasks.get(job_id)
     if task is not None:
         if not task.done():
@@ -995,6 +1011,7 @@ async def history():
 
 @app.get("/api/history/{job_id}")
 async def history_detail(job_id: str):
+    job_id = _require_job_id(job_id)
     files = get_job_files(job_id)
     if files is None:
         raise HTTPException(404, "job not found")

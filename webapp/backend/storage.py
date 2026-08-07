@@ -15,9 +15,37 @@ from backend.security import redact_sensitive
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".eval" / "history"
 
+# 系统生成 job_id 的唯一合法格式（create_job_id 输出），API 与存储统一入口校验
+JOB_ID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6}$")
+
+
+def is_valid_job_id(job_id: str) -> bool:
+    """job_id 必须符合 create_job_id() 生成的格式（issue #17，防路径穿越）。"""
+    return isinstance(job_id, str) and bool(JOB_ID_RE.fullmatch(job_id))
+
+
+def validate_job_id(job_id: str) -> str:
+    if not is_valid_job_id(job_id):
+        raise ValueError(f"非法 job_id: {job_id!r}")
+    return job_id
+
+
+def _job_path(job_id: str) -> Path:
+    """取 job 目录路径（只解析不创建，读操作专用）。
+
+    双层防护：格式校验 + resolve() 后必须是 BASE_DIR 的直接子目录，
+    拒绝 ``..``、``.``、绝对路径等任何越界写法。
+    """
+    validate_job_id(job_id)
+    d = (BASE_DIR / job_id).resolve()
+    if d.parent != BASE_DIR.resolve():
+        raise ValueError(f"job_id 越界: {job_id!r}")
+    return d
+
 
 def _job_dir(job_id: str) -> Path:
-    d = BASE_DIR / job_id
+    """取 job 目录路径并创建（写操作专用），职责与 _job_path 分离。"""
+    d = _job_path(job_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -80,7 +108,10 @@ def save_reveal(job_id: str, reveal: dict) -> Path:
 
 
 def load_reveal(job_id: str) -> dict | None:
-    p = _job_dir(job_id) / "reveal.json"
+    try:
+        p = _job_path(job_id) / "reveal.json"
+    except ValueError:
+        return None
     if not p.exists():
         return None
     try:
@@ -104,7 +135,10 @@ def save_round_verdicts(job_id: str, round_verdicts: list[dict]) -> Path:
 
 
 def load_review(job_id: str) -> dict | None:
-    p = _job_dir(job_id) / "review.json"
+    try:
+        p = _job_path(job_id) / "review.json"
+    except ValueError:
+        return None
     if not p.exists():
         return None
     try:
@@ -141,11 +175,14 @@ def _job_state(d: Path) -> str:
 
 
 def get_job_status(job_id: str) -> dict[str, Any] | None:
-    cfg_path = _job_dir(job_id) / "config.json"
+    try:
+        cfg_path = _job_path(job_id) / "config.json"
+    except ValueError:
+        return None
     if not cfg_path.exists():
         return None
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    d = _job_dir(job_id)
+    d = _job_path(job_id)
     files = [f.name for f in d.iterdir()]
     verdict = None
     if "verdict.json" in files:
@@ -178,8 +215,15 @@ def list_jobs() -> list[dict[str, Any]]:
 
 
 def delete_job(job_id: str) -> bool:
-    """删除指定任务的所有文件。"""
-    d = BASE_DIR / job_id
+    """删除指定任务的所有文件。
+
+    仅允许删除 BASE_DIR 的直接子目录：非法格式或越界路径一律拒绝
+    （issue #17，杜绝 job_id 路径穿越删除 .eval 等上级目录）。
+    """
+    try:
+        d = _job_path(job_id)
+    except ValueError:
+        return False
     if not d.exists():
         return False
     shutil.rmtree(d, ignore_errors=True)
@@ -187,7 +231,10 @@ def delete_job(job_id: str) -> bool:
 
 
 def get_job_files(job_id: str) -> dict[str, Any] | None:
-    d = BASE_DIR / job_id
+    try:
+        d = _job_path(job_id)
+    except ValueError:
+        return None
     if not d.exists():
         return None
     result = {}

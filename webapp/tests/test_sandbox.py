@@ -192,8 +192,9 @@ def test_native_process_bomb_killed(native_runner):
     assert res["timed_out"] is False, "进程炸弹应被进程数配额拒绝，而非等墙钟超时"
 
 
-# 慢速输出脚本：避免单次大写入在 watcher 轮询前完成导致测试竞态
-# （生产环境恶意代码持续写入同样会被 0.1s 轮询捕获）
+# 慢速持续写入脚本：避免单次大写入在 watcher 轮询前完成导致测试竞态。
+# 监视对象为整个工作目录总占用（0.05s 轮询），慢速脚本保证超限发生在
+# 运行期内、能被 watcher 捕获（生产环境恶意代码持续写入同样会被捕获）。
 _SLOW_STDOUT = (
     "import sys, time\n"
     "for _ in range(200):\n"
@@ -208,6 +209,36 @@ _SLOW_STDERR = (
     "    sys.stderr.write('y' * 6000)\n"
     "    sys.stderr.flush()\n"
     "    time.sleep(0.02)\n"
+    "print('done')\n"
+)
+_SLOW_BLOB = (
+    "import time\n"
+    "with open('blob.bin', 'wb') as f:\n"
+    "    for _ in range(200):\n"
+    "        f.write(b'x' * 6000)\n"
+    "        f.flush()\n"
+    "        time.sleep(0.02)\n"
+    "print('done')\n"
+)
+# 单次高速大写入后立即退出：可能在 0.05s 轮询采样前完成（进程随即退出），
+# 依赖进程退出后的目录总占用复核兜底（issue #18 缺口2 回归）
+_BIG_SINGLE_WRITE = (
+    "with open('blob.bin', 'wb') as f:\n"
+    "    f.write(b'x' * (4 * 1024 * 1024))\n"
+    "    f.flush()\n"
+)
+# stdout/stderr/普通文件各自 < 1MB，但累计超限（每轮 18KB × 70 轮 = 1.26MB）
+_MULTI_FILE_SLOW = (
+    "import sys, time\n"
+    "with open('blob.bin', 'wb') as bf:\n"
+    "    for _ in range(70):\n"
+    "        sys.stdout.write('x' * 6000)\n"
+    "        sys.stdout.flush()\n"
+    "        sys.stderr.write('y' * 6000)\n"
+    "        sys.stderr.flush()\n"
+    "        bf.write(b'z' * 6000)\n"
+    "        bf.flush()\n"
+    "        time.sleep(0.02)\n"
     "print('done')\n"
 )
 
@@ -235,6 +266,46 @@ def test_native_output_quota_configurable(native_runner):
     res = windows_native.run_code(_SLOW_STDOUT, limits={"max_output_bytes": 8 * 1024})
     assert res["ok"] is False
     assert res.get("output_overflow") is True, res
+
+
+def test_native_regular_file_overflow_killed(native_runner):
+    """Issue #18 验收1：持续写普通文件（非 stdout/stderr）同样在配额内被终止。"""
+    res = native_runner.run(_SLOW_BLOB)
+    assert res["ok"] is False
+    assert res.get("output_overflow") is True, res
+    assert res["timed_out"] is False
+    assert "配额" in (res.get("error") or "")
+
+
+def test_native_multiple_files_cumulative(native_runner):
+    """Issue #18 验收2：stdout/stderr/普通文件各自未超限但累计超限时被终止（同一总量约束）。"""
+    res = native_runner.run(_MULTI_FILE_SLOW)
+    assert res["ok"] is False
+    assert res.get("output_overflow") is True, res
+    assert res["timed_out"] is False
+
+
+def test_native_single_big_write_detected(native_runner):
+    """Issue #18 缺口2：单次高速大写入在轮询采样前完成，退出后复核兜底判定超限。"""
+    res = native_runner.run(_BIG_SINGLE_WRITE)
+    assert res["ok"] is False
+    assert res.get("output_overflow") is True, res
+
+
+def test_native_peak_dir_bytes_bounded(native_runner):
+    """Issue #18 验收3：终止时目录总字节数（peak_dir_bytes）的最大超额符合文档承诺。
+
+    慢速写入每轮 6KB（20ms），0.05s 轮询窗口内最多再写约 15KB；
+    64KB 上界远大于理论峰值（8KB 配额 + 窗口写入 + 基准文件），
+    用于避免机器抖动导致的 flaky，同时能捕获实现回归（如只查单文件）。
+    """
+    from backend.engine.isolation import windows_native
+
+    res = windows_native.run_code(_SLOW_BLOB, limits={"max_output_bytes": 8 * 1024})
+    assert res.get("output_overflow") is True, res
+    peak = res.get("peak_dir_bytes", 0)
+    assert isinstance(peak, int) and peak > 0, res
+    assert peak <= 8 * 1024 + 64 * 1024, res
 
 
 def test_native_large_but_within_quota_output_ok(native_runner):

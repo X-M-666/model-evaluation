@@ -33,10 +33,18 @@ DEFAULT_LIMITS = {
     "cpu_time_sec": 5,
     "max_active_processes": 8,
     "max_output_chars": 4096,
-    "max_output_bytes": 1024 * 1024,  # stdout/stderr 单文件磁盘硬上限（Job Object 无 IO 配额）
+    # 整个一次性工作目录的总占用上限（运行期监视的软限制，非 OS 硬配额；
+    # Job Object 无 IO 配额，标准用户下 Windows 亦无每任务磁盘配额）。
+    # 超额按 0.05s 轮询终止，单轮窗口最大超额 ≈ 间隔 × 峰值写入速率；
+    # 进程退出后复核兜底，终止后目录即清理。
+    "max_output_bytes": 1024 * 1024,
 }
 
 APPCONTAINER_NAME = "arena.code-sandbox"
+
+# 磁盘占用轮询间隔（秒）：越短则轮询窗口内的最大超额越小，
+# 但会提高每次执行的开销；正常任务目录仅数个小文件，0.05s 开销可忽略。
+WATCH_INTERVAL = 0.05
 
 # 并发运行隔离池大小：>= executor._CODE_SEM(2) 即保证并发运行的 SID 互异
 PROFILE_POOL_SIZE = 4
@@ -344,6 +352,26 @@ def _read_capped(path: Path, max_chars: int) -> str:
         return ""
 
 
+def _dir_size(path: Path) -> int:
+    """统计目录内全部文件 st_size 之和（含子目录，不跟随符号链接）。
+
+    这是"工作目录磁盘占用"的直接度量，覆盖 stdout/stderr/普通文件及
+    多文件累计；遍历中目录被增删导致的 OSError 不影响安全（本次放弃，
+    下轮重试），单独文件的 stat 失败（如句柄独占）跳过。
+    """
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        return 0
+    return total
+
+
 # ---- 进程启动 ----
 
 def _create_io_file(path: Path, read: bool) -> wintypes.HANDLE:
@@ -534,29 +562,31 @@ def _spawn(
                         f"AssignProcessToJobObject 失败（宿主进程可能已处于不可嵌套的 Job）：WinError {err}")
                 kernel32.ResumeThread(pi.hThread)
 
-                # ---- 输出大小监视（Job Object 无 IO 配额，需自行兜底）----
-                # 恶意代码可无限写 stdout/stderr 填满宿主磁盘；监视线程
-                # 在运行期间轮询输出文件大小，超限即 TerminateJobObject 强杀。
+                # ---- 工作目录磁盘占用监视（Job Object 无 IO 配额，需自行兜底）----
+                # 恶意代码可无限写任意文件（含 stdout/stderr）填满宿主磁盘；
+                # 监视线程在运行期间轮询整个工作目录总占用（而非仅输出文件），
+                # 超限即 TerminateJobObject 强杀。这是软限制：单轮窗口内的
+                # 最大超额 ≈ WATCH_INTERVAL × 峰值写入速率，进程退出后复核兜底。
                 max_bytes = int(limits.get("max_output_bytes", 1024 * 1024))
                 overflowed = False
+                peak_dir_bytes = 0
                 stop = threading.Event()
                 watcher = None
 
-                def _watch_output():
-                    nonlocal overflowed
+                def _watch_workdir():
+                    nonlocal overflowed, peak_dir_bytes
                     while not stop.is_set():
-                        for p in (out_file, err_file):
-                            try:
-                                if p.stat().st_size > max_bytes:
-                                    overflowed = True
-                                    kernel32.TerminateJobObject(job, 1)
-                                    return
-                            except OSError:
-                                pass
-                        time.sleep(0.1)
+                        current = _dir_size(workdir)
+                        if current > peak_dir_bytes:
+                            peak_dir_bytes = current
+                        if current > max_bytes:
+                            overflowed = True
+                            kernel32.TerminateJobObject(job, 1)
+                            return
+                        time.sleep(WATCH_INTERVAL)
 
                 try:
-                    watcher = threading.Thread(target=_watch_output, daemon=True)
+                    watcher = threading.Thread(target=_watch_workdir, daemon=True)
                     watcher.start()
 
                     # ---- 等待 / 超时强杀 ----
@@ -572,6 +602,15 @@ def _spawn(
                         watcher.join(timeout=5)
                 # 无论正常退出与否都终止 Job，确保子孙进程不残留
                 kernel32.TerminateJobObject(job, 1)
+                # 等待 Job 内全部进程退出后复核目录总占用：单次高速大写入
+                # 可能在轮询采样前完成（进程随即退出），此处兜底捕获，
+                # 确保最终磁盘占用不超过配额；统计值同时纳入 peak 记录。
+                kernel32.WaitForSingleObject(pi.hProcess, 5000)
+                final_bytes = _dir_size(workdir)
+                if final_bytes > peak_dir_bytes:
+                    peak_dir_bytes = final_bytes
+                if final_bytes > max_bytes:
+                    overflowed = True
                 rc = wintypes.DWORD()
                 kernel32.GetExitCodeProcess(pi.hProcess, ctypes.byref(rc))
                 # 子进程已退出，先关闭输出句柄（share=0），否则父进程
@@ -597,6 +636,7 @@ def _spawn(
                 "stderr": _read_capped(err_file, max_chars),
                 "timed_out": timed_out,
                 "output_overflow": overflowed,
+                "peak_dir_bytes": peak_dir_bytes,
                 "returncode": rc.value,
                 "error": error_msg,
             }
@@ -622,9 +662,19 @@ def run_code(code: str, stdin_text: str = "", limits: dict[str, Any] | None = No
     python_exe_path = bootstrap.resolve_runtime()
     workdir = Path(tempfile.mkdtemp(prefix="arena_iso_"))
     try:
-        return _spawn(python_exe_path, workdir, code, stdin_text, limits)
+        result = _spawn(python_exe_path, workdir, code, stdin_text, limits)
     except Exception as exc:
-        return {"ok": False, "stdout": "", "stderr": "", "timed_out": False,
-                "returncode": None, "error": f"沙箱执行异常: {exc}"}
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        result = {"ok": False, "stdout": "", "stderr": "", "timed_out": False,
+                  "returncode": None, "error": f"沙箱执行异常: {exc}"}
+    # 终止后可靠清理；失败不静默（重试一次仍失败则标记可观测，
+    # 部署方可据此人工处置残留目录）
+    try:
+        shutil.rmtree(workdir)
+    except OSError as exc:
+        time.sleep(0.5)
+        try:
+            shutil.rmtree(workdir)
+        except OSError:
+            result["cleanup_failed"] = True
+            result["error"] = (result.get("error") or "") + f"；沙箱目录清理失败: {exc}"
+    return result

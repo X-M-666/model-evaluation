@@ -14,6 +14,7 @@ import socket
 from urllib.parse import urlparse
 
 import httpx
+import httpcore
 from httpcore import AsyncNetworkBackend, AsyncNetworkStream
 
 ALLOW_PRIVATE = os.environ.get("MODEL_DUEL_ALLOW_PRIVATE_UPSTREAM", "") == "1"
@@ -120,10 +121,40 @@ class ValidatingNetworkBackend(AsyncNetworkBackend):
     "域名 -> 连接 IP" 绑定为连接前一刻的解析结果，将校验过的 IP 交给
     内部后端连接；TLS 由 httpcore 连接层后续以原始域名做 SNI/证书校验，
     因此域名伪造与证书绕过均不可行。
+
+    多地址故障转移：httpcore 的 anyio 后端把 OSError/超时分别映射为
+    ConnectError/ConnectTimeout（均非 OSError 子类），逐一尝试全部
+    已验证 IP 时须显式捕获；timeout 是全部地址的总预算（asyncio.wait_for
+    兜底，不随地址数放大），每地址分得 timeout/len(ips) 配额，保证首个
+    地址超时后后续地址仍有真实连接机会。取消与其余异常原样上抛，不吞。
     """
 
     def __init__(self, inner: AsyncNetworkBackend):
         self._inner = inner
+
+    async def _try_ips(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None,
+        local_address: str | None,
+        socket_options,
+        ips: list[str],
+    ) -> AsyncNetworkStream:
+        """依次连接全部已验证 IP，全部失败时抛出最后一个连接异常。"""
+        per_address = timeout / len(ips) if timeout is not None else None
+        last_error: Exception | None = None
+        for ip in ips:
+            try:
+                return await self._inner.connect_tcp(
+                    ip, port, timeout=per_address,
+                    local_address=local_address, socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout, OSError) as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise httpx.ConnectError(f"无法连接到 {host}")
 
     async def connect_tcp(
         self,
@@ -140,18 +171,15 @@ class ValidatingNetworkBackend(AsyncNetworkBackend):
         except UpstreamUrlError as exc:
             raise httpx.ConnectError(f"SSRF 校验失败: {exc}") from exc
 
-        last_error: OSError | None = None
-        for ip in ips:
-            try:
-                return await self._inner.connect_tcp(
-                    ip, port, timeout=timeout,
-                    local_address=local_address, socket_options=socket_options,
-                )
-            except OSError as exc:
-                last_error = exc
-        if last_error is not None:
-            raise last_error
-        raise httpx.ConnectError(f"无法连接到 {host}")
+        if timeout is None:
+            return await self._try_ips(host, port, None, local_address, socket_options, ips)
+        try:
+            return await asyncio.wait_for(
+                self._try_ips(host, port, timeout, local_address, socket_options, ips),
+                timeout,
+            )
+        except asyncio.TimeoutError:
+            raise httpx.ConnectTimeout(f"连接 {host} 超时（总预算 {timeout}s）") from None
 
     async def connect_unix_socket(self, path, timeout=None, socket_options=None):
         return await self._inner.connect_unix_socket(path, timeout=timeout, socket_options=socket_options)

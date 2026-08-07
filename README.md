@@ -115,7 +115,7 @@ $env:MODEL_DUEL_RATE_LIMIT = "30"                  # 可选：每 IP 每分钟�
 ## 代码验真与安全
 
 - 模型输出属于**不可信外部输入**，默认不对其执行：`code_verify_mode=off` 时仅展示代码并做语法检查
-- 显式选择 `native-sandbox` 后，代码题会在 **Windows AppContainer（文件/网络硬隔离）+ Job Object（内存/CPU/进程数配额）** 中逐用例执行，超时强杀进程树，不继承宿主环境变量；stdout/stderr 输出另有 1MB 磁盘配额（运行期监视，超限即终止进程，防止撑爆宿主磁盘，`limits.max_output_bytes` 可调）
+- 显式选择 `native-sandbox` 后，代码题会在 **Windows AppContainer（文件/网络硬隔离）+ Job Object（内存/CPU/进程数配额）** 中逐用例执行，超时强杀进程树，不继承宿主环境变量；整个一次性工作目录另受 1MB 存储配额约束（**软限制**，`limits.max_output_bytes` 可调：运行期每 0.05s 轮询目录总占用（含 stdout/stderr 与任意普通文件），超限即终止进程；单轮窗口内最大超额 ≈ 轮询间隔 × 峰值写入速率（数 MB~数十 MB 量级），进程退出后复核兜底，终止后目录立即清理；性质说明见 SECURITY.md「存储配额性质」）
 - **运行时由部署方预装并提供（issue #16）**：应用不会自行下载、解压、安装或更新 Python。设置环境变量 `MODEL_DUEL_SANDBOX_PYTHON` 为部署方预装 `python.exe` 的**绝对路径**；未配置或运行时非法时 `native-sandbox` 明确不可用（fail closed），不会联网下载，也不会从系统 PATH 中寻找替代解释器
 - **自包含单目录要求**：指向的必须是自包含运行时（stdlib 位于 `python.exe` 所在目录内，如完整安装根目录或 embeddable 发行包目录）；venv 等跨目录运行时在校验时被拒绝（AppContainer 仅授权该目录，沙箱内无法读取外部 stdlib）
 - **信任边界**：运行时的安装、补丁、来源与完整性验证由部署流程负责；应用仅引用配置路径，并校验路径/文件类型/版本/自包含性

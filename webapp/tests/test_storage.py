@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -16,6 +17,11 @@ import pytest
 from backend import storage
 
 JOB_ID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6}$")
+
+
+def _jid(tag: str) -> str:
+    """生成符合 JOB_ID_RE 的确定性 job_id（issue #17 后存储层仅接受系统格式）。"""
+    return "20260101_120000_" + hashlib.md5(tag.encode()).hexdigest()[:6]
 
 
 def _write(job_id: str, name: str, content: str) -> Path:
@@ -28,7 +34,7 @@ def _write(job_id: str, name: str, content: str) -> Path:
 # ---------------- save_config 脱敏落盘 ----------------
 
 def test_save_config_masks_key_keeps_display_fields():
-    job_id = "cfg1"
+    job_id = _jid("cfg1")
     storage.save_config(job_id, {
         "model_a": {"name": "A", "url": "https://a/v1", "key": "secret-a",
                     "temperature": 0.3, "max_tokens": 2048, "top_p": 0.9},
@@ -36,7 +42,7 @@ def test_save_config_masks_key_keeps_display_fields():
         "dims": ["知识能力"], "seed": 42, "dataset_name": "ds",
         "repeat_n": 3, "code_verify_mode": "native-sandbox",
     })
-    raw = (storage.BASE_DIR / job_id / "config.json").read_text(encoding="utf-8")
+    raw = (storage.BASE_DIR / _jid("cfg1") / "config.json").read_text(encoding="utf-8")
     assert "secret-a" not in raw and "secret-b" not in raw
     cfg = json.loads(raw)
     assert "key" not in cfg["model_a"] and "key" not in cfg["model_b"]
@@ -52,8 +58,8 @@ def test_save_config_masks_key_keeps_display_fields():
 
 
 def test_save_config_defaults():
-    storage.save_config("cfg2", {"model_a": {}, "model_b": {}})
-    cfg = json.loads((storage.BASE_DIR / "cfg2" / "config.json").read_text(encoding="utf-8"))
+    storage.save_config(_jid("cfg2"), {"model_a": {}, "model_b": {}})
+    cfg = json.loads((storage.BASE_DIR / _jid("cfg2") / "config.json").read_text(encoding="utf-8"))
     assert cfg["model_a"]["name"] == "?"
     assert cfg["model_a"]["temperature"] == 0.7
     assert cfg["model_a"]["max_tokens"] == 4096
@@ -63,88 +69,88 @@ def test_save_config_defaults():
 # ---------------- _job_state 状态推断 ----------------
 
 def test_state_pending_empty_dir():
-    d = storage.BASE_DIR / "st-empty"
+    d = storage.BASE_DIR / _jid("st-empty")
     d.mkdir(parents=True, exist_ok=True)
     assert storage._job_state(d) == "pending"
 
 
 def test_state_executing_tasks_only():
-    _write("st-exe", "tasks.json", "{}")
-    assert storage._job_state(storage.BASE_DIR / "st-exe") == "executing"
+    _write(_jid("st-exe"), "tasks.json", "{}")
+    assert storage._job_state(storage.BASE_DIR / _jid("st-exe")) == "executing"
 
 
 def test_state_executing_answers_a_only():
     """仅有单侧答卷不算可评审：按当前实现落入 pending/executing 区间（锁定）。"""
-    _write("st-a", "answers-a.json", "{}")
-    assert storage._job_state(storage.BASE_DIR / "st-a") == "pending"
+    _write(_jid("st-a"), "answers-a.json", "{}")
+    assert storage._job_state(storage.BASE_DIR / _jid("st-a")) == "pending"
 
 
 def test_state_reviewing_both_answers():
-    _write("st-rev", "answers-a.json", "{}")
-    _write("st-rev", "answers-b.json", "{}")
-    assert storage._job_state(storage.BASE_DIR / "st-rev") == "reviewing"
+    _write(_jid("st-rev"), "answers-a.json", "{}")
+    _write(_jid("st-rev"), "answers-b.json", "{}")
+    assert storage._job_state(storage.BASE_DIR / _jid("st-rev")) == "reviewing"
 
 
 def test_state_judging_with_verdict():
-    _write("st-judge", "answers-a.json", "{}")
-    _write("st-judge", "answers-b.json", "{}")
-    _write("st-judge", "verdict.json", "{}")
-    assert storage._job_state(storage.BASE_DIR / "st-judge") == "judging"
+    _write(_jid("st-judge"), "answers-a.json", "{}")
+    _write(_jid("st-judge"), "answers-b.json", "{}")
+    _write(_jid("st-judge"), "verdict.json", "{}")
+    assert storage._job_state(storage.BASE_DIR / _jid("st-judge")) == "judging"
 
 
 def test_state_completed_with_report():
-    _write("st-done", "answers-a.json", "{}")
-    _write("st-done", "answers-b.json", "{}")
-    _write("st-done", "verdict.json", "{}")
-    _write("st-done", "report.json", "{}")
-    assert storage._job_state(storage.BASE_DIR / "st-done") == "completed"
+    _write(_jid("st-done"), "answers-a.json", "{}")
+    _write(_jid("st-done"), "answers-b.json", "{}")
+    _write(_jid("st-done"), "verdict.json", "{}")
+    _write(_jid("st-done"), "report.json", "{}")
+    assert storage._job_state(storage.BASE_DIR / _jid("st-done")) == "completed"
 
 
 def test_state_error_takes_priority_even_with_report():
-    _write("st-err", "report.json", "{}")
-    _write("st-err", "error.json", '{"error":"boom"}')
-    assert storage._job_state(storage.BASE_DIR / "st-err") == "error"
+    _write(_jid("st-err"), "report.json", "{}")
+    _write(_jid("st-err"), "error.json", '{"error":"boom"}')
+    assert storage._job_state(storage.BASE_DIR / _jid("st-err")) == "error"
 
 
 # ---------------- 损坏 JSON 容错 ----------------
 
 def test_load_reveal_missing_returns_none():
-    assert storage.load_reveal("noreveal") is None
+    assert storage.load_reveal(_jid("noreveal")) is None
 
 
 def test_load_reveal_corrupt_returns_none():
-    _write("cor-reveal", "reveal.json", "{broken")
-    assert storage.load_reveal("cor-reveal") is None
+    _write(_jid("cor-reveal"), "reveal.json", "{broken")
+    assert storage.load_reveal(_jid("cor-reveal")) is None
 
 
 def test_load_review_corrupt_returns_none():
-    _write("cor-review", "review.json", "not json")
-    assert storage.load_review("cor-review") is None
+    _write(_jid("cor-review"), "review.json", "not json")
+    assert storage.load_review(_jid("cor-review")) is None
 
 
 def test_load_reveal_roundtrip():
-    storage.save_reveal("rev-ok", {"rounds": [{"answer_x": "a", "answer_y": "b"}]})
-    assert storage.load_reveal("rev-ok")["rounds"][0]["answer_x"] == "a"
+    storage.save_reveal(_jid("rev-ok"), {"rounds": [{"answer_x": "a", "answer_y": "b"}]})
+    assert storage.load_reveal(_jid("rev-ok"))["rounds"][0]["answer_x"] == "a"
 
 
 def test_get_job_files_corrupt_entry_returns_none():
-    _write("cor-files", "verdict.json", "{broken")
-    _write("cor-files", "report.json", "{}")
-    files = storage.get_job_files("cor-files")
+    _write(_jid("cor-files"), "verdict.json", "{broken")
+    _write(_jid("cor-files"), "report.json", "{}")
+    files = storage.get_job_files(_jid("cor-files"))
     assert files["verdict.json"] is None
     assert files["report.json"] == {}
 
 
 def test_get_job_files_includes_round_files():
-    _write("rf", "answers-a-r1.json", "{}")
-    _write("rf", "answers-b-r2.json", "{}")
-    files = storage.get_job_files("rf")
+    _write(_jid("rf"), "answers-a-r1.json", "{}")
+    _write(_jid("rf"), "answers-b-r2.json", "{}")
+    files = storage.get_job_files(_jid("rf"))
     assert "answers-a-r1.json" in files
     assert "answers-b-r2.json" in files
 
 
 def test_get_job_files_missing_job_returns_none():
-    assert storage.get_job_files("no-such-job") is None
+    assert storage.get_job_files(_jid("no-such-job")) is None
 
 
 # ---------------- _safe_dataset_name 消毒 ----------------
@@ -221,15 +227,15 @@ def test_dataset_list_skips_corrupt_files():
 # ---------------- 任务删除 ----------------
 
 def test_delete_job_missing_returns_false():
-    assert storage.delete_job("不存在") is False
+    assert storage.delete_job(_jid("missing")) is False
 
 
 def test_delete_job_removes_directory():
-    _write("del-me", "config.json", "{}")
-    _write("del-me", "report.json", "{}")
-    assert (storage.BASE_DIR / "del-me").exists()
-    assert storage.delete_job("del-me") is True
-    assert not (storage.BASE_DIR / "del-me").exists()
+    _write(_jid("del-me"), "config.json", "{}")
+    _write(_jid("del-me"), "report.json", "{}")
+    assert (storage.BASE_DIR / _jid("del-me")).exists()
+    assert storage.delete_job(_jid("del-me")) is True
+    assert not (storage.BASE_DIR / _jid("del-me")).exists()
 
 
 def test_create_job_id_unique_format():
@@ -240,7 +246,58 @@ def test_create_job_id_unique_format():
 
 
 def test_save_round_verdicts_persisted():
-    storage.save_round_verdicts("rv", [{"round": 1, "x": 1}, {"round": 2, "x": 2}])
-    p = storage.BASE_DIR / "rv" / "round-verdicts.json"
+    storage.save_round_verdicts(_jid("rv"), [{"round": 1, "x": 1}, {"round": 2, "x": 2}])
+    p = storage.BASE_DIR / _jid("rv") / "round-verdicts.json"
     assert p.exists()
     assert json.loads(p.read_text(encoding="utf-8"))[1]["round"] == 2
+
+
+# ---------------- job_id 校验与路径穿越防护（issue #17 / R3-001） ----------------
+
+def test_is_valid_job_id_rejects_traversal_and_junk():
+    for bad in ("..", ".", "../x", "a/b", "..\\..\\etc", "C:\\x",
+                "abc", "2026-01-01_120000_abcdef",
+                "20260101_120000_xyz123", "20260101_120000_ab",
+                "20260101_120000_abcdefg", "20260101_120000_abcdef ",
+                "", None):
+        assert storage.is_valid_job_id(bad) is False, repr(bad)
+    assert storage.is_valid_job_id(_jid("ok")) is True
+
+
+def test_job_path_rejects_out_of_base():
+    for bad in ("..", ".", "../x", "a/b", "..\\..\\etc", "C:\\x"):
+        with pytest.raises(ValueError):
+            storage._job_path(bad)
+
+
+def test_delete_job_dotdot_never_escapes_base():
+    """``..``/``.``/越界写法删除必须被拒绝：父目录哨兵与兄弟 job 不受影响。"""
+    parent = storage.BASE_DIR.parent
+    audit_log = parent / "audit.log"
+    sentinel = parent / "sentinel.txt"
+    audit_log.write_text("audit-line\n", encoding="utf-8")
+    sentinel.write_text("keep", encoding="utf-8")
+    storage.BASE_DIR.mkdir(parents=True, exist_ok=True)
+    victim = _jid("victim")
+    _write(victim, "config.json", "{}")
+
+    for bad in ("..", ".", "../", "..\\..", "a/b", "C:\\x"):
+        assert storage.delete_job(bad) is False, repr(bad)
+
+    assert audit_log.read_text(encoding="utf-8") == "audit-line\n"
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert (storage.BASE_DIR / victim).exists()
+
+
+def test_read_apis_traversal_return_none():
+    assert storage.get_job_files("..") is None
+    assert storage.get_job_status("..") is None
+    assert storage.load_reveal("..") is None
+    assert storage.load_review("..") is None
+
+
+def test_read_apis_never_create_directory():
+    """读操作不得隐式创建目录（_job_path 只取路径不 mkdir）。"""
+    jid = _jid("read-only")
+    assert storage.get_job_files(jid) is None
+    assert not (storage.BASE_DIR / jid).exists()

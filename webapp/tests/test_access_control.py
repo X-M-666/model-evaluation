@@ -199,10 +199,14 @@ def test_shared_mode_sse_ticket_scope_mismatch(shared_client):
 
 def test_shared_mode_sse_ticket_unknown_or_terminal_job(shared_client):
     headers = {"Authorization": "Bearer secret-token-123"}
-    # 不存在的 job
+    # 不存在的 job（job_id 必须为系统生成格式，issue #17；未知 ID → 404）
+    assert shared_client.post(
+        "/api/eval/20260101_120000_abcdef/events/ticket", headers=headers
+    ).status_code == 404
+    # 非法格式 → 400
     assert shared_client.post(
         "/api/eval/no-such-job/events/ticket", headers=headers
-    ).status_code == 404
+    ).status_code == 400
     # 终态 job（completed / error）拒绝签发，避免客户端挂在心跳上
     job_id = shared_client.post("/api/eval/mock", headers=headers).json()["job_id"]
     main_module._jobs[job_id]["state"] = "completed"

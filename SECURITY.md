@@ -21,7 +21,7 @@
 | 内存炸弹 | 内存配额内终止 | Job Object `JOB_OBJECT_LIMIT_JOB_MEMORY`（默认 256MB） |
 | 死循环 | CPU 时间配额内终止 | Job Object `JOB_OBJECT_LIMIT_PROCESS_TIME`（默认 5s） |
 | 进程炸弹 | 活动进程数配额内拒绝 | Job Object `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`（默认 8） |
-| 输出/磁盘写 | 超限输出在配额内被终止 | 运行期监视线程轮询 stdout/stderr 文件大小（默认 1MB，`max_output_bytes` 可调），超限 `TerminateJobObject` 强杀；返回内容限量读取（`max_output_chars` 4096 字符） |
+| 输出/磁盘写 | 超限磁盘占用在配额内被终止 | 运行期监视线程轮询**整个工作目录总占用**（默认 1MB，`max_output_bytes` 可调），超限 `TerminateJobObject` 强杀，进程退出后复核兜底；此为监视式**软限制**（见「存储配额性质」）；返回内容限量读取（`max_output_chars` 4096 字符） |
 | 超时/残留进程 | 强杀整棵进程树 | `TerminateJobObject` + `KILL_ON_JOB_CLOSE` |
 | 凭据/环境泄露 | 不继承宿主环境变量 | 显式环境白名单（仅 TEMP/TMP/LOCALAPPDATA/SYSTEMROOT/WINDIR/PYTHONDONTWRITEBYTECODE/PYTHONUTF8） |
 | 解释器访问系统目录 | 使用部署方指定的自包含运行时 | 部署方配置 `MODEL_DUEL_SANDBOX_PYTHON`（应用不下载/更新运行时，仅授权该目录） |
@@ -45,6 +45,26 @@
   无法在不引入内核过滤驱动的条件下阻止；边界是**用户数据（文档/项目/配置/凭据）不可读写**。
 - `LOCALAPPDATA` 由内核要求必须存在（用于推导 AppContainer 包状态目录，
   缺失将导致 `ERROR_ENVVAR_NOT_FOUND`），实现上指向一次性工作目录而非宿主路径。
+
+### 存储配额性质（issue #18）
+
+Windows 标准用户没有 OS 级"每任务/每目录磁盘配额"（NTFS 配额需管理员配置，
+固定容量 VHD 虚拟磁盘需管理员创建并挂载），因此工作目录 1MB 存储上限是
+**监视式软限制**而非操作系统强制硬配额，实施为三层约束：
+
+1. **运行期轮询**：每 0.05s 统计工作目录全部文件总占用（含 stdout/stderr、
+   任意普通文件与多文件累计），超限即 `TerminateJobObject` 强杀；
+   单轮窗口内最大超额 ≈ 轮询间隔 × 峰值写入速率（通常数 MB~数十 MB 量级，
+   取决于磁盘吞吐），运行中的短暂超额在终止后由清理回收。
+2. **退出复核**：进程退出后再次统计目录总占用，超限仍判
+   `output_overflow`，覆盖"单次高速大写入在轮询采样前完成"的窗口竞态。
+3. **终止即清理**：目录随执行结束删除；清理失败不静默（结果带
+   `cleanup_failed` 标记与错误说明，供部署方人工处置残留目录）。
+
+结果中的 `peak_dir_bytes` 为执行期间观测到的目录总占用峰值，用于审计实际
+超额；验收测试（`webapp/tests/test_sandbox.py`）断言其不超过
+`max_output_bytes + 64KB` 的文档承诺界。稀疏文件等按逻辑大小计数的对象
+会因 `st_size` 偏大被提前终止，属保守方向（只会更早拒绝，不会放行）。
 
 ## 信任边界与前提
 
@@ -84,5 +104,7 @@
 ## 验收对照
 
 见 `webapp/tests/test_sandbox.py` 与 `webapp/scripts/sandbox_selfcheck.py`，
-覆盖：宿主文件读取、目录外写入、网络连接、内存/CPU/进程配额、**输出磁盘配额（stdout/stderr 超限终止）**、
+覆盖：宿主文件读取、目录外写入、网络连接、内存/CPU/进程配额、
+**磁盘占用配额（工作目录总占用超限终止：普通文件持续写入、多文件累计、
+单次高速大写入退出后复核、峰值超额上界）**、
 环境变量不继承、并发任务的跨任务工作目录隔离（互异 SID）。

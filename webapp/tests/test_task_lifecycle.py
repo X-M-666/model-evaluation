@@ -155,8 +155,9 @@ def test_cooperative_cancel_stops_before_persistence(monkeypatch):
 # ---- 删除语义：重复删除 / 评审提交（HTTP 层） ----
 
 def test_delete_missing_job_404(client):
-    r = client.delete("/api/history/不存在的任务")
-    assert r.status_code == 404
+    # 未知 job（合法格式）→ 404；非法格式 → 400（issue #17）
+    assert client.delete("/api/history/20260101_120000_abcdef").status_code == 404
+    assert client.delete("/api/history/不存在的任务").status_code == 400
 
 
 def test_delete_twice_second_404(client):
