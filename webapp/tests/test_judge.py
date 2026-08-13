@@ -274,3 +274,80 @@ def test_run_judge_all_excluded_totals_zero(monkeypatch):
     result = asyncio.run(run_judge(task_set, answers_x, answers_y, JUDGE_CFG))
     assert result["totals"] == {"answer_x": 0, "answer_y": 0}
     assert result["winner_model"] == "tie"
+
+
+# ---- 迭代二：注入 reveal / 进度回调 / 长度围栏 ----
+
+def test_run_judge_injected_reveal_respected(monkeypatch):
+    async def mock_call(client, judge_cfg, prompt, *args, **kwargs):
+        return VALID_V
+    monkeypatch.setattr(judge_module, "_call_judge_model", mock_call)
+
+    task_set = {"tasks": [TASK]}
+    answers_x = {"model": "模型A", "answers": [ANSWER_X]}
+    answers_y = {"model": "模型B", "answers": [ANSWER_Y]}
+
+    # 注入 rounds 结构（human_review.make_reveal 输出）：X=模型B、Y=模型A
+    result = asyncio.run(run_judge(
+        task_set, answers_x, answers_y, JUDGE_CFG,
+        revealed={"rounds": [{"answer_x": "b", "answer_y": "a"}]},
+    ))
+    assert result["revealed"] == {
+        "answer_x": "answers-b.json", "answer_y": "answers-a.json",
+        "answer_x_file": "b", "answer_y_file": "a",
+    }
+    # 注入直接映射（旧 run_judge 输出格式亦可回灌）
+    result2 = asyncio.run(run_judge(
+        task_set, answers_x, answers_y, JUDGE_CFG,
+        revealed={"answer_x": "answers-a.json", "answer_y": "answers-b.json"},
+    ))
+    assert result2["revealed"]["answer_x_file"] == "a"
+    assert result2["revealed"]["answer_y_file"] == "b"
+
+
+def test_run_judge_progress_callback_counts(monkeypatch):
+    async def mock_call(client, judge_cfg, prompt, *args, **kwargs):
+        return VALID_V
+    monkeypatch.setattr(judge_module, "_call_judge_model", mock_call)
+
+    task_set = {"tasks": [TASK, {**TASK, "id": "T2"}]}
+    answers_x = {"model": "模型A", "answers": [
+        {"id": "T1", "raw_answer": "a"}, {"id": "T2", "raw_answer": "a"}]}
+    answers_y = {"model": "模型B", "answers": [
+        {"id": "T1", "raw_answer": "b"}, {"id": "T2", "raw_answer": "b"}]}
+
+    events = []
+
+    async def progress(done, total):
+        events.append((done, total))
+
+    asyncio.run(run_judge(task_set, answers_x, answers_y, JUDGE_CFG,
+                          progress_cb=progress))
+    assert events == [(1, 2), (2, 2)]
+
+
+def test_blind_prompt_fence_truncates_long_answer():
+    ax = {"raw_answer": "长" * 20000, "code_verify": {}}
+    p = _build_blind_prompt(TASK, ax, ANSWER_Y)
+    assert "已截断" in p
+    assert "长" * 20000 not in p
+
+
+def test_blind_prompt_short_answer_not_truncated():
+    ax = {"raw_answer": "正常长度答案", "code_verify": {}}
+    p = _build_blind_prompt(TASK, ax, ANSWER_Y)
+    assert "已截断" not in p
+    assert "正常长度答案" in p
+
+
+def test_fenced_empty_placeholder():
+    assert judge_module._fenced("") == "(无回答)"
+    assert judge_module._fenced(None) == "(无回答)"
+    assert judge_module._fenced("abc") == "abc"
+
+
+def test_file_label_normalization():
+    assert judge_module._file_label("a") == "a"
+    assert judge_module._file_label("answers-b.json") == "b"
+    assert judge_module._file_label("answers-a.json") == "a"
+    assert judge_module._file_label("") == "b"

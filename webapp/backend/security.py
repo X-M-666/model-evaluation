@@ -31,10 +31,15 @@ def _is_sensitive_key(name: str) -> bool:
 
 
 def sanitize_config(config: dict[str, Any]) -> dict[str, Any]:
-    """返回不包含模型 API Key 的配置副本，保留报告展示所需的全部字段。"""
+    """返回不包含模型/辅助配置 API Key 的配置副本，保留报告展示所需的全部字段。"""
     safe = copy.deepcopy(config)
-    for slot in ("model_a", "model_b"):
+    for slot in ("model_a", "model_b", "judge", "embedding"):
         model = safe.get(slot)
         if isinstance(model, dict):
             model.pop("key", None)
+    review = safe.get("review")
+    if isinstance(review, dict):
+        judge = review.get("judge")
+        if isinstance(judge, dict):
+            judge.pop("key", None)
     return safe

@@ -1,14 +1,22 @@
 # -*- coding: utf-8 -*-
 """报告生成器（纯规则化统计，无 API）：从任务集/答卷/verdict 计算全部指标，
-生成 8 类图表数据与逐条引用数值的精确分析文本，写入 report JSON 供前端渲染。"""
+生成 8 类图表数据与逐条引用数值的精确分析文本，写入 report JSON 供前端渲染。
+
+迭代二：新增 metrics（逐题指标引擎）/ kpi / significance（bootstrap 显著性）/
+warnings（跳过与降级提示）四段；judge_mode 按实际评审模式输出；
+significance 与 win_rate 均按 scoring_ids（排除 excluded_from_total）过滤。
+"""
 from __future__ import annotations
 
 import statistics
 from typing import Any
 
+from backend.engine.metrics import compute_task_metrics
+from backend.engine.stats import MIN_SAMPLE, significance_note
 from backend.engine.tasks import STABILITY_DIMENSION
 
 EPS = 0.001
+SIG_SEED = 2026
 
 
 def _group_by_id(ans: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
@@ -154,12 +162,15 @@ def build_report(
     answers_b: dict[str, Any] | None,
     verdict: dict[str, Any],
     rounds_answers: list[dict[str, Any]] | None = None,
+    embedding_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """生成完整报告结构：summary + charts + analysis。
+    """生成完整报告结构：summary + charts + analysis + 迭代二四段。
 
     多轮（rounds_answers 长度>1）时效率/成本/代码/原文按稳定模型跨轮聚合：
     延迟取平均、Token 求和、成功率=成功轮/总轮、代码通过率逐轮+聚合、
     原文带轮次标记；单轮/缺省时保持原逻辑。
+
+    embedding_config：embedding provider 配置（仅用于报告标注，报告本身零网络）。
     """
     tasks = task_set["tasks"]
     if rounds_answers and len(rounds_answers) > 1:
@@ -170,13 +181,188 @@ def build_report(
     summary = _build_summary(config, tasks, rows, verdict)
     charts = _build_charts(tasks, rows, summary)
     analysis = _build_analysis(tasks, rows, summary, charts)
+    metrics = _build_metrics(task_set, rounds_answers, answers_a, answers_b, verdict,
+                             embedding_config)
+    significance = _build_significance(task_set, verdict)
+    kpi = _build_kpi(summary, charts, significance, rows)
+    warnings = _build_warnings(task_set, verdict, metrics, significance)
 
     return {
-        "judge_mode": "human",
+        "judge_mode": (config.get("review") or {}).get("mode") or "human",
+        "prompt_strategy": config.get("prompt_strategy", "cot"),
         "summary": summary,
         "charts": charts,
         "analysis": analysis,
+        "metrics": metrics,
+        "kpi": kpi,
+        "significance": significance,
+        "warnings": warnings,
     }
+
+
+def _build_metrics(
+    task_set: dict[str, Any],
+    rounds_answers: list[dict[str, Any]] | None,
+    answers_a: dict[str, Any] | None,
+    answers_b: dict[str, Any] | None,
+    verdict: dict[str, Any],
+    embedding_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """逐题指标（指标引擎）：X/Y 两侧分别计算；纯规则化、零网络。
+
+    语义向量优先执行期采集（ans_entry.semantic），缺失时 n-gram 兜底；
+    截断/调用失败/无 expected/代码未执行 → {skipped, reason} 由 warnings 段承接。
+    """
+    revealed = verdict.get("revealed", {})
+    x_file = revealed.get("answer_x_file", "a")
+    y_file = revealed.get("answer_y_file", "b")
+
+    if rounds_answers and len(rounds_answers) > 1:
+        last_round = rounds_answers[-1]
+    else:
+        last_round = {"a": answers_a, "b": answers_b}
+
+    def entries(label: str, task_id: str) -> list[dict[str, Any]]:
+        ra = last_round.get(label) if isinstance(last_round, dict) else None
+        return [e for e in (ra or {}).get("answers", []) if e.get("id") == task_id]
+
+    score_map = {s["id"]: s for s in verdict.get("scores", [])}
+    per_task: list[dict[str, Any]] = []
+    for t in task_set.get("tasks", []):
+        sid = t["id"]
+        sc = score_map.get(sid, {})
+        per_task.append({
+            "id": sid,
+            "dimension": t.get("dimension", "自定义"),
+            "x": compute_task_metrics(t, entries("a" if x_file == "a" else "b", sid),
+                                      sc.get("answer_x")),
+            "y": compute_task_metrics(t, entries("b" if y_file == "b" else "a", sid),
+                                      sc.get("answer_y")),
+        })
+    provider = {
+        "kind": (embedding_config or {}).get("provider") or "auto",
+        "error": (embedding_config or {}).get("error"),
+    }
+    return {"provider": provider, "per_task": per_task}
+
+
+def _build_significance(
+    task_set: dict[str, Any],
+    verdict: dict[str, Any],
+) -> dict[str, Any]:
+    """bootstrap 配对显著性（迭代二）：稳定模型空间，按 scoring_ids 过滤。
+
+    整体 + 分维度；样本 < MIN_SAMPLE 或 CI 含 0 → significant=False 并区分原因。
+    """
+    excluded = {t["id"] for t in task_set.get("tasks", []) if t.get("excluded_from_total")}
+    x_file = verdict.get("revealed", {}).get("answer_x_file", "a")
+    rows: list[dict[str, Any]] = []
+    for s in verdict.get("scores", []):
+        if s.get("id") in excluded:
+            continue
+        if x_file == "a":
+            ma, mb = s.get("answer_x", 0), s.get("answer_y", 0)
+        else:
+            ma, mb = s.get("answer_y", 0), s.get("answer_x", 0)
+        rows.append({"dimension": s.get("dimension", "自定义"), "ma": ma, "mb": mb})
+
+    by_dim: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        by_dim.setdefault(r["dimension"], []).append(r)
+    per_dimension = {
+        d: significance_note([r["ma"] for r in rs], [r["mb"] for r in rs], seed=SIG_SEED)
+        for d, rs in sorted(by_dim.items())
+    }
+    overall = (
+        significance_note([r["ma"] for r in rows], [r["mb"] for r in rows], seed=SIG_SEED)
+        if rows else {"significant": False, "reason": "no_scoring_tasks",
+                      "ci": [0.0, 0.0], "sample": 0, "note": "无计分题，无法进行显著性检验"}
+    )
+    return {"overall": overall, "per_dimension": per_dimension}
+
+
+def _build_kpi(
+    summary: dict[str, Any],
+    charts: dict[str, Any],
+    significance: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """KPI 汇总：分数/胜场/代码通过率/延迟/token + 显著性结论。"""
+    code_rates = {"x": None, "y": None}
+    total_px = total_tx = total_py = total_ty = 0
+    for c in charts.get("code_pass_rate", []):
+        total_px += c.get("x_passed", 0)
+        total_tx += c.get("x_total", 0)
+        total_py += c.get("y_passed", 0)
+        total_ty += c.get("y_total", 0)
+    if total_tx:
+        code_rates["x"] = round(total_px / total_tx, 4)
+    if total_ty:
+        code_rates["y"] = round(total_py / total_ty, 4)
+
+    lat_x = [r["latency_x"] for r in rows if r["status_x"] == "ok" and r["latency_x"] > 0]
+    lat_y = [r["latency_y"] for r in rows if r["status_y"] == "ok" and r["latency_y"] > 0]
+
+    return {
+        "total_score": {"x": summary["total_x"], "y": summary["total_y"],
+                        "max": summary["max_score"]},
+        "avg_score": {"x": summary["avg_x"], "y": summary["avg_y"]},
+        "win_count": {"x": summary["win_x"], "y": summary["win_y"], "ties": summary["ties"]},
+        "code_pass_rate": code_rates,
+        "latency_ms": {
+            "x": round(statistics.mean(lat_x), 1) if lat_x else None,
+            "y": round(statistics.mean(lat_y), 1) if lat_y else None,
+        },
+        "total_tokens": {
+            "x": sum(r["prompt_x"] + r["completion_x"] for r in rows),
+            "y": sum(r["prompt_y"] + r["completion_y"] for r in rows),
+        },
+        "significance": significance["overall"],
+    }
+
+
+def _build_warnings(
+    task_set: dict[str, Any],
+    verdict: dict[str, Any],
+    metrics: dict[str, Any],
+    significance: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """告警清单：指标跳过（截断/失败/无 expected/代码未执行）、评审失败、
+    embedding 降级、显著性未达样本/CI 含 0。"""
+    warnings: list[dict[str, Any]] = []
+    meta = verdict.get("meta", {})
+    if meta.get("invalid"):
+        warnings.append({
+            "code": "invalid_verdicts", "level": "warning",
+            "message": f"评审失败 {meta['invalid']} 题，已按平局标记 invalid 处理",
+        })
+    for pt in metrics.get("per_task", []):
+        for side in ("x", "y"):
+            m = pt.get(side) or {}
+            if m.get("skipped"):
+                reason = m.get("reason", "")
+                warnings.append({
+                    "code": "metrics_skipped", "level": "info",
+                    "message": f"{pt['id']} 侧{side}指标跳过：{reason}",
+                })
+    emb_err = (metrics.get("provider") or {}).get("error")
+    if emb_err:
+        warnings.append({
+            "code": "embedding_degraded", "level": "warning",
+            "message": f"embedding provider 不可用（{emb_err}），语义相似度已用 n-gram 兜底",
+        })
+    sig = significance.get("overall", {})
+    if sig.get("reason") == "insufficient_sample":
+        warnings.append({
+            "code": "significance_sample", "level": "warning",
+            "message": f"计分样本 {sig.get('sample', 0)} < {MIN_SAMPLE}，显著性结论不可靠",
+        })
+    elif sig.get("reason") == "ci_overlaps_zero":
+        warnings.append({
+            "code": "significance_overlap", "level": "info",
+            "message": "总分差异不显著（bootstrap CI 包含 0）",
+        })
+    return warnings
 
 
 def _build_rows(

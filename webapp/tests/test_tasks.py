@@ -176,7 +176,7 @@ def test_build_task_set_meta():
     assert ts["meta"]["scope"] == "八大能力维度"
     assert ts["meta"]["num_questions"] == 7
     assert ts["meta"]["created_by"] == "webapp"
-    assert ts["meta"]["dataset_version"] == "v1"
+    assert ts["meta"]["dataset_version"] == "v2"
     assert ts["meta"]["dataset_source"] == "builtin"
 
 

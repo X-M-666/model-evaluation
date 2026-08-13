@@ -55,8 +55,14 @@ def create_job_id() -> str:
 
 
 def save_config(job_id: str, config: dict) -> None:
-    """保存任务配置（API Key 打码，不落盘）。保留嵌套结构与 dataset_name/repeat_n。"""
+    """保存任务配置（API Key 打码，不落盘）。保留嵌套结构与 dataset_name/repeat_n。
+
+    迭代二：judge/embedding 辅助配置同样掩码（Key 不落盘不变量），
+    并落盘 prompt_strategy 供历史报告自描述执行方式。
+    """
     def _mask_model(m):
+        if not isinstance(m, dict):
+            return m
         return {
             "name": m.get("name", "?"),
             "url": m.get("url", ""),
@@ -65,6 +71,11 @@ def save_config(job_id: str, config: dict) -> None:
             "max_tokens": m.get("max_tokens", 4096),
             "top_p": m.get("top_p"),
         }
+    judge_cfg = None
+    if isinstance(config.get("review"), dict):
+        judge_cfg = config["review"].get("judge")
+    elif config.get("judge"):
+        judge_cfg = config.get("judge")
     safe = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model_a": _mask_model(config.get("model_a", {})),
@@ -76,8 +87,15 @@ def save_config(job_id: str, config: dict) -> None:
         "dataset_name": config.get("dataset_name"),
         "repeat_n": config.get("repeat_n", 1),
         "code_verify_mode": config.get("code_verify_mode", "off"),
+        "prompt_strategy": config.get("prompt_strategy", "cot"),
         "model_a_key_masked": "***",
         "model_b_key_masked": "***",
+        "judge": _mask_model(judge_cfg) if judge_cfg else None,
+        "judge_key_masked": "***",
+        "embedding": _mask_model(config.get("embedding")) if config.get("embedding") else None,
+        "embedding_key_masked": "***",
+        "review_mode": config.get("review", {}).get("mode", "pure_human") if isinstance(config.get("review"), dict) else "pure_human",
+        "budget": config.get("budget") if isinstance(config.get("budget"), dict) else None,
     }
     (_job_dir(job_id) / "config.json").write_text(json.dumps(safe, ensure_ascii=False, indent=2), encoding="utf-8")
 

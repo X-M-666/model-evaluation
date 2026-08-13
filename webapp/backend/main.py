@@ -22,6 +22,8 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.engine.tasks import build_task_set, build_task_set_from_dataset, DIMENSIONS
 from backend.engine.executor import execute_all
+from backend.engine.budget import check_budget
+from backend.engine.judge import run_judge
 from backend.engine.human_review import (
     make_reveal, resolve_round, build_review_view,
     build_round_verdict, build_final_verdict,
@@ -409,7 +411,11 @@ async def test_connection(config: StartRequest):
 
 @app.post("/api/eval/start", response_model=StartResponse)
 async def start_eval(req: StartRequest):
-    """启动一轮评测。支持 dataset_name（自定义评测集）和 repeat_n（重复次数）。"""
+    """启动一轮评测。支持 dataset_name（自定义评测集）和 repeat_n（重复次数）。
+
+    迭代二：prompt_strategy / review（pure_agent 评审）/ budget（预算熔断）/
+    embedding（语义向量采集）随请求生效；budget hard 超限启动即 400 拒绝。
+    """
     # SSRF 防护：评测启动即校验上游目标（executor 每次调用前不再重复解析）
     try:
         validate_upstream_url(req.model_a.url)
@@ -417,10 +423,27 @@ async def start_eval(req: StartRequest):
     except UpstreamUrlError as e:
         raise HTTPException(400, f"模型 URL 校验失败: {e}")
 
-    # 并发限制：执行中任务数（mock 不消耗外部资源，不计入）
+    # 迭代二：pure_agent 时评审模型同样走 SSRF 校验
+    review_mode = (req.review.mode if req.review else "pure_human")
+    judge_cfg = None
+    if review_mode == "pure_agent":
+        if not req.review or req.review.judge is None:
+            raise HTTPException(400, "pure_agent 评审模式必须提供 review.judge 模型配置")
+        judge_cfg = {
+            "name": req.review.judge.name,
+            "url": req.review.judge.url,
+            "key": req.review.judge.key,
+        }
+        try:
+            validate_upstream_url(req.review.judge.url)
+        except UpstreamUrlError as e:
+            raise HTTPException(400, f"评审模型 URL 校验失败: {e}")
+
+    # 并发限制：执行中任务数（mock 不消耗外部资源，不计入；judging 阶段
+    # 评审模型真实调用，同样计入）
     active = sum(
         1 for j in _jobs.values()
-        if j.get("state") in ("pending", "executing")
+        if j.get("state") in ("pending", "executing", "judging")
         and not str(j.get("config", {}).get("model_a", {}).get("url", "")).startswith("mock")
     )
     if active >= MAX_ACTIVE_JOBS:
@@ -452,6 +475,18 @@ async def start_eval(req: StartRequest):
     else:
         task_set = build_task_set(dims=req.dims, seed=seed, num_questions=req.num_questions)
 
+    # 迭代二：预算熔断（hard 超限启动即 400 拒绝；warn 由运行期幂等提示）
+    budget_check = check_budget(
+        req.budget.model_dump() if req.budget else None,
+        task_set["meta"]["total"], req.repeat_n, review_mode,
+    )
+    if budget_check["limited"] and not budget_check["allowed"]:
+        raise HTTPException(
+            400,
+            f"预算超限：预估消耗 {budget_check['estimated']} token，"
+            f"超过上限 {budget_check['limit']}（hard 模式拒绝启动）",
+        )
+
     # 构建 config（含模型参数）
     def _build_model_config(mc) -> dict[str, Any]:
         return {
@@ -469,6 +504,14 @@ async def start_eval(req: StartRequest):
         "repeat_n": req.repeat_n,
         "num_questions": req.num_questions,
         "code_verify_mode": req.code_verify_mode,
+        "prompt_strategy": req.prompt_strategy,
+        "review": {
+            "mode": review_mode,
+            "fail_open": bool(req.review.fail_open) if req.review else False,
+            "judge": judge_cfg,
+        },
+        "budget": req.budget.model_dump() if req.budget else None,
+        "embedding": req.embedding.model_dump() if req.embedding else None,
     }
     save_config(job_id, config_data)
     save_task_set(job_id, task_set)
@@ -486,6 +529,8 @@ async def start_eval(req: StartRequest):
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "sse_queue": asyncio.Queue(),
         "repeat_n": req.repeat_n,
+        "budget_warned": False,
+        "embedding_cfg": req.embedding.model_dump() if req.embedding else None,
     }
 
     task = asyncio.create_task(_run_eval(job_id))
@@ -576,8 +621,12 @@ async def _run_eval_impl(job_id: str):
             await _push_event(job_id, {"state": "executing", "progress": f"{done}/{total}", "round": round_label})
 
         try:
+            _exec_kwargs = {}
+            if j.get("embedding_cfg"):
+                _exec_kwargs["embedding_cfg"] = j["embedding_cfg"]
             answers_a, answers_b = await execute_all(
-                task_set, config_a=cfg["model_a"], config_b=cfg["model_b"], progress_cb=progress_cb,
+                task_set, config_a=cfg["model_a"], config_b=cfg["model_b"],
+                progress_cb=progress_cb, **_exec_kwargs,
             )
         except Exception as e:
             if _job_cancelled(job_id):
@@ -615,6 +664,23 @@ async def _run_eval_impl(job_id: str):
         raise JobCancelled
     j["rounds_answers"] = all_rounds
 
+    # 迭代二：warn 预算超限 → 每任务幂等推送一次预算告警
+    budget_cfg = cfg.get("budget")
+    if budget_cfg:
+        b_check = check_budget(
+            budget_cfg, task_set["meta"]["total"], repeat_n,
+            (cfg.get("review") or {}).get("mode", "pure_human"),
+        )
+        if b_check["limited"] and not j.get("budget_warned") and b_check["exceed"] > 0:
+            j["budget_warned"] = True
+            await _push_event(job_id, {
+                "type": "budget_warning",
+                "message": f"预估 token 消耗 {b_check['estimated']} 超过预算上限 "
+                           f"{b_check['limit']}（超出 {b_check['exceed']}），请关注成本",
+                "estimated": b_check["estimated"],
+                "limit": b_check["limit"],
+            })
+
     # 生成并持久化 X/Y 身份映射（重启不丢）
     reveal = make_reveal(repeat_n)
     save_reveal(job_id, reveal)
@@ -623,10 +689,136 @@ async def _run_eval_impl(job_id: str):
         raise JobCancelled
     j["reveal"] = reveal
 
-    # 进入人工评审阶段，等待用户打分
-    j["state"] = "reviewing"
-    j["progress"] = "0/0"
-    await _push_event(job_id, {"state": "reviewing"})
+    if (cfg.get("review") or {}).get("mode") == "pure_agent":
+        await _run_agent_judging(job_id, all_rounds, reveal, cfg, task_set)
+    else:
+        # 进入人工评审阶段，等待用户打分
+        j["state"] = "reviewing"
+        j["progress"] = "0/0"
+        await _push_event(job_id, {"state": "reviewing"})
+
+
+async def _run_agent_judging(
+    job_id: str,
+    all_rounds: list[dict],
+    reveal: dict,
+    cfg: dict,
+    task_set: dict,
+):
+    """pure_agent：作答完成后由评审模型逐轮自动评审 → 聚合 → 生成报告 → completed。
+
+    - 与人工评审共用同一 reveal（身份对齐）与 build_final_verdict 聚合；
+    - 评审模型整体异常 / 全部 verdict invalid：fail_open=True 降级人工评审
+      （推送 judge_health 事件），否则任务置 error；
+    - Key 仅存进程内存（config 落盘时已打码）。
+    """
+    j = _jobs.get(job_id)
+    if j is None:
+        raise JobCancelled
+    judge_cfg = (cfg.get("review") or {}).get("judge") or {}
+    fail_open = bool((cfg.get("review") or {}).get("fail_open"))
+    repeat_n = len(all_rounds) or 1
+
+    def _raise_if_cancelled():
+        if _job_cancelled(job_id):
+            raise JobCancelled
+        jj = _jobs.get(job_id)
+        if jj is None or jj.get("cancel_requested"):
+            raise JobCancelled
+
+    async def judge_progress_cb(done, total):
+        jj = _jobs.get(job_id)
+        if jj is None:
+            return
+        jj["progress"] = f"{done}/{total}"
+        await _push_event(job_id, {"state": "judging", "progress": f"{done}/{total}"})
+
+    round_verdicts: list[dict] = []
+    try:
+        for r_idx, round_ans in enumerate(all_rounds):
+            _raise_if_cancelled()
+            jj = _jobs.get(job_id)
+            jj["state"] = "judging"
+            jj["progress"] = "0/0"
+            await _push_event(job_id, {"state": "judging", "progress": "0/0",
+                                       "round": f"第{r_idx+1}/{repeat_n}轮"})
+
+            x_model, y_model, _xp, _yp = resolve_round(
+                reveal, r_idx, round_ans["a"], round_ans["b"]
+            )
+            round_reveal = reveal["rounds"][r_idx] if r_idx < len(reveal["rounds"]) \
+                else {"answer_x": "a", "answer_y": "b"}
+            judge_verdict = await run_judge(
+                task_set, round_ans["a"], round_ans["b"], judge_cfg,
+                revealed={"rounds": [round_reveal]},
+                progress_cb=judge_progress_cb,
+            )
+            valid = judge_verdict.get("meta", {}).get("valid", 0)
+            if valid == 0:
+                raise RuntimeError("评审模型未能返回任何有效 verdict")
+            round_verdicts.append(_round_verdict_from_judge(
+                judge_verdict, x_model, y_model, r_idx, round_reveal,
+            ))
+    except JobCancelled:
+        raise
+    except Exception as e:
+        _raise_if_cancelled()
+        j = _jobs.get(job_id)
+        if fail_open:
+            j["state"] = "reviewing"
+            j["progress"] = "0/0"
+            await _push_event(job_id, {
+                "state": "reviewing", "judge_failed": True,
+            })
+            await _push_event(job_id, {
+                "type": "judge_health", "status": "degraded",
+                "detail": f"AI 评审失败（fail_open 降级人工评审）：{e}",
+            })
+            return
+        j["state"] = "error"
+        j["error"] = f"AI 评审失败: {e}"
+        await _push_event(job_id, {"state": "error", "error": str(e)})
+        _mark_error(job_id, f"AI 评审失败: {e}")
+        return
+
+    verdict = build_final_verdict(round_verdicts, repeat_n)
+    answers_a, answers_b = all_rounds[-1]["a"], all_rounds[-1]["b"]
+    _finalize_job(
+        job_id, verdict, {"mode": "pure_agent", "note": "agent 自动评审"},
+        round_verdicts, cfg, task_set, answers_a, answers_b, all_rounds,
+        embedding_config=_jobs.get(job_id, {}).get("embedding_cfg"),
+    )
+    await _push_event(job_id, {"state": "completed"})
+    audit.review_submitted(job_id, actor="agent")
+
+
+def _round_verdict_from_judge(
+    judge_verdict: dict,
+    x_model: str,
+    y_model: str,
+    round_idx: int,
+    round_reveal: dict,
+) -> dict:
+    """把 run_judge 输出归一化为人工评审同构的轮次 verdict（供 build_final_verdict 聚合）。"""
+    scores = []
+    for s in judge_verdict.get("scores", []):
+        row = dict(s)
+        row["round"] = round_idx + 1
+        scores.append(row)
+    return {
+        "meta": {**judge_verdict.get("meta", {}), "repeat_n": 1},
+        "scores": scores,
+        "per_dimension": judge_verdict.get("per_dimension", {}),
+        "totals": judge_verdict.get("totals", {}),
+        "revealed": {
+            "answer_x": x_model,
+            "answer_y": y_model,
+            "answer_x_file": round_reveal.get("answer_x", "a"),
+            "answer_y_file": round_reveal.get("answer_y", "b"),
+        },
+        "conclusion": judge_verdict.get("conclusion", ""),
+        "winner_model": judge_verdict.get("winner_model", "tie"),
+    }
 
 
 def _finalize_job(
@@ -639,6 +831,7 @@ def _finalize_job(
     answers_a: dict,
     answers_b: dict,
     rounds_answers: list[dict] | None = None,
+    embedding_config: dict | None = None,
 ):
     """人工评审提交后：写 verdict/review/round-verdicts/report，置为 completed。
 
@@ -649,7 +842,8 @@ def _finalize_job(
     save_review(job_id, review_data)
     if round_verdicts:
         save_round_verdicts(job_id, round_verdicts)
-    report = build_report(cfg, task_set, answers_a, answers_b, verdict, rounds_answers)
+    report = build_report(cfg, task_set, answers_a, answers_b, verdict, rounds_answers,
+                          embedding_config)
     save_report(job_id, {
         "config": sanitize_config(cfg),
         "tasks": task_set,
@@ -976,7 +1170,7 @@ async def eval_report(job_id: str):
                 }
                 payload["report"] = build_report(
                     j["config"], j["task_set"], j["answers_a"], j["answers_b"],
-                    j["verdict"], rounds_answers,
+                    j["verdict"], rounds_answers, j.get("embedding_cfg"),
                 )
                 return redact_sensitive(payload)
         raise HTTPException(404, "job not found or not completed")
@@ -1010,7 +1204,12 @@ async def eval_report(job_id: str):
         rich = report_dict.get("report")
     if rich is None and verdict and tasks:
         try:
-            rich = build_report(cfg, tasks, answers_a, answers_b, verdict, rounds_answers)
+            # 磁盘 config 为扁平化结构（review_mode/judge 平铺），重建时还原
+            # review.mode 供 build_report 输出正确的 judge_mode
+            restore_cfg = dict(cfg or {})
+            if isinstance(restore_cfg.get("review_mode"), str):
+                restore_cfg["review"] = {"mode": restore_cfg["review_mode"]}
+            rich = build_report(restore_cfg, tasks, answers_a, answers_b, verdict, rounds_answers)
         except Exception:
             rich = None
 

@@ -3,7 +3,9 @@
 按分差判定 winner（tie/answer_x/answer_y），分差 ≤ 1 需仲裁备注，
 最终写入 verdict 结构（与 .eval/verdict.json 兼容）。
 
-评审模型调用 OpenAI 兼容 API（与 executor 相同协议）。
+迭代二：revealed 可显式注入（与人工评审 reveal 打通，缺省仍随机打乱）、
+评审网络走 SSRF 校验客户端、答案长度围栏（超长截断避免 prompt 爆炸）、
+judging SSE 进度回调。评审模型调用 OpenAI 兼容 API（与 executor 相同协议）。
 """
 from __future__ import annotations
 
@@ -11,9 +13,23 @@ import json
 import random
 import re
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
+
+from backend.ssrf import build_upstream_client
+
+# 送审答案长度围栏：超长截断并在 prompt 中标注（防 prompt 爆炸，保证可审性）
+ANSWER_FENCE = 8000
+
+
+def _fenced(raw: str | None) -> str:
+    """答案围栏：超长截断并标注；空值显示占位符。"""
+    if not raw:
+        return "(无回答)"
+    if len(raw) <= ANSWER_FENCE:
+        return raw
+    return raw[:ANSWER_FENCE] + "\n\n……（答案过长已截断，完整内容见答卷文件）"
 
 
 async def _call_judge_model(
@@ -98,10 +114,10 @@ def _build_blind_prompt(
 答案Y 通过率：{_fmt_code_verify(code_verify_y)}
 
 【答案X】
-{answer_x.get('raw_answer', '(无回答)')}
+{_fenced(answer_x.get('raw_answer'))}
 
 【答案Y】
-{answer_y.get('raw_answer', '(无回答)')}
+{_fenced(answer_y.get('raw_answer'))}
 """
     return prompt
 
@@ -156,39 +172,83 @@ async def judge_task(
     return verdict
 
 
+def _file_label(v: Any) -> str:
+    """revealed 标签归一化：支持 "a"/"b"、文件全名 "answers-a.json" 等形式。"""
+    s = str(v or "")
+    if s in ("a", "b"):
+        return s
+    if "answers-a" in s or "a.json" in s:
+        return "a"
+    return "b"
+
+
+def _normalize_reveal(revealed: dict[str, Any] | None) -> tuple[str, str] | None:
+    """归一化外部注入的 revealed（支持 human_review 的 rounds 结构与直接映射）。"""
+    if not isinstance(revealed, dict):
+        return None
+    r = revealed.get("rounds", [{}])[0] if revealed.get("rounds") else revealed
+    x, y = r.get("answer_x"), r.get("answer_y")
+    if x is None and y is None:
+        return None
+    return _file_label(x) or "a", _file_label(y) or "b"
+
+
 async def run_judge(
     task_set: dict[str, Any],
     answers_x: dict[str, Any],
     answers_y: dict[str, Any],
     judge_config: dict[str, str],
+    revealed: dict[str, Any] | None = None,
+    progress_cb: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """对全部任务集执行双盲评审，返回完整 verdict 结构。
 
-    - 随机打乱 X/Y 对应关系（答案X/答案Y身份随机）
-    - 逐题评分
+    - 随机打乱 X/Y 对应关系（答案X/答案Y身份随机）；revealed 非 None 时
+      显式注入身份映射（与人工评审 reveal 打通，人工/agent 评审结果可对齐）
+    - 逐题评分（送审答案带长度围栏），每审完一题回调 progress_cb(done, total)
     - 统计 totals / per_dimension / revealed / meta
+    - 网络统一走 build_upstream_client()（SSRF 校验）
     """
     tasks = task_set["tasks"]
     answers_list_x = {a["id"]: a for a in answers_x["answers"]}
     answers_list_y = {a["id"]: a for a in answers_y["answers"]}
 
-    # 随机打乱：决定哪份答卷是答案X，哪份是答案Y
-    if random.random() < 0.5:
-        x_pool, y_pool = answers_list_x, answers_list_y
-        revealed = {"answer_x": "answers-a.json", "answer_y": "answers-b.json"}
+    # 决定哪份答卷是答案X，哪份是答案Y
+    injected = _normalize_reveal(revealed)
+    if injected is not None:
+        x_label, y_label = injected
+        x_pool, y_pool = (
+            (answers_list_x, answers_list_y) if x_label == "a"
+            else (answers_list_y, answers_list_x)
+        )
     else:
-        x_pool, y_pool = answers_list_y, answers_list_x
-        revealed = {"answer_x": "answers-b.json", "answer_y": "answers-a.json"}
+        if random.random() < 0.5:
+            x_label, y_label = "a", "b"
+        else:
+            x_label, y_label = "b", "a"
+        x_pool, y_pool = (
+            (answers_list_x, answers_list_y) if x_label == "a"
+            else (answers_list_y, answers_list_x)
+        )
+
+    revealed_map = {
+        "answer_x": f"answers-{x_label}.json",
+        "answer_y": f"answers-{y_label}.json",
+        "answer_x_file": x_label,
+        "answer_y_file": y_label,
+    }
 
     verdicts: list[dict[str, Any]] = []
-    async with httpx.AsyncClient() as client:
-        for task in tasks:
+    async with build_upstream_client() as client:
+        for i, task in enumerate(tasks):
             tid = task["id"]
             # 效率稳定性题有 repeat_1/repeat_2 两条，用 repeat_1 送审
             ax = x_pool.get(tid) or x_pool.get(f"{tid}_repeat_1", {"raw_answer": "", "api_info": {}})
             ay = y_pool.get(tid) or y_pool.get(f"{tid}_repeat_1", {"raw_answer": "", "api_info": {}})
             v = await judge_task(client, task, ax, ay, judge_config)
             verdicts.append(v)
+            if progress_cb:
+                await progress_cb(i + 1, len(tasks))
 
     # 统计
     valid = [v for v in verdicts if not v.get("_invalid")]
@@ -234,7 +294,7 @@ async def run_judge(
         "scores": verdicts,
         "per_dimension": dim_totals,
         "totals": {"answer_x": total_x, "answer_y": total_y},
-        "revealed": revealed,
+        "revealed": revealed_map,
         "conclusion": _build_conclusion(valid, dim_totals, total_x, total_y),
         "winner_model": answers_x["model"] if total_x > total_y else (
             answers_y["model"] if total_y > total_x else "tie"
