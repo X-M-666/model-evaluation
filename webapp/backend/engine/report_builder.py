@@ -163,14 +163,18 @@ def build_report(
     verdict: dict[str, Any],
     rounds_answers: list[dict[str, Any]] | None = None,
     embedding_config: dict[str, Any] | None = None,
+    gold: dict[str, Any] | None = None,
+    round_verdicts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """生成完整报告结构：summary + charts + analysis + 迭代二四段。
+    """生成完整报告结构：summary + charts + analysis + 迭代二四段 + 元评估/一致率。
 
     多轮（rounds_answers 长度>1）时效率/成本/代码/原文按稳定模型跨轮聚合：
     延迟取平均、Token 求和、成功率=成功轮/总轮、代码通过率逐轮+聚合、
     原文带轮次标记；单轮/缺省时保持原逻辑。
 
     embedding_config：embedding provider 配置（仅用于报告标注，报告本身零网络）。
+    gold（迭代三）：金标记录；None/不匹配 → meta_eval 段空态。
+    round_verdicts（迭代三）：逐轮 verdict，供复评一致率（repeat_n≥2 时）。
     """
     tasks = task_set["tasks"]
     if rounds_answers and len(rounds_answers) > 1:
@@ -186,9 +190,19 @@ def build_report(
     significance = _build_significance(task_set, verdict)
     kpi = _build_kpi(summary, charts, significance, rows)
     warnings = _build_warnings(task_set, verdict, metrics, significance)
+    meta_eval = _build_meta_eval(gold, verdict, task_set)
+    consistency = _build_consistency(round_verdicts,
+                                     verdict.get("meta", {}).get("repeat_n", 1))
 
+    review_cfg = config.get("review") or {}
+    review = {
+        "mode": review_cfg.get("mode") or "pure_human",
+        "degraded": bool(review_cfg.get("degraded")) or False,
+        "k_top_human": review_cfg.get("k_top_human"),
+    }
     return {
-        "judge_mode": (config.get("review") or {}).get("mode") or "human",
+        "judge_mode": review_cfg.get("mode") or "human",  # 旧字段：缺省 human 兼容
+        "review": review,
         "prompt_strategy": config.get("prompt_strategy", "cot"),
         "summary": summary,
         "charts": charts,
@@ -197,6 +211,61 @@ def build_report(
         "kpi": kpi,
         "significance": significance,
         "warnings": warnings,
+        "meta_eval": meta_eval,
+        "consistency": consistency,
+    }
+
+
+def _build_meta_eval(gold: dict[str, Any] | None,
+                     verdict: dict[str, Any],
+                     task_set: dict[str, Any]) -> dict[str, Any]:
+    """金标元评估段（迭代三）：金标传入且可匹配时计算；否则空态提示。"""
+    if not isinstance(gold, dict) or not gold.get("items"):
+        return {
+            "available": False, "spearman": None, "kappa": None,
+            "gold_offset": None, "gold_source": None,
+            "matched": 0, "gold_total": 0,
+            "note": "未配置金标集，暂无元评估（可在页面录入或直接调用金标 API）",
+        }
+    from backend.gold import compute_meta_eval
+    return compute_meta_eval(verdict, task_set, gold)
+
+
+def _build_consistency(round_verdicts: list[dict[str, Any]] | None,
+                       repeat_n: int) -> dict[str, Any] | None:
+    """复评一致率（迭代三，M4）：repeat_n≥2 时稳定空间逐轮 winner 一致率。
+
+    逐轮 winner 在稳定模型空间判定（model_a/tie/model_b）；单轮/缺数据 → None。
+    """
+    if repeat_n < 2 or not round_verdicts or len(round_verdicts) < 2:
+        return None
+    from backend.engine.human_review import _stable_scores
+    from backend.engine.stats import consistency_rate
+
+    per_id: dict[str, list[str]] = {}
+    for rv in round_verdicts:
+        # 迭代三：agent 逐题独立交换时 round-verdicts 落盘 per_task 映射，
+        # 一致率按题归一化到稳定模型空间（避免轮级 reveal 失配）
+        per_task = rv.get("revealed", {}).get("per_task")
+        for r in _stable_scores(rv, per_task):
+            a, b = r["model_a"], r["model_b"]
+            eps = 1e-6
+            winner = "model_a" if a - b > eps else ("model_b" if b - a > eps else "tie")
+            per_id.setdefault(r["id"], []).append(winner)
+    per_task = {
+        tid: {"rounds": wins,
+              "rate": consistency_rate(wins)}
+        for tid, wins in sorted(per_id.items())
+    }
+    task_rates = [v["rate"] for v in per_task.values() if v["rate"] is not None]
+    overall_rate = round(
+        sum(task_rates) / len(task_rates), 4
+    ) if task_rates else None
+    return {
+        "repeat_n": repeat_n,
+        "per_task": per_task,
+        "overall": overall_rate,
+        "note": "稳定空间逐轮 winner 一致率（两两轮次比对）",
     }
 
 

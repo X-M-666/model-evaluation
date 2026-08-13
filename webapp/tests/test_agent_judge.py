@@ -218,9 +218,23 @@ def test_agent_judge_uses_shared_reveal_and_injects(monkeypatch):
         j = main_module._jobs[job_id]
         round_reveal = j["reveal"]["rounds"][0]
 
-        # run_judge 收到显式注入的 reveal（与人工评审同一身份映射）
-        assert captured["revealed"] == {"rounds": [round_reveal]}
-        # round_verdicts 中 x 模型名 = reveal 标签对应模型；文件标签同 reveal
+        # 迭代三（H1）：run_judge 收到逐题独立随机交换 reveal（仅 agent）
+        rv = captured["revealed"]
+        assert set(rv) == {"rounds", "per_task"}
+        per_task = {pt["task_id"]: pt for pt in rv["per_task"]}
+        # rounds 字段 = per_task 首项（轮级兜底），与逐题映射一致
+        first = rv["per_task"][0]
+        assert rv["rounds"][0]["answer_x"] == first["answer_x"]
+        assert rv["rounds"][0]["answer_y"] == first["answer_y"]
+        task_ids = {t["id"] for t in j["task_set"]["tasks"]}
+        assert set(per_task) == task_ids
+        assert all(pt["answer_x"] in ("a", "b") and pt["answer_y"] in ("a", "b")
+                   and pt["answer_x"] != pt["answer_y"] for pt in per_task.values())
+        # 聚合结果未被逐题交换破坏（单轮不归一化，totals 即 answer_x/answer_y）
+        verdict = storage.get_job_files(job_id)["verdict.json"]
+        assert verdict["totals"] and len(verdict["totals"]) == 2
+
+        # round_verdicts 中 x 模型名 = 轮级 reveal 标签对应模型；文件标签同 reveal
         expected_x = ("A", "B") if round_reveal["answer_x"] == "a" else ("B", "A")
         verdicts = storage.get_job_files(job_id)["round-verdicts.json"]
         assert verdicts[0]["revealed"]["answer_x"] == expected_x[0]

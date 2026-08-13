@@ -59,10 +59,15 @@ h3{font-size:15px;color:#c9d1d9;margin-bottom:8px}
 <p class="sub" id="subInfo">加载中...</p>
 <div style="margin-bottom:16px"><a href="/">← 返回配置</a></div>
 
-<div class="blind-note">
+<div class="blind-note" id="blindNote">
   <strong>双盲规则</strong>：以下是两个被测模型的回答，已随机打乱为 <strong>答案X</strong> 与 <strong>答案Y</strong>，你不知道它们各自对应哪个模型。
   请依据每题给出的评分标准（rubric）独立打分：每题为 X、Y 各评 0-10 分（支持 0.5 步长），可选填评语。
   打分过程中不要尝试猜测模型身份；提交后系统将揭示对应关系并生成报告。
+</div>
+
+<div class="blind-note" id="hybridNote" style="display:none;border-color:#8957e5;background:rgba(137,87,229,.08)">
+  <strong>Hybrid 复核</strong>：AI 评审已完成全部题目，本页仅列出需人工复核的 Top-K 题（无效评审必选）。
+  每题显示 AI 原分供参考，<strong style="color:#f0883e">复核提交后将用你的打分覆盖该题的 AI 分</strong>，其余题目保留 AI 评审结果。
 </div>
 
 <div id="content"><div class="loading">加载评审数据...</div></div>
@@ -111,6 +116,17 @@ async function loadReview(){
 function render(){
   const sub = `任务: ${DATA.total_questions} 题 | 轮次: ${DATA.repeat_n} | jobId: ${jobId}`;
   document.getElementById('subInfo').textContent = sub;
+  const isHybrid = !!DATA.hybrid;
+  document.getElementById('hybridNote').style.display = isHybrid ? 'block' : 'none';
+  document.getElementById('submitBtn').textContent = isHybrid ? '提交复核' : '提交评审';
+  const reviewKeys = new Set();
+  let agentScores = {};
+  if(isHybrid){
+    (DATA.hybrid.review_set || []).forEach(it=>{
+      reviewKeys.add(it.round + ':' + it.task_id);
+      agentScores[it.round + ':' + it.task_id] = it;
+    });
+  }
   const content = document.getElementById('content');
   let html = '';
   DATA.rounds.forEach((round, ri) => {
@@ -119,9 +135,15 @@ function render(){
     }
     round.items.forEach((item, qi) => {
       const gi = globalIndex(ri, qi);
+      const rk = round.round + ':' + item.id;
+      if(isHybrid && !reviewKeys.has(rk)) return;  // hybrid 复核态仅渲染复核题
+      const agent = agentScores[rk];
+      const agentBadge = agent ? `<span class="badge dim" style="background:#8957e5" title="AI 预评分（提交后将被覆盖）">AI: X ${agent.agent_x} / Y ${agent.agent_y}${agent.invalid ? '（无效，需复核）' : ''}</span>` : '';
+      const prefillX = isHybrid && agent ? agent.agent_x : draftScore(ri,qi,'x');
+      const prefillY = isHybrid && agent ? agent.agent_y : draftScore(ri,qi,'y');
       html += `<div class="card q-card" data-ri="${ri}" data-qi="${qi}">
         <h3>${esc(item.id)} <span class="badge dim">${esc(item.dimension)}</span>
-          <span class="badge lv">${esc(item.difficulty||'')}</span></h3>
+          <span class="badge lv">${esc(item.difficulty||'')}</span> ${agentBadge}</h3>
         <div style="font-size:13px;color:#8b949e;margin-top:6px;white-space:pre-wrap">${esc(item.prompt)}</div>
         ${item.rubric_note ? `<div class="rubric">📋 ${esc(item.rubric_note)}</div>` : ''}
         ${item.test_cases && item.test_cases.length ? `<div class="test-cases"><strong>测试用例参考：</strong>${item.test_cases.map(tc=>`<div class="tc">· ${esc(tc.input)} → ${esc(tc.expected)}</div>`).join('')}</div>` : ''}
@@ -130,8 +152,8 @@ function render(){
           ${answerBox('答案Y', item.answer_y, 'y')}
         </div>
         <div class="score-row">
-          <div class="score-field"><label>答案X 得分 (0-10)</label><input type="number" min="0" max="10" step="0.5" data-field="x" data-ri="${ri}" data-qi="${qi}" value="${draftScore(ri,qi,'x')}" /></div>
-          <div class="score-field"><label>答案Y 得分 (0-10)</label><input type="number" min="0" max="10" step="0.5" data-field="y" data-ri="${ri}" data-qi="${qi}" value="${draftScore(ri,qi,'y')}" /></div>
+          <div class="score-field"><label>答案X 得分 (0-10)</label><input type="number" min="0" max="10" step="0.5" data-field="x" data-ri="${ri}" data-qi="${qi}" value="${prefillX}" /></div>
+          <div class="score-field"><label>答案Y 得分 (0-10)</label><input type="number" min="0" max="10" step="0.5" data-field="y" data-ri="${ri}" data-qi="${qi}" value="${prefillY}" /></div>
           <div class="score-field note-field"><label>评语（可选）</label><input type="text" placeholder="简要说明评分依据..." data-field="note" data-ri="${ri}" data-qi="${qi}" value="${esc(draftNote(ri,qi))}" /></div>
         </div>
       </div>`;
@@ -247,10 +269,12 @@ async function submitReview(){
   });
   if(!valid){ alert('存在无效分数（应为 0-10），请检查红色标记的输入框'); return; }
 
+  const isHybrid = !!DATA.hybrid;
+  const endpoint = isHybrid ? `/api/eval/${jobId}/hybrid-review` : `/api/eval/${jobId}/review`;
   const btn = document.getElementById('submitBtn');
   btn.disabled = true; btn.textContent = '提交中...';
   try{
-    const r = await apiFetch(`/api/eval/${jobId}/review`, {
+    const r = await apiFetch(endpoint, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({scores}),
     });

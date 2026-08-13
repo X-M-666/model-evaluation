@@ -23,10 +23,12 @@ from fastapi.staticfiles import StaticFiles
 from backend.engine.tasks import build_task_set, build_task_set_from_dataset, DIMENSIONS
 from backend.engine.executor import execute_all
 from backend.engine.budget import check_budget
-from backend.engine.judge import run_judge
+from backend.engine.judge import (
+    run_judge, make_task_reveal, _normalize_task_reveal, health_check,
+)
 from backend.engine.human_review import (
     make_reveal, resolve_round, build_review_view,
-    build_round_verdict, build_final_verdict,
+    build_round_verdict, build_final_verdict, merge_hybrid_verdicts,
 )
 from backend.engine.report_builder import build_report, reveal_answers
 from backend.engine.parsers import get_parser, supported_extensions
@@ -43,13 +45,19 @@ from backend.ssrf import build_upstream_client, validate_upstream_url, UpstreamU
 from backend.storage import (
     create_job_id, save_config, save_task_set, save_answers,
     save_verdict, save_error, save_report, save_reveal, load_reveal,
-    save_review, load_review, save_round_verdicts,
+    save_review, load_review, save_round_verdicts, load_round_verdicts,
     get_job_status, list_jobs, get_job_files,
     save_dataset, load_dataset, list_datasets, delete_dataset,
     update_saturation, get_saturation,
     is_valid_job_id,
+    list_gold, save_gold, delete_gold, load_gold, save_hybrid_review,
+    load_hybrid_review,
 )
-from backend.schemas import StartRequest, StartResponse, ReviewSubmission, ModelRegisterRequest
+from backend.gold import ensure_demo_gold, compute_meta_eval
+from backend.schemas import (
+    StartRequest, StartResponse, ReviewSubmission, ModelRegisterRequest,
+    GoldSetRequest,
+)
 from backend.security import redact_sensitive, sanitize_config
 from backend.models_registry import (
     delete_model, get_key, get_model, list_models, register, ModelRegistryError,
@@ -107,6 +115,7 @@ async def _shutdown_cancel_all():
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    ensure_demo_gold()  # 迭代三：gold 目录为空时载入 demo 金标（source="demo"）
     yield
     await _shutdown_cancel_all()
 
@@ -324,6 +333,52 @@ async def remove_dataset(name: str):
     return {"ok": True}
 
 
+# ---- 金标集（迭代三） ----
+
+@app.get("/api/gold")
+async def gold_list():
+    """金标集列表（含 source=demo/manual，供前端标注）。"""
+    return {"gold": list_gold()}
+
+
+@app.post("/api/gold")
+async def gold_upsert(req: GoldSetRequest):
+    """录入/覆盖金标集（source=manual；manual 覆盖同名 demo）。"""
+    save_gold(req.name, {"items": [it.model_dump() for it in req.items],
+                         "source": "manual"})
+    audit.gold_added(req.name)
+    return {"ok": True, "name": req.name}
+
+
+@app.delete("/api/gold/{name}")
+async def gold_remove(name: str):
+    ok = delete_gold(name)
+    if not ok:
+        raise HTTPException(404, "gold set not found")
+    return {"ok": True}
+
+
+@app.get("/api/gold/{name}/meta-eval")
+async def gold_meta_eval(name: str, job_id: str):
+    """金标元评估：金标 vs 指定任务评审分的 Spearman/Kappa/锚定偏移。
+
+    任务未完成（无 verdict）→ 404；金标与 job 题/模型不匹配 → 200 空态。
+    """
+    if not is_valid_job_id(job_id):
+        raise HTTPException(400, "非法 job_id")
+    files = get_job_files(job_id)
+    if files is None:
+        raise HTTPException(404, "job not found")
+    verdict = files.get("verdict.json")
+    if verdict is None:
+        raise HTTPException(404, "任务尚未完成评审（无 verdict），无法计算元评估")
+    task_set = files.get("tasks.json", {})
+    gold = load_gold(name)
+    if gold is None:
+        raise HTTPException(404, "gold set not found")
+    return {"meta_eval": compute_meta_eval(verdict, task_set, gold)}
+
+
 # ---- 模型配置库（迭代一） ----
 
 @app.post("/api/models")
@@ -423,12 +478,12 @@ async def start_eval(req: StartRequest):
     except UpstreamUrlError as e:
         raise HTTPException(400, f"模型 URL 校验失败: {e}")
 
-    # 迭代二：pure_agent 时评审模型同样走 SSRF 校验
+    # 迭代二：pure_agent 时评审模型同样走 SSRF 校验；迭代三：hybrid 同要求
     review_mode = (req.review.mode if req.review else "pure_human")
     judge_cfg = None
-    if review_mode == "pure_agent":
+    if review_mode in ("pure_agent", "hybrid"):
         if not req.review or req.review.judge is None:
-            raise HTTPException(400, "pure_agent 评审模式必须提供 review.judge 模型配置")
+            raise HTTPException(400, f"{review_mode} 评审模式必须提供 review.judge 模型配置")
         judge_cfg = {
             "name": req.review.judge.name,
             "url": req.review.judge.url,
@@ -509,6 +564,7 @@ async def start_eval(req: StartRequest):
             "mode": review_mode,
             "fail_open": bool(req.review.fail_open) if req.review else False,
             "judge": judge_cfg,
+            "k_top_human": req.review.k_top_human if req.review else 0,
         },
         "budget": req.budget.model_dump() if req.budget else None,
         "embedding": req.embedding.model_dump() if req.embedding else None,
@@ -530,6 +586,7 @@ async def start_eval(req: StartRequest):
         "sse_queue": asyncio.Queue(),
         "repeat_n": req.repeat_n,
         "budget_warned": False,
+        "health_warned": False,
         "embedding_cfg": req.embedding.model_dump() if req.embedding else None,
     }
 
@@ -689,8 +746,9 @@ async def _run_eval_impl(job_id: str):
         raise JobCancelled
     j["reveal"] = reveal
 
-    if (cfg.get("review") or {}).get("mode") == "pure_agent":
-        await _run_agent_judging(job_id, all_rounds, reveal, cfg, task_set)
+    review_mode = (cfg.get("review") or {}).get("mode")
+    if review_mode in ("pure_agent", "hybrid"):
+        await _run_agent_judging(job_id, all_rounds, reveal, cfg, task_set, review_mode)
     else:
         # 进入人工评审阶段，等待用户打分
         j["state"] = "reviewing"
@@ -704,12 +762,19 @@ async def _run_agent_judging(
     reveal: dict,
     cfg: dict,
     task_set: dict,
+    mode: str = "pure_agent",
 ):
-    """pure_agent：作答完成后由评审模型逐轮自动评审 → 聚合 → 生成报告 → completed。
+    """Agent 全量预评（pure_agent 直通 completed；hybrid 选出复核集进 reviewing）。
 
-    - 与人工评审共用同一 reveal（身份对齐）与 build_final_verdict 聚合；
+    - 与人工评审共用 build_final_verdict 聚合；迭代三起逐题独立随机交换
+      （H1：make_task_reveal → per_round_reveal 按题归一化聚合）；
     - 评审模型整体异常 / 全部 verdict invalid：fail_open=True 降级人工评审
-      （推送 judge_health 事件），否则任务置 error；
+      （写盘 review.mode=pure_human + degraded 标注 H3），否则任务置 error；
+    - hybrid：judging 结束选择复核集（H2：invalid 必选 → 分差降序 → 低分兜底，
+      k=min(k_top_human, 候选, 总数) L3）；k==0 直通 completed（不 reviewing）；
+      落盘 hybrid-review.json（M2 重启恢复）；SSE reviewing 带 mode/k；
+    - 健康度：invalid 率超阈值 → 幂等推送 judge_health invalid_rate；
+    - audit：judging 完成落 eval_judged（补迭代二缺口）；
     - Key 仅存进程内存（config 落盘时已打码）。
     """
     j = _jobs.get(job_id)
@@ -718,6 +783,7 @@ async def _run_agent_judging(
     judge_cfg = (cfg.get("review") or {}).get("judge") or {}
     fail_open = bool((cfg.get("review") or {}).get("fail_open"))
     repeat_n = len(all_rounds) or 1
+    k_top = int((cfg.get("review") or {}).get("k_top_human") or 0)
 
     def _raise_if_cancelled():
         if _job_cancelled(job_id):
@@ -734,6 +800,7 @@ async def _run_agent_judging(
         await _push_event(job_id, {"state": "judging", "progress": f"{done}/{total}"})
 
     round_verdicts: list[dict] = []
+    per_round_reveal: list[dict] = []
     try:
         for r_idx, round_ans in enumerate(all_rounds):
             _raise_if_cancelled()
@@ -748,9 +815,15 @@ async def _run_agent_judging(
             )
             round_reveal = reveal["rounds"][r_idx] if r_idx < len(reveal["rounds"]) \
                 else {"answer_x": "a", "answer_y": "b"}
+            # 迭代三（H1）：逐题独立随机交换（仅 agent）；旧轮级 reveal 保留为兜底
+            task_reveal = make_task_reveal(
+                [t["id"] for t in task_set["tasks"]],
+                seed=int(cfg.get("seed", 0)) * 100 + r_idx,
+            )
+            per_round_reveal.append(_normalize_task_reveal(task_reveal) or {})
             judge_verdict = await run_judge(
                 task_set, round_ans["a"], round_ans["b"], judge_cfg,
-                revealed={"rounds": [round_reveal]},
+                revealed=task_reveal,
                 progress_cb=judge_progress_cb,
             )
             valid = judge_verdict.get("meta", {}).get("valid", 0)
@@ -758,6 +831,7 @@ async def _run_agent_judging(
                 raise RuntimeError("评审模型未能返回任何有效 verdict")
             round_verdicts.append(_round_verdict_from_judge(
                 judge_verdict, x_model, y_model, r_idx, round_reveal,
+                per_task_reveal=per_round_reveal[-1],
             ))
     except JobCancelled:
         raise
@@ -774,6 +848,7 @@ async def _run_agent_judging(
                 "type": "judge_health", "status": "degraded",
                 "detail": f"AI 评审失败（fail_open 降级人工评审）：{e}",
             })
+            await _mark_review_degraded(job_id, cfg)
             return
         j["state"] = "error"
         j["error"] = f"AI 评审失败: {e}"
@@ -781,15 +856,145 @@ async def _run_agent_judging(
         _mark_error(job_id, f"AI 评审失败: {e}")
         return
 
-    verdict = build_final_verdict(round_verdicts, repeat_n)
+    # 健康度告警（迭代三）：judging 结束后整体 invalid 率超阈值 →
+    # 幂等推送 judge_health invalid_rate（不打断流程）
+    j = _jobs.get(job_id)
+    if j is not None:
+        total_v = sum(int(rv.get("meta", {}).get("total", 0)) for rv in round_verdicts)
+        total_inv = sum(int(rv.get("meta", {}).get("invalid", 0)) for rv in round_verdicts)
+        h = health_check({"total": total_v, "invalid": total_inv}, threshold=0.1)
+        if h["alarm"] and not j.get("health_warned"):
+            j["health_warned"] = True
+            await _push_event(job_id, {
+                "type": "judge_health", "status": "invalid_rate",
+                "rate": h["invalid_rate"], "threshold": 0.1,
+            })
+
+    if mode == "hybrid":
+        review_set, k = _select_hybrid_review_set(round_verdicts, k_top, task_set)
+        if k == 0:
+            # L3 边界：k==0 直通 completed（不进入复核态）
+            _finalize_agent_done(job_id, round_verdicts, per_round_reveal,
+                                 cfg, task_set, all_rounds,
+                                 review_data={"mode": "hybrid", "k": 0,
+                                              "note": "k_top_human=0 或候选为空，未进入人工复核"})
+            await _push_event(job_id, {"state": "completed", "mode": "hybrid", "k": 0})
+            audit.eval_judged(job_id, actor="agent")
+            audit.review_submitted(job_id, actor="agent")
+            return
+        save_round_verdicts(job_id, round_verdicts)  # M2：逐轮 agent 分落盘，供复核提交聚合
+        save_hybrid_review(job_id, {
+            "k": k,
+            "review_set": review_set,
+            "reveals": per_round_reveal,   # M2：逐题 reveal 落盘，重启恢复聚合
+            "selected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "state": "reviewing",
+        })
+        j = _jobs.get(job_id)
+        j["state"] = "reviewing"
+        j["progress"] = "0/0"
+        await _push_event(job_id, {"state": "reviewing", "mode": "hybrid", "k": k})
+        audit.eval_judged(job_id, actor="agent")
+        return
+
+    _finalize_agent_done(job_id, round_verdicts, per_round_reveal,
+                         cfg, task_set, all_rounds,
+                         review_data={"mode": "pure_agent", "note": "agent 自动评审"})
+    await _push_event(job_id, {"state": "completed"})
+    audit.eval_judged(job_id, actor="agent")
+    audit.review_submitted(job_id, actor="agent")
+
+
+def _finalize_agent_done(
+    job_id: str,
+    round_verdicts: list[dict],
+    per_round_reveal: list[dict],
+    cfg: dict,
+    task_set: dict,
+    all_rounds: list[dict],
+    review_data: dict,
+):
+    """agent 路径完成聚合（pure_agent / hybrid k==0 共用）。"""
+    verdict = build_final_verdict(
+        round_verdicts, len(all_rounds) or 1,
+        per_round_reveal=per_round_reveal or None,
+    )
     answers_a, answers_b = all_rounds[-1]["a"], all_rounds[-1]["b"]
     _finalize_job(
-        job_id, verdict, {"mode": "pure_agent", "note": "agent 自动评审"},
+        job_id, verdict, review_data,
         round_verdicts, cfg, task_set, answers_a, answers_b, all_rounds,
         embedding_config=_jobs.get(job_id, {}).get("embedding_cfg"),
     )
-    await _push_event(job_id, {"state": "completed"})
-    audit.review_submitted(job_id, actor="agent")
+
+
+async def _mark_review_degraded(job_id: str, cfg: dict):
+    """fail_open 降级（H3）：review.mode 落盘 pure_human + degraded 标注。"""
+    j = _jobs.get(job_id)
+    if j is not None:
+        j["config"] = dict(cfg)
+        j["config"].setdefault("review", {})
+        j["config"]["review"]["mode"] = "pure_human"
+        j["config"]["review"]["degraded"] = True
+        j["config"]["review"]["judge"] = None
+    _re_save_config(job_id, cfg)
+
+
+def _re_save_config(job_id: str, cfg: dict):
+    """把降级后的 review 配置重新落盘（config.json），重启恢复可见。"""
+    from backend.storage import save_config
+    degraded_cfg = dict(cfg)
+    review = dict(degraded_cfg.get("review") or {})
+    review["mode"] = "pure_human"
+    review["degraded"] = True
+    review["judge"] = None
+    degraded_cfg["review"] = review
+    degraded_cfg["review_mode"] = "pure_human"  # 兼容扁平落盘读取
+    save_config(job_id, degraded_cfg)
+
+
+def _select_hybrid_review_set(
+    round_verdicts: list[dict],
+    k_top_human: int,
+    task_set: dict,
+) -> tuple[list[dict], int]:
+    """选择 hybrid 人工复核集（H2/L3）：invalid 必选 → 其余分差降序 → 低分兜底。
+
+    k = min(k_top_human, 候选总数)（L3）；返回 (review_set, k)。候选不含
+    excluded_from_total 题（不计分题无需复核胜负）。
+    """
+    excluded = {t["id"] for t in task_set.get("tasks", [])
+                if t.get("excluded_from_total")}
+    candidates: list[dict] = []
+    for rv in round_verdicts:
+        for s in rv.get("scores", []):
+            tid = s.get("id", "")
+            if tid in excluded:
+                continue
+            x = float(s.get("answer_x", 0))
+            y = float(s.get("answer_y", 0))
+            candidates.append({
+                "round": int(s.get("round", 1)),
+                "task_id": tid,
+                "agent_x": round(x, 2),
+                "agent_y": round(y, 2),
+                "winner": s.get("winner", "tie"),
+                "basis": s.get("basis", ""),
+                "gap": round(abs(x - y), 2),
+                "low": round(min(x, y), 2),
+                "invalid": bool(s.get("_invalid")),
+            })
+    if not candidates:
+        return [], 0
+    k = min(max(k_top_human, 0), len(candidates))
+    invalids = sorted(
+        [c for c in candidates if c["invalid"]],
+        key=lambda c: (-c["gap"], c["low"]),
+    )
+    others = sorted(
+        [c for c in candidates if not c["invalid"]],
+        key=lambda c: (-c["gap"], c["low"]),
+    )
+    return (invalids + others)[:k], k
 
 
 def _round_verdict_from_judge(
@@ -798,24 +1003,32 @@ def _round_verdict_from_judge(
     y_model: str,
     round_idx: int,
     round_reveal: dict,
+    per_task_reveal: dict[str, str] | None = None,
 ) -> dict:
-    """把 run_judge 输出归一化为人工评审同构的轮次 verdict（供 build_final_verdict 聚合）。"""
+    """把 run_judge 输出归一化为人工评审同构的轮次 verdict（供 build_final_verdict 聚合）。
+
+    per_task_reveal（迭代三 H1）：逐题独立交换映射，写进 revealed 供
+    report_builder 一致率在稳定空间计算时按题对齐（round-verdicts.json 落盘持久）。
+    """
     scores = []
     for s in judge_verdict.get("scores", []):
         row = dict(s)
         row["round"] = round_idx + 1
         scores.append(row)
+    revealed = {
+        "answer_x": x_model,
+        "answer_y": y_model,
+        "answer_x_file": round_reveal.get("answer_x", "a"),
+        "answer_y_file": round_reveal.get("answer_y", "b"),
+    }
+    if per_task_reveal:
+        revealed["per_task"] = per_task_reveal
     return {
         "meta": {**judge_verdict.get("meta", {}), "repeat_n": 1},
         "scores": scores,
         "per_dimension": judge_verdict.get("per_dimension", {}),
         "totals": judge_verdict.get("totals", {}),
-        "revealed": {
-            "answer_x": x_model,
-            "answer_y": y_model,
-            "answer_x_file": round_reveal.get("answer_x", "a"),
-            "answer_y_file": round_reveal.get("answer_y", "b"),
-        },
+        "revealed": revealed,
         "conclusion": judge_verdict.get("conclusion", ""),
         "winner_model": judge_verdict.get("winner_model", "tie"),
     }
@@ -901,11 +1114,31 @@ def _validate_review_scores(
     return errors
 
 
+def _restore_review_object(cfg: dict) -> None:
+    """把扁平 config（落盘格式）重建为 review 对象；已含 review 对象则跳过。
+
+    迭代三：k_top_human/degraded 仅在有落盘键时写入，与未配置（缺省）区分。
+    """
+    if isinstance(cfg.get("review"), dict):
+        return
+    if isinstance(cfg.get("review_mode"), str):
+        review = {"mode": cfg.get("review_mode")}
+        if "fail_open" in cfg:
+            review["fail_open"] = bool(cfg.get("fail_open"))
+        if "review_k_top_human" in cfg:
+            review["k_top_human"] = int(cfg.get("review_k_top_human") or 0)
+        if "review_degraded" in cfg:
+            review["degraded"] = bool(cfg.get("review_degraded"))
+        cfg["review"] = review
+
+
 def _load_job_state(job_id: str) -> tuple[dict, dict, dict, int] | None:
     """从内存或磁盘恢复评审所需状态（config/task_set/rounds_answers/repeat_n）。"""
     if job_id in _jobs:
         j = _jobs[job_id]
-        return j["config"], j["task_set"], j["rounds_answers"], j.get("repeat_n", 1)
+        cfg = j["config"]
+        _restore_review_object(cfg)
+        return cfg, j["task_set"], j["rounds_answers"], j.get("repeat_n", 1)
     files = get_job_files(job_id)
     if files is None:
         return None
@@ -926,6 +1159,8 @@ def _load_job_state(job_id: str) -> tuple[dict, dict, dict, int] | None:
             rounds.append({"a": a, "b": b})
     if not task_set or not rounds:
         return None
+    # 磁盘 config 为扁平结构（迭代三含 k_top_human/degraded），重建 review 对象
+    _restore_review_object(cfg)
     return cfg, task_set, rounds, repeat_n
 
 
@@ -950,12 +1185,33 @@ async def eval_review_view(job_id: str):
         ]
         rounds_view.append({"round": r_idx + 1, "items": items})
 
+    # 迭代三（H4）：hybrid 任务附带复核集/agent 原分/K（纯人工任务缺省；
+    # k==0 直通 completed 时无 hybrid-review.json，视为非复核态）
+    hybrid_view = None
+    if (cfg.get("review") or {}).get("mode") == "hybrid":
+        hdata = load_hybrid_review(job_id)
+        if hdata is not None:
+            review_set = hdata.get("review_set", []) or []
+            agent_scores = {
+                f"{it.get('round')}:{it.get('task_id')}": {
+                    "agent_x": it.get("agent_x"), "agent_y": it.get("agent_y"),
+                    "winner": it.get("winner"),
+                }
+                for it in review_set
+            }
+            hybrid_view = {
+                "review_set": review_set,
+                "agent_scores": agent_scores,
+                "k": hdata.get("k", 0 if review_set else None),
+            }
+
     return {
         "job_id": job_id,
         "repeat_n": repeat_n,
         "total_questions": len(task_set["tasks"]),
         "rounds": rounds_view,
         "submitted": load_review(job_id) is not None,
+        "hybrid": hybrid_view,
     }
 
 
@@ -972,6 +1228,11 @@ async def eval_review_submit(job_id: str, req: ReviewSubmission):
 
     if load_review(job_id) is not None:
         raise HTTPException(409, "该任务已提交评分，请勿重复提交")
+
+    # 迭代三：hybrid 任务的人工打分必须走 hybrid-review 复核接口（子集覆盖），
+    # 防止绕过融合直接用全量人工分覆盖
+    if (cfg.get("review") or {}).get("mode") == "hybrid":
+        raise HTTPException(409, "该任务为 hybrid 评审模式，请走 AI 复核接口提交（hybrid-review）")
 
     scores_by_round: dict[int, list[dict]] = {}
     for s in req.scores:
@@ -1013,6 +1274,76 @@ async def eval_review_submit(job_id: str, req: ReviewSubmission):
     )
     await _push_event(job_id, {"state": "completed"})
     audit.review_submitted(job_id)
+    return StartResponse(job_id=job_id)
+
+
+@app.post("/api/eval/{job_id}/hybrid-review", response_model=StartResponse)
+async def eval_hybrid_review_submit(job_id: str, req: ReviewSubmission):
+    """hybrid 复核提交：按 (round, task_id) 用人工分覆盖 agent 预评分 → 聚合 → completed。
+
+    约束：配置/状态非 hybrid 复核态 → 409；已提交 → 409；复核子集内
+    每 (round, task_id) 恰一条、round 在 1..repeat_n、task 属于复核集、
+    题号属于任务集 → 否则 400；重启恢复（M2）从磁盘 config /
+    hybrid-review.json / round-verdicts.json 重建。
+    """
+    job_id = _require_job_id(job_id)
+    restored = _load_job_state(job_id)
+    if restored is None:
+        raise HTTPException(404, "job not found")
+    if _jobs.get(job_id, {}).get("state") in ("cancelling", "cancelled"):
+        raise HTTPException(409, "该任务已被取消或删除，无法提交复核")
+    cfg, task_set, rounds_answers, repeat_n = restored
+
+    if (cfg.get("review") or {}).get("mode") != "hybrid":
+        raise HTTPException(409, "该任务不是 hybrid 评审模式，请走人工评审接口")
+    if (cfg.get("review") or {}).get("degraded"):
+        raise HTTPException(409, "该任务已因 AI 评审失败降级为纯人工评审，请走人工评审接口")
+    if load_review(job_id) is not None:
+        raise HTTPException(409, "该任务已提交评审结果，请勿重复提交")
+
+    hybrid_data = load_hybrid_review(job_id)
+    if hybrid_data is None:
+        raise HTTPException(409, "该任务未进入 hybrid 复核态（无复核集）")
+    review_keys = {(int(it["round"]), str(it["task_id"]))
+                   for it in hybrid_data.get("review_set", [])}
+
+    # 复核子集校验：round 在 1..repeat_n、task 属于复核集、每 (round, task) 恰一条
+    task_ids = {t["id"] for t in task_set["tasks"]}
+    seen: set[tuple[int, str]] = set()
+    for s in req.scores:
+        key = (s.round, s.id)
+        if s.round not in range(1, repeat_n + 1):
+            raise HTTPException(400, f"轮次越界：round={s.round}（有效 1..{repeat_n}）")
+        if s.id not in task_ids:
+            raise HTTPException(400, f"未知题号：{s.id}")
+        if key not in review_keys:
+            raise HTTPException(400, f"题目 {s.id}（round {s.round}）不属于 hybrid 复核集")
+        if key in seen:
+            raise HTTPException(400, f"重复提交：round {s.round} / 题 {s.id}")
+        seen.add(key)
+    missing = sorted(review_keys - seen)
+    if missing:
+        raise HTTPException(400, f"复核集未完整提交，缺失 {len(missing)} 条："
+                                 f"{', '.join(f'r{r}/{tid}' for r, tid in missing[:5])}…")
+
+    round_verdicts = load_round_verdicts(job_id)
+    if not round_verdicts:
+        raise HTTPException(409, "缺少 agent 预评的逐轮 verdict（round-verdicts.json 缺失）")
+
+    merged = merge_hybrid_verdicts(
+        round_verdicts, [s.model_dump() for s in req.scores]
+    )
+    per_round_reveal = hybrid_data.get("reveals") or None
+    verdict = build_final_verdict(merged, repeat_n, per_round_reveal=per_round_reveal)
+    answers_a, answers_b = rounds_answers[-1]["a"], rounds_answers[-1]["b"]
+    _finalize_job(
+        job_id, verdict,
+        {"mode": "hybrid", "scores": [s.model_dump() for s in req.scores],
+         "k": hybrid_data.get("k", 0)},
+        merged, cfg, task_set, answers_a, answers_b, rounds_answers,
+    )
+    await _push_event(job_id, {"state": "completed"})
+    audit.review_submitted(job_id, actor="human")
     return StartResponse(job_id=job_id)
 
 

@@ -182,6 +182,42 @@ def _file_label(v: Any) -> str:
     return "b"
 
 
+def make_task_reveal(task_ids: list[str], seed: int | None = None) -> dict[str, Any]:
+    """逐题独立随机交换（迭代三，仅 agent 评审）：每题独立决定 答案X 对应
+    答卷 a 或 b，消除位置偏差。
+
+    Returns:
+        {"rounds": [{"answer_x": "a", "answer_y": "b"}],   # 轮级兜底（取首题）
+         "per_task": [{"task_id": "...", "answer_x": "a", "answer_y": "b"}, ...]}
+    """
+    rng = random.Random(seed)
+    per_task = []
+    for tid in task_ids:
+        x = "a" if rng.random() < 0.5 else "b"
+        per_task.append({"task_id": tid, "answer_x": x, "answer_y": "b" if x == "a" else "a"})
+    first = per_task[0] if per_task else {"answer_x": "a", "answer_y": "b"}
+    return {"rounds": [{"answer_x": first["answer_x"], "answer_y": first["answer_y"]}],
+            "per_task": per_task}
+
+
+def _normalize_task_reveal(revealed: dict[str, Any] | None) -> dict[str, str] | None:
+    """把注入 revealed 的 per_task 归一化为 {task_id: "a"|"b"}；缺失返回 None。"""
+    if not isinstance(revealed, dict):
+        return None
+    per_task = revealed.get("per_task")
+    if not isinstance(per_task, list) or not per_task:
+        return None
+    mapping: dict[str, str] = {}
+    for item in per_task:
+        if not isinstance(item, dict):
+            continue
+        tid = item.get("task_id")
+        label = _file_label(item.get("answer_x"))
+        if tid:
+            mapping[str(tid)] = label
+    return mapping or None
+
+
 def _normalize_reveal(revealed: dict[str, Any] | None) -> tuple[str, str] | None:
     """归一化外部注入的 revealed（支持 human_review 的 rounds 结构与直接映射）。"""
     if not isinstance(revealed, dict):
@@ -215,21 +251,14 @@ async def run_judge(
 
     # 决定哪份答卷是答案X，哪份是答案Y
     injected = _normalize_reveal(revealed)
+    task_map = _normalize_task_reveal(revealed)
     if injected is not None:
         x_label, y_label = injected
-        x_pool, y_pool = (
-            (answers_list_x, answers_list_y) if x_label == "a"
-            else (answers_list_y, answers_list_x)
-        )
     else:
         if random.random() < 0.5:
             x_label, y_label = "a", "b"
         else:
             x_label, y_label = "b", "a"
-        x_pool, y_pool = (
-            (answers_list_x, answers_list_y) if x_label == "a"
-            else (answers_list_y, answers_list_x)
-        )
 
     revealed_map = {
         "answer_x": f"answers-{x_label}.json",
@@ -242,6 +271,13 @@ async def run_judge(
     async with build_upstream_client() as client:
         for i, task in enumerate(tasks):
             tid = task["id"]
+            # 迭代三：逐题独立随机交换（per_task 注入时每题按题选池，消除位置偏差）；
+            # 无题级映射时回退轮级标签
+            task_x = task_map.get(tid, x_label) if task_map else x_label
+            if task_x == "a":
+                x_pool, y_pool = (answers_list_x, answers_list_y)
+            else:
+                x_pool, y_pool = (answers_list_y, answers_list_x)
             # 效率稳定性题有 repeat_1/repeat_2 两条，用 repeat_1 送审
             ax = x_pool.get(tid) or x_pool.get(f"{tid}_repeat_1", {"raw_answer": "", "api_info": {}})
             ay = y_pool.get(tid) or y_pool.get(f"{tid}_repeat_1", {"raw_answer": "", "api_info": {}})
@@ -324,3 +360,153 @@ def _build_conclusion(
         return f"答案Y 以 {int(total_y)}:{int(total_x)} 胜出"
     else:
         return f"平局 {int(total_x)}:{int(total_y)}"
+
+
+def _build_single_arm_prompt(task: dict[str, Any], answer: dict[str, Any]) -> str:
+    """单臂 rubric 评审 prompt（迭代三，N 模型评审协议层）：单答案独立评分。
+
+    与双盲评审共用评分标准（rubric_note），输出结构化 JSON 打分协议。
+    """
+    dim = task["dimension"]
+    rubric_note = task.get("rubric_note", "")
+    test_cases = task.get("test_cases", [])
+    code_verify = answer.get("code_verify", {})
+
+    prompt = f"""你是一个严格、客观、公平的 AI 评测评审官。
+你将看到一道评测题、该题的评分标准（rubric），以及一个被测模型的回答。
+请依据 rubric 独立评分，不要与其他模型比较。
+
+请严格按以下 JSON 格式输出，不要输出任何其他文字：
+{{"id":"{task['id']}","dimension":"{dim}","score":<0-10分>,"basis":"详细评分依据"}}
+
+---
+【评测题 id={task['id']}】
+维度：{dim}
+题目：
+{task['prompt']}
+
+【评分标准】
+{rubric_note}
+"""
+    if test_cases:
+        prompt += "\n【测试用例参考（已验证）】\n"
+        for i, tc in enumerate(test_cases):
+            prompt += f"  用例{i+1}：输入={tc['input']}，期望={tc['expected']}\n"
+
+    prompt += f"""
+【代码验真结果】
+通过率：{_fmt_code_verify(code_verify)}
+
+【回答】
+{_fenced(answer.get('raw_answer'))}
+"""
+    return prompt
+
+
+def _parse_single_arm_verdict(raw: str) -> dict[str, Any] | None:
+    """单臂评审输出结构校验：score 0-10 数值、basis 非空、id 与题一致由调用方核对。"""
+    parsed = _parse_verdict(raw)
+    if not parsed:
+        return None
+    score = parsed.get("score")
+    if not isinstance(score, (int, float)) or not (0 <= float(score) <= 10):
+        return None
+    if not isinstance(parsed.get("basis"), str) or not parsed["basis"].strip():
+        return None
+    return {
+        "id": str(parsed.get("id", "")),
+        "dimension": str(parsed.get("dimension", "")),
+        "score": round(float(score), 2),
+        "basis": parsed["basis"].strip(),
+    }
+
+
+async def run_single_arm_judge(
+    task_set: dict[str, Any],
+    answers: dict[str, Any],
+    judge_config: dict[str, str],
+    progress_cb: Callable[[int, int], Awaitable[None]] | None = None,
+    max_retries: int = 1,
+) -> dict[str, Any]:
+    """单臂 rubric 评审（迭代三，评审协议层，不接主流程；迭代 7 benchmark 接线）。
+
+    每题对单个模型独立评分（无 X/Y 配对，成本 O(N)），金标锚定由元评估
+    段经 stats.calibration_offset 计算展示，本函数不做自动校正。
+
+    Returns:
+        {"meta": {"total", "valid", "invalid", "excluded_ids", "excluded_dimensions"},
+         "scores": [{"id", "dimension", "score", "basis", "_invalid"}...],
+         "totals": {"score": 汇总分, "max": 满分}, "health": {...}}
+    """
+    tasks = task_set["tasks"]
+    answers_map = {a["id"]: a for a in answers.get("answers", [])}
+    verdicts: list[dict[str, Any]] = []
+    async with build_upstream_client() as client:
+        for i, task in enumerate(tasks):
+            tid = task["id"]
+            answer = (answers_map.get(tid) or answers_map.get(f"{tid}_repeat_1")
+                      or {"raw_answer": "", "api_info": {}})
+            prompt = _build_single_arm_prompt(task, answer)
+            v = None
+            for _attempt in range(1 + max_retries):
+                raw = await _call_judge_model(client, judge_config, prompt)
+                v = _parse_single_arm_verdict(raw)
+                if v:
+                    break
+            if v is None:
+                v = {
+                    "id": tid,
+                    "dimension": task.get("dimension", ""),
+                    "score": 0.0,
+                    "basis": "评审模型未能返回有效 verdict",
+                    "_invalid": True,
+                }
+            verdicts.append(v)
+            if progress_cb:
+                await progress_cb(i + 1, len(tasks))
+
+    valid = [v for v in verdicts if not v.get("_invalid")]
+    excluded_ids = [t["id"] for t in tasks if t.get("excluded_from_total")]
+    scoring_scores = [v for v in verdicts if v["id"] not in excluded_ids]
+    return {
+        "meta": {
+            "total": len(verdicts),
+            "valid": len(valid),
+            "invalid": len(verdicts) - len(valid),
+            "excluded_ids": excluded_ids,
+            "excluded_dimensions": sorted({t.get("dimension", "") for t in tasks
+                                           if t.get("excluded_from_total")}),
+        },
+        "scores": verdicts,
+        "totals": {
+            "score": round(sum(s.get("score", 0) for s in scoring_scores), 2),
+            "max": round(10 * len(scoring_scores), 2),
+        },
+        "health": health_check(verdicts),
+    }
+
+
+def health_check(verdicts: list[dict[str, Any]] | dict[str, Any],
+                 threshold: float = 0.1) -> dict[str, Any]:
+    """评审健康度（迭代三）：invalid 率阈值判定。
+
+    入参可为 verdicts 列表（自带 _invalid 标记）或 run_judge/单臂输出的
+    meta dict（含 total/invalid）。
+    Returns:
+        {"healthy": bool, "invalid_rate": float, "alarm": bool, "threshold": float}
+    """
+    if isinstance(verdicts, dict) and "total" in verdicts:
+        total = int(verdicts.get("total", 0))
+        invalid = int(verdicts.get("invalid", 0))
+    elif isinstance(verdicts, list):
+        total = len(verdicts)
+        invalid = sum(1 for v in verdicts if v.get("_invalid"))
+    else:
+        total = invalid = 0
+    rate = round(invalid / total, 4) if total else 0.0
+    return {
+        "healthy": rate <= threshold,
+        "invalid_rate": rate,
+        "alarm": rate > threshold,
+        "threshold": threshold,
+    }

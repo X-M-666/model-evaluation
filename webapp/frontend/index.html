@@ -214,6 +214,27 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
     模型输出属于不可信外部输入，自动执行其代码存在安全风险。仅在确认本机环境（Windows 原生隔离）
     已通过自检（python -m scripts.sandbox_selfcheck）时开启。
   </div>
+<div style="margin-top:14px">
+  <label>评审方式</label>
+  <div class="radio-group">
+    <label><input type="radio" name="review-mode" value="pure_human" checked> 纯人工评审</label>
+    <label><input type="radio" name="review-mode" value="pure_agent"> AI 自动评审</label>
+    <label><input type="radio" name="review-mode" value="hybrid"> Hybrid（AI 预评 + 人工复核 Top-K）</label>
+  </div>
+  <div id="judge-panel" style="display:none;margin-top:12px;padding:12px;background:#0d1117;border:1px solid #30363d;border-radius:6px">
+    <div class="param-row">
+      <label>评审 API URL<div class="hint">OpenAI 兼容</div><input id="j-url" placeholder="https://api.openai.com/v1"></label>
+      <label>评审 API Key<input id="j-key" type="password" placeholder="sk-..."></label>
+      <label>评审模型名称<div class="hint">可选</div><input id="j-name" placeholder="gpt-4o"></label>
+    </div>
+    <label style="display:block;margin-top:12px;font-size:13px;color:#c9d1d9">
+      <input type="checkbox" id="j-fail-open" checked style="margin-right:6px">
+      AI 评审失败时降级为人工评审（不勾选则任务置为错误）
+    </label>
+    <div id="k-panel" style="margin-top:10px;display:none">
+      <label>人工复核题数 K<div class="hint">分差最大 / 低分题优先，无效评审必选；0 = 不复核直通报告</div><input id="j-k" type="number" value="5" min="0" max="20" style="width:140px"></label>
+    </div>
+  </div>
 </div>
 </div>
 
@@ -274,6 +295,14 @@ apiFetch(API+'/api/dims').then(r=>r.json()).then(d=>{
 // ---- 折叠切换 ----
 function toggleCollapse(id){
   document.getElementById(id).classList.toggle('open');
+}
+
+// ---- 评审方式切换（迭代三：hybrid） ----
+function onReviewModeChange(){
+  const mode = document.querySelector('input[name="review-mode"]:checked').value;
+  const panel = document.getElementById('judge-panel');
+  panel.style.display = mode === 'pure_human' ? 'none' : 'block';
+  document.getElementById('k-panel').style.display = mode === 'hybrid' ? 'block' : 'none';
 }
 
 // ---- 评测集模式切换 ----
@@ -491,6 +520,18 @@ async function startEval(){
     code_verify_mode: g('code-verify-mode') || 'off',
   };
 
+  // 评审方式（迭代三：hybrid）
+  const rm = document.querySelector('input[name="review-mode"]:checked').value;
+  if(rm !== 'pure_human'){
+    const review = {
+      mode: rm,
+      fail_open: document.getElementById('j-fail-open').checked,
+      judge: {url:g('j-url'), key:g('j-key'), name:g('j-name'), temperature:0.0, max_tokens:256},
+    };
+    if(rm === 'hybrid') review.k_top_human = parseInt(g('j-k')) || 0;
+    body.review = review;
+  }
+
   try{
     const r = await apiFetch(API+'/api/eval/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!r.ok){
@@ -540,7 +581,11 @@ async function connectEvents(jobId, progText, btn){
       const round = evt.round ? `[${evt.round}] ` : '';
       if(evt.state==='executing') progText.textContent = `${round}模型调用中 ${evt.progress||''}`;
       else if(evt.state==='reviewing'){
-        progText.textContent = '模型作答完成，跳转人工双盲评审...';
+        progText.textContent = evt.judge_failed
+          ? 'AI 评审失败，已降级为人工评审，跳转评审页...'
+          : (evt.mode === 'hybrid'
+              ? `AI 预评完成（复核 ${evt.k} 题），跳转人工复核页...`
+              : '模型作答完成，跳转人工双盲评审...');
         onTerminal();
         setTimeout(()=>window.location='/review.html?job='+jobId, 500);
       }else if(evt.state==='completed'){
@@ -551,6 +596,13 @@ async function connectEvents(jobId, progText, btn){
         progText.textContent = '错误: '+evt.error;
         onTerminal();
         btn.disabled = false;
+      }
+      if(evt.type==='judge_health'){
+        if(evt.status==='invalid_rate'){
+          progText.textContent = `⚠ AI 评审无效率 ${(evt.rate*100).toFixed(0)}%（阈值 ${(evt.threshold*100).toFixed(0)}%），请关注报告告警`;
+        }else if(evt.status==='degraded'){
+          progText.textContent = '⚠ AI 评审失败，降级为人工评审';
+        }
       }
     };
     evtSource.onerror = () => {
@@ -771,6 +823,10 @@ document.querySelectorAll('a[data-fmt]').forEach(a=>{
 });
 document.getElementById('uploadJsonBtn').addEventListener('click', uploadJson);
 document.getElementById('code-verify-mode').addEventListener('change', onCodeVerifyModeChange);
+document.querySelectorAll('input[name="review-mode"]').forEach(r=>{
+  r.addEventListener('change', onReviewModeChange);
+});
+onReviewModeChange();
 document.querySelectorAll('input[name="ds-mode"]').forEach(r=>{
   r.addEventListener('change', switchDatasetMode);
 });

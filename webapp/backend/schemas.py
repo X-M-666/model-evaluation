@@ -93,18 +93,38 @@ class ModelRegisterRequest(BaseModel):
 
 
 class ReviewConfig(BaseModel):
-    """AI 评审配置（迭代二）。评审模型独立于被测模型，Key 仅存内存不落盘。
+    """AI 评审配置（迭代二；迭代三扩展 hybrid）。评审模型独立于被测模型，
+    Key 仅存内存不落盘。
 
     mode:
       - pure_human：纯人工双盲评审（默认，保持现状）
       - pure_agent：作答完成后由评审模型自动评审并生成报告
-      - hybrid（迭代三）：Agent 预评 + 人工复核
+      - hybrid（迭代三）：Agent 预评全部题目 + 分歧/低分 Top-K 转人工复核，
+        人工分覆盖被选题（未复核题沿用 Agent 分）
+    k_top_human：hybrid 下转人工复核的题数上限（k==0 时直通 completed，
+    等价纯人工结果的 Agent 预评展示；非 hybrid 忽略）。
     fail_open：评审模型全部失败时降级为人工评审（True）或任务置 error（False）。
     """
-    mode: str = Field("pure_human", pattern=r"^(pure_human|pure_agent)$",
-                      description="评审方式：pure_human / pure_agent（hybrid 迭代三）")
-    judge: ModelConfig | None = Field(None, description="评审模型配置（pure_agent 必填）")
+    mode: str = Field("pure_human", pattern=r"^(pure_human|pure_agent|hybrid)$",
+                      description="评审方式：pure_human / pure_agent / hybrid")
+    judge: ModelConfig | None = Field(None, description="评审模型配置（pure_agent/hybrid 必填）")
     fail_open: bool = Field(False, description="评审全败时降级人工评审")
+    k_top_human: int = Field(5, ge=0, le=20,
+                             description="hybrid 转人工复核题数上限（0=不复核直通）")
+
+
+class GoldScoreItem(BaseModel):
+    """金标集中单条打分（迭代三）：某模型在某题上的权威分。"""
+    task_id: str = Field(..., min_length=1, max_length=200)
+    model_name: str = Field(..., min_length=1, max_length=200)
+    score: float = Field(..., ge=0, le=100, description="权威分（0-100）")
+    note: str = Field("", max_length=1000)
+
+
+class GoldSetRequest(BaseModel):
+    """金标集（迭代三）：name 为集名（如 demo / qwen3-vl），items 为打分条目。"""
+    name: str = Field(..., min_length=1, max_length=100)
+    items: list[GoldScoreItem] = Field(default_factory=list, max_length=5000)
 
 
 class BudgetConfig(BaseModel):

@@ -79,6 +79,16 @@ def auth_failed(path: str, actor: str = "unknown") -> None:
     _append({"event": "auth_failed", "path": path, "actor": actor})
 
 
+def gold_added(name: str, actor: str = "local") -> None:
+    """金标集录入/覆盖（迭代三，source=manual 时调用）。"""
+    _append({"event": "gold_added", "target": name, "actor": actor})
+
+
+def eval_judged(job_id: str, actor: str = "local") -> None:
+    """Agent 评审完成（迭代二缺口补录：迭代三起每次 judging 完成落一条）。"""
+    _append({"event": "eval_judged", "job_id": job_id, "actor": actor})
+
+
 def read_events() -> list[dict[str, Any]]:
     """读取全部审计事件（测试与运维排查用）。"""
     p = _log_path()

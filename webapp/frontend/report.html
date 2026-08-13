@@ -86,6 +86,9 @@ td{color:#c9d1d9}
 <div id="analysisBody"></div>
 </div>
 
+<div class="card" id="metaEvalCard" style="display:none"></div>
+<div class="card" id="consistencyCard" style="display:none"></div>
+
 <div class="card">
 <h2>逐题评分明细</h2>
 <table id="scoreTable">
@@ -157,7 +160,11 @@ function renderReport(data){
   const dsName = cfg.dataset_name || null;
   const repeatN = cfg.repeat_n || 1;
 
-  let subText = `${ma} vs ${mb} | 任务集: ${tasks.length} 题 | 评审: 人工双盲 | jobId: ${jobId}`;
+  const modeText = rep?.review?.mode === 'pure_agent' ? 'AI 自动评审'
+    : rep?.review?.mode === 'hybrid' ? `Hybrid（AI 预评 + 人工复核 Top-${rep.review.k_top_human ?? '?'}）`
+    : '人工双盲';
+  let subText = `${ma} vs ${mb} | 任务集: ${tasks.length} 题 | 评审: ${modeText} | jobId: ${jobId}`;
+  if(rep?.review?.degraded) subText += ' | ⚠ 已降级为人工评审';
   if(dsName) subText += ` | 评测集: ${dsName}`;
   if(repeatN > 1) subText += ` | 重复 ${repeatN} 次取平均`;
   if(cfg.seed != null) subText += ` | seed=${cfg.seed}`;
@@ -188,6 +195,8 @@ function renderReport(data){
     document.getElementById('statCard').innerHTML = `<h2>核心指标</h2><div class="stat-grid">${stats.map(st=>`<div class="stat-box ${st.c||''}"><div class="v">${st.v}</div><div class="k">${st.k}</div></div>`).join('')}</div>`;
     renderCharts(rep);
     renderAnalysis(rep.analysis || []);
+    renderMetaEval(rep);
+    renderConsistency(rep);
   }else{
     document.getElementById('statCard').style.display='none';
     document.querySelectorAll('.chart-card').forEach(c=>c.style.display='none');
@@ -196,6 +205,47 @@ function renderReport(data){
 
   renderScoreTable(v, data.round_scores);
   renderAnswers(data);
+}
+
+// ---- 元评估（金标）段（迭代三） ----
+function renderMetaEval(rep){
+  const el = document.getElementById('metaEvalCard');
+  const m = rep?.meta_eval;
+  if(!m){ el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  if(!m.available){
+    el.innerHTML = `<h2>元评估（金标）</h2><p class="hint" style="color:#8b949e;font-size:13px">${esc(m.note||'未配置金标集')}</p>`;
+    return;
+  }
+  const src = m.gold_source ? `<span class="badge dim">来源：${esc(m.gold_source)}</span>` : '';
+  const rows = [
+    {k:'Spearman（评审 vs 金标）', v: m.spearman != null ? String(m.spearman) : '样本不足'},
+    {k:'Kappa（胜负一致）', v: m.kappa != null ? String(m.kappa) : '样本不足'},
+    {k:'平均分偏移（评审×10 减金标）', v: m.gold_offset != null ? String(m.gold_offset) : '—'},
+    {k:'匹配题数', v: `${m.matched}/${m.gold_total}`},
+  ];
+  el.innerHTML = `<h2>元评估（金标） ${src}</h2>
+    <div class="meta-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:10px">
+      ${rows.map(r=>`<div class="stat-box"><div class="v">${esc(r.v)}</div><div class="k">${esc(r.k)}</div></div>`).join('')}
+    </div>
+    ${m.note ? `<p class="hint" style="color:#8b949e;font-size:12px;margin-top:8px">${esc(m.note)}</p>` : ''}`;
+}
+
+// ---- 复评一致率段（迭代三，repeat_n≥2） ----
+function renderConsistency(rep){
+  const el = document.getElementById('consistencyCard');
+  const c = rep?.consistency;
+  if(!c){ el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  const perRows = Object.entries(c.per_task||{}).map(([tid, v])=>`
+    <tr><td>${esc(tid)}</td><td>${esc((v.rounds||[]).join(' / '))}</td><td>${v.rate == null ? '—' : (v.rate*100).toFixed(0)+'%'}</td></tr>`).join('');
+  el.innerHTML = `<h2>复评一致率（${c.repeat_n} 轮）</h2>
+    <p style="font-size:20px;font-weight:bold;color:${c.overall == null ? '#8b949e' : (c.overall >= 0.8 ? '#3fb950' : c.overall >= 0.5 ? '#f0883e' : '#f85149')}">${c.overall == null ? '—' : (c.overall*100).toFixed(0)+'%'}</p>
+    <p class="hint" style="color:#8b949e;font-size:12px;margin-top:4px">${esc(c.note||'')}</p>
+    <table style="width:100%;margin-top:10px;font-size:13px;border-collapse:collapse">
+      <tr style="color:#8b949e;text-align:left"><th style="padding:4px 6px">题目</th><th style="padding:4px 6px">逐轮胜方（稳定空间）</th><th style="padding:4px 6px">一致率</th></tr>
+      ${perRows || '<tr><td colspan="3" style="color:#8b949e">无逐题数据</td></tr>'}
+    </table>`;
 }
 
 function renderCharts(rep){

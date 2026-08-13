@@ -95,6 +95,9 @@ def save_config(job_id: str, config: dict) -> None:
         "embedding": _mask_model(config.get("embedding")) if config.get("embedding") else None,
         "embedding_key_masked": "***",
         "review_mode": config.get("review", {}).get("mode", "pure_human") if isinstance(config.get("review"), dict) else "pure_human",
+        "fail_open": bool(config["review"].get("fail_open")) if isinstance(config.get("review"), dict) else False,
+        "review_k_top_human": int(config["review"].get("k_top_human") or 0) if isinstance(config.get("review"), dict) else 0,
+        "review_degraded": bool(config["review"].get("degraded")) if isinstance(config.get("review"), dict) else False,
         "budget": config.get("budget") if isinstance(config.get("budget"), dict) else None,
     }
     (_job_dir(job_id) / "config.json").write_text(json.dumps(safe, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -163,6 +166,21 @@ def load_review(job_id: str) -> dict | None:
         return json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
+
+
+def load_round_verdicts(job_id: str) -> list[dict] | None:
+    """读取逐轮 verdict（迭代三：hybrid 重启恢复降级/M2 复用）。"""
+    try:
+        p = _job_path(job_id) / "round-verdicts.json"
+    except ValueError:
+        return None
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, list) else None
 
 
 def save_error(job_id: str, message: str) -> Path:
@@ -257,7 +275,8 @@ def get_job_files(job_id: str) -> dict[str, Any] | None:
         return None
     result = {}
     names = ["tasks.json", "answers-a.json", "answers-b.json", "verdict.json",
-             "report.json", "config.json", "round-verdicts.json"]
+             "report.json", "config.json", "round-verdicts.json",
+             "hybrid-review.json"]
     names += sorted(p.name for p in d.glob("answers-*-r*.json"))
     for name in names:
         p = d / name
@@ -272,6 +291,9 @@ def get_job_files(job_id: str) -> dict[str, Any] | None:
 # ---- 数据集管理 ----
 
 DATASETS_DIR = Path(__file__).resolve().parent.parent / "data" / "datasets"
+
+# 金标集目录（迭代三）：<name>.json，结构 {name, items, source, created_at}
+GOLD_DIR = Path(__file__).resolve().parent.parent / "data" / "gold"
 
 # 跨 job 历史汇总（迭代一：接口与幂等写入，真实接入在后续迭代）
 STATS_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".eval" / "stats"
@@ -399,3 +421,87 @@ def delete_dataset(name: str) -> bool:
         return False
     p.unlink()
     return True
+
+
+# ---- 金标集（迭代三） ----
+
+def _ensure_gold_dir():
+    GOLD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_gold(name: str, data: dict) -> Path:
+    """保存金标集到 data/gold/{safe_name}.json；同名覆盖（manual 覆盖 demo）。"""
+    _ensure_gold_dir()
+    p = GOLD_DIR / f"{_safe_dataset_name(name)}.json"
+    record = {
+        "name": str(name),
+        "items": data.get("items", []),
+        "source": data.get("source", "manual"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    p.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_gold(name: str) -> dict | None:
+    """读取金标集；文件缺失/损坏返回 None（损坏不自动覆盖，保留现场）。"""
+    p = GOLD_DIR / f"{_safe_dataset_name(name)}.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    data.setdefault("source", "manual")
+    return data
+
+
+def list_gold() -> list[dict[str, Any]]:
+    """列出全部金标集摘要（含 source，供前端标注 demo/manual）。"""
+    _ensure_gold_dir()
+    result = []
+    for p in sorted(GOLD_DIR.glob("*.json")):
+        data = load_gold(p.stem)
+        if data is None:
+            continue
+        result.append({
+            "name": data.get("name", p.stem),
+            "source": data.get("source", "manual"),
+            "item_count": len(data.get("items", [])),
+            "created_at": data.get("created_at", ""),
+        })
+    return result
+
+
+def delete_gold(name: str) -> bool:
+    """删除金标集。"""
+    p = GOLD_DIR / f"{_safe_dataset_name(name)}.json"
+    if not p.exists():
+        return False
+    p.unlink()
+    return True
+
+
+# ---- hybrid 复核（迭代三） ----
+
+def save_hybrid_review(job_id: str, data: dict) -> Path:
+    """持久化 hybrid 复核集/已提交复核（重启恢复 M2）。"""
+    p = _job_dir(job_id) / "hybrid-review.json"
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_hybrid_review(job_id: str) -> dict | None:
+    try:
+        p = _job_path(job_id) / "hybrid-review.json"
+    except ValueError:
+        return None
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None

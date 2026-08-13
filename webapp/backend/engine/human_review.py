@@ -187,20 +187,31 @@ def build_round_verdict(
     }
 
 
-def _stable_scores(round_verdict: dict[str, Any]) -> list[dict[str, Any]]:
+def _task_x_file(round_verdict: dict[str, Any], task_id: str,
+                  per_task_reveal: dict[str, str] | None) -> str:
+    """取单题的 answer_x 文件标签：题级 reveal 优先（迭代三，仅 agent），
+    无 per_task 时回退轮级字段（人工评审与旧数据路径，行为不变）。"""
+    if per_task_reveal and task_id in per_task_reveal:
+        return per_task_reveal[task_id]
+    return round_verdict.get("revealed", {}).get("answer_x_file", "a")
+
+
+def _stable_scores(
+    round_verdict: dict[str, Any],
+    per_task_reveal: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """把一轮 verdict 的 X/Y 分数按该轮 reveal 归一化为稳定模型分数。
 
-    每轮的 X/Y 身份独立随机（answer_x_file 可为 "a" 或 "b"），
-    跨轮统计必须以此处归一化后的 model_a/model_b 为主键。
+    每轮的 X/Y 身份独立随机（answer_x_file 可为 "a" 或 "b"；迭代三 agent
+    评审可细到逐题 per_task_reveal），跨轮统计必须以此处归一化后的
+    model_a/model_b 为主键。
 
     Returns:
         [{"id": ..., "dimension": ..., "model_a": float, "model_b": float}, ...]
     """
-    revealed = round_verdict.get("revealed", {})
-    x_file = revealed.get("answer_x_file", "a")
     rows = []
     for s in round_verdict.get("scores", []):
-        if x_file == "a":
+        if _task_x_file(round_verdict, s.get("id"), per_task_reveal) == "a":
             model_a, model_b = s["answer_x"], s["answer_y"]
         else:
             model_a, model_b = s["answer_y"], s["answer_x"]
@@ -213,10 +224,23 @@ def _stable_scores(round_verdict: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def _stable_names(round_verdict: dict[str, Any]) -> dict[str, str]:
-    """从一轮 reveal 反查稳定模型名：{"a": 模型A名, "b": 模型B名}。"""
+def _stable_names(
+    round_verdict: dict[str, Any],
+    per_task_reveal: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """从一轮 reveal 反查稳定模型名：{"a": 模型A名, "b": 模型B名}。
+
+    逐题模式下不同题可映射到不同模型文件；取该轮首题映射（展示用），
+    聚合统计以 _stable_scores 按题归一化为准。
+    """
+    first_id = None
+    for s in round_verdict.get("scores", []):
+        first_id = s.get("id")
+        break
+    x_file = _task_x_file(round_verdict, first_id, per_task_reveal) if first_id \
+        else round_verdict.get("revealed", {}).get("answer_x_file", "a")
     revealed = round_verdict.get("revealed", {})
-    if revealed.get("answer_x_file") == "a":
+    if x_file == "a":
         return {
             "a": revealed.get("answer_x", "模型A"),
             "b": revealed.get("answer_y", "模型B"),
@@ -230,6 +254,8 @@ def _stable_names(round_verdict: dict[str, Any]) -> dict[str, str]:
 def build_final_verdict(
     round_verdicts: list[dict[str, Any]],
     repeat_n: int,
+    per_task_reveal: dict[str, str] | None = None,
+    per_round_reveal: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """多轮聚合（repeat_n>1 时取平均分与标准差）；单轮直接返回。
 
@@ -237,6 +263,10 @@ def build_final_verdict(
     reveal 归一化，再聚合均值/标准差/胜负/维度汇总；胜方在稳定空间
     判定后，用固定的展示映射（最后一轮 reveal）把结果投影回
     answer_x/answer_y 展示字段，保证报告与前端无需感知身份变化。
+
+    迭代三：per_round_reveal=[{task_id: "a"|"b"}...]（与 round_verdicts
+    逐轮对齐的逐题 reveal，仅 agent 评审）优先；缺省回退 per_task_reveal
+    （全员同映射）或轮级 reveal（人工/旧数据，零破坏）。
     """
     if repeat_n <= 1:
         v = round_verdicts[0]
@@ -254,10 +284,16 @@ def build_final_verdict(
         return v
 
     last = round_verdicts[-1]
-    names = _stable_names(last)
+    last_per_task = None
+    if per_round_reveal and len(per_round_reveal) == len(round_verdicts):
+        last_per_task = per_round_reveal[-1]
+    names = _stable_names(last, last_per_task or per_task_reveal)
     stable_map: dict[str, list[dict]] = {}
-    for v in round_verdicts:
-        for r in _stable_scores(v):
+    for i, v in enumerate(round_verdicts):
+        round_map = None
+        if per_round_reveal and i < len(per_round_reveal):
+            round_map = per_round_reveal[i]
+        for r in _stable_scores(v, round_map or per_task_reveal):
             stable_map.setdefault(r["id"], []).append(r)
 
     # 不计分题（安全与价值观维度）：仍保留平均分展示，但不计入总分/胜负
@@ -350,3 +386,86 @@ def build_final_verdict(
         "conclusion": f"经过{repeat_n}轮人工评审取平均",
         "winner_model": winner_model,
     }
+
+
+def merge_hybrid_verdicts(
+    round_verdicts: list[dict[str, Any]],
+    human_scores: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """hybrid 复核（迭代三）：按 (round, task_id) 用人工分覆盖 agent verdict。
+
+    - 人工为准：answer_x/answer_y/winner/basis（basis=人工备注或默认文案）、
+      arbiter_note 清空、_invalid=False；未覆盖题原样保留 agent 分
+    - 覆盖后重算该轮 per_dimension / totals / meta（与 run_judge 同口径：
+      excluded_from_total 不计入聚合）
+    - 纯函数：不修改入参，返回新结构供 build_final_verdict 聚合
+    """
+    by_key: dict[tuple[int, str], dict[str, Any]] = {}
+    for h in human_scores:
+        r = int(h.get("round", 0))
+        tid = str(h.get("id", ""))
+        by_key[(r, tid)] = h
+
+    out: list[dict[str, Any]] = []
+    for rv in round_verdicts:
+        scores: list[dict[str, Any]] = []
+        for s in rv.get("scores", []):
+            row = dict(s)
+            h = by_key.get((int(row.get("round", 1)), str(row.get("id", ""))))
+            if h is not None:
+                x = float(h.get("answer_x", 0))
+                y = float(h.get("answer_y", 0))
+                note = str(h.get("note", "")).strip()
+                row["answer_x"] = round(x, 2)
+                row["answer_y"] = round(y, 2)
+                row["winner"] = (
+                    "tie" if abs(x - y) <= EPS
+                    else ("answer_x" if x > y else "answer_y")
+                )
+                row["basis"] = note or "人工复核打分（覆盖 AI 评审）"
+                row["arbiter_note"] = ""
+                row["_invalid"] = False
+                row["reviewed"] = True
+            else:
+                row.pop("reviewed", None)
+            scores.append(row)
+
+        excluded_ids = set(rv.get("meta", {}).get("excluded_ids", []))
+        dim_totals: dict[str, dict[str, float]] = {}
+        for sc in scores:
+            if sc.get("id") in excluded_ids:
+                continue
+            dim = sc.get("dimension", "")
+            if dim not in dim_totals:
+                dim_totals[dim] = {"x": 0.0, "y": 0.0}
+            dim_totals[dim]["x"] += float(sc.get("answer_x", 0))
+            dim_totals[dim]["y"] += float(sc.get("answer_y", 0))
+        total_x = round(sum(d["x"] for d in dim_totals.values()), 2)
+        total_y = round(sum(d["y"] for d in dim_totals.values()), 2)
+        valid = [sc for sc in scores if not sc.get("_invalid")]
+        revealed = rv.get("revealed", {})
+        if total_x > total_y:
+            winner_model = revealed.get("answer_x", "answer_x")
+        elif total_y > total_x:
+            winner_model = revealed.get("answer_y", "answer_y")
+        else:
+            winner_model = "tie"
+
+        merged_meta = dict(rv.get("meta", {}))
+        merged_meta.update({
+            "total": len(scores),
+            "valid": len(valid),
+            "invalid": len(scores) - len(valid),
+        })
+        out.append({
+            **rv,
+            "meta": merged_meta,
+            "scores": scores,
+            "per_dimension": {d: {"x": round(v["x"], 2), "y": round(v["y"], 2)}
+                              for d, v in dim_totals.items()},
+            "totals": {"answer_x": total_x, "answer_y": total_y},
+            "winner_model": winner_model,
+            "conclusion": f"第{int(scores[0].get('round', 1))}轮人工复核覆盖完成"
+                          if scores else rv.get("conclusion", ""),
+        })
+    return out
