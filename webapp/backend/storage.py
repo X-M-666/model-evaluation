@@ -794,3 +794,120 @@ def bump_dataset_version(version: str | None) -> str:
     m = re.match(r"^v(\d+)$", str(version or "").strip())
     n = int(m.group(1)) if m else 0
     return f"v{n + 1}"
+
+
+# ---- 扰动评测（迭代六）----
+
+# 系统生成 perturb_id 的唯一合法格式（main 生成：prb_ + create_job_id）
+PERTURB_ID_RE = re.compile(r"^prb_\d{8}_\d{6}_[0-9a-f]{6}$")
+
+# 扰动评测产物（运行数据，同 badcases 约定）
+PERTURB_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".eval" / "perturb"
+
+
+def is_valid_perturb_id(perturb_id: str) -> bool:
+    return isinstance(perturb_id, str) and bool(PERTURB_ID_RE.fullmatch(perturb_id))
+
+
+def _ensure_perturb_dir():
+    PERTURB_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_perturb(perturb_id: str, data: dict) -> Path:
+    """保存扰动评测结果。data 含 model 掩码字段，不含 Key 明文。"""
+    if not is_valid_perturb_id(perturb_id):
+        raise ValueError(f"非法 perturb_id: {perturb_id!r}")
+    _ensure_perturb_dir()
+    p = PERTURB_DIR / f"{perturb_id}.json"
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_perturb(perturb_id: str) -> dict | None:
+    if not is_valid_perturb_id(perturb_id):
+        return None
+    p = PERTURB_DIR / f"{perturb_id}.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def list_perturbs() -> list[dict]:
+    """列出全部扰动评测摘要。"""
+    _ensure_perturb_dir()
+    result = []
+    for p in sorted(PERTURB_DIR.glob("prb_*.json")):
+        data = load_perturb(p.stem)
+        if data is None:
+            continue
+        result.append({
+            "perturb_id": p.stem,
+            "state": data.get("state", "unknown"),
+            "created_at": data.get("created_at", ""),
+            "model": data.get("model_name", ""),
+            "dataset": data.get("dataset", ""),
+            "modes": data.get("modes", []),
+            "progress": data.get("progress", ""),
+        })
+    return result
+
+
+# ---- 排行榜（迭代六）----
+
+# 系统生成 lb_id 的唯一合法格式（main 生成：lb_ + create_job_id）
+LB_ID_RE = re.compile(r"^lb_\d{8}_\d{6}_[0-9a-f]{6}$")
+
+# 排行榜（用户数据，同 datasets 约定）
+LEADERBOARD_DIR = Path(__file__).resolve().parent.parent / "data" / "leaderboards"
+
+
+def is_valid_lb_id(lb_id: str) -> bool:
+    return isinstance(lb_id, str) and bool(LB_ID_RE.fullmatch(lb_id))
+
+
+def _ensure_leaderboard_dir():
+    LEADERBOARD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_leaderboard(lb_id: str, data: dict) -> Path:
+    if not is_valid_lb_id(lb_id):
+        raise ValueError(f"非法 lb_id: {lb_id!r}")
+    _ensure_leaderboard_dir()
+    p = LEADERBOARD_DIR / f"{lb_id}.json"
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_leaderboard(lb_id: str) -> dict | None:
+    if not is_valid_lb_id(lb_id):
+        return None
+    p = LEADERBOARD_DIR / f"{lb_id}.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def list_leaderboards() -> list[dict]:
+    _ensure_leaderboard_dir()
+    result = []
+    for p in sorted(LEADERBOARD_DIR.glob("lb_*.json")):
+        data = load_leaderboard(p.stem)
+        if data is None:
+            continue
+        result.append({
+            "lb_id": p.stem,
+            "name": data.get("name", ""),
+            "created_at": data.get("created_at", ""),
+            "models": data.get("models", []),
+            "dataset": data.get("dataset", ""),
+            "n_jobs": len(data.get("jobs", [])),
+        })
+    return result

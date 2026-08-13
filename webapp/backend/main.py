@@ -22,10 +22,11 @@ from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.engine.tasks import build_task_set, build_task_set_from_dataset, DIMENSIONS
-from backend.engine.executor import execute_all
+from backend.engine.executor import execute_all, _execute_model
 from backend.engine.budget import check_budget
 from backend.engine.judge import (
-    run_judge, make_task_reveal, _normalize_task_reveal, health_check,
+    run_judge, run_single_arm_judge, make_task_reveal, _normalize_task_reveal,
+    health_check,
 )
 from backend.engine.human_review import (
     make_reveal, resolve_round, build_review_view,
@@ -62,6 +63,8 @@ from backend.storage import (
     build_export_zip,
     save_badcase, load_badcase, list_badcases, delete_badcase,
     update_badcase_attribution, export_badcases_json,
+    save_perturb, load_perturb, list_perturbs, is_valid_perturb_id,
+    save_leaderboard, load_leaderboard, list_leaderboards, is_valid_lb_id,
 )
 from backend.gold import ensure_demo_gold, compute_meta_eval
 from backend.engine.rag_demo import ensure_demo_rag_dataset
@@ -69,9 +72,17 @@ from backend.engine.badcase import (
     BAD_CASE_CATEGORIES, UNCATEGORIZED, mine_bad_cases, attribute_badcase,
 )
 from backend.engine.stats import saturation_trend
+from backend.engine.perturb import (
+    PERTURB_MODES, build_perturb_set, score_task_metric,
+    build_robustness_curves, bias_analysis,
+)
+from backend.engine.leaderboard import build_leaderboard, LeaderboardError
+from backend.engine.dashboard import build_jobs_trend
+from backend.hwmon import collect_hw
 from backend.schemas import (
     StartRequest, StartResponse, ReviewSubmission, ModelRegisterRequest,
     GoldSetRequest, GenerateRequest, ReviewDecisionRequest,
+    PerturbRequest, LeaderboardRequest,
 )
 from backend.security import redact_sensitive, sanitize_config
 from backend.models_registry import (
@@ -209,8 +220,25 @@ async def gen_review_page():
 
 @app.get("/badcases.html", response_class=HTMLResponse)
 async def badcases_page():
-    """bad case 页（迭代五）：列表/分类分布/归因报告/导出。"""
     return _page_response("badcases.html")
+
+
+@app.get("/perturb.html", response_class=HTMLResponse)
+async def perturb_page():
+    """对抗扰动评测页（迭代六）：配置 → 运行 → 衰减曲线/偏见对照。"""
+    return _page_response("perturb.html")
+
+
+@app.get("/leaderboard.html", response_class=HTMLResponse)
+async def leaderboard_page():
+    """N 模型排行榜页（迭代六）：历史 job 聚合 → 排名/胜率矩阵/图表。"""
+    return _page_response("leaderboard.html")
+
+
+@app.get("/dashboard.html", response_class=HTMLResponse)
+async def dashboard_page():
+    """KPI 看板页（迭代六）：耗时/token 趋势 + CPU/GPU 硬件利用率。"""
+    return _page_response("dashboard.html")
 
 
 @app.get("/api/dims")
@@ -483,6 +511,233 @@ async def generate_tasks(req: GenerateRequest):
     task.add_done_callback(lambda t, gid=gen_id: _task_done(gid, t))
     audit.task_generate_started(gen_id)
     return {"ok": True, "gen_id": gen_id, "state": "generating", "count": req.count}
+
+
+# ---- 对抗扰动评测（迭代六）----
+
+_PERTURB_MAX_ACTIVE = 3
+
+# 进程内存扰动请求表：{perturb_id: PerturbRequest}，仅内存不落盘
+# （含 model/judge Key，随进程销毁；重启后遗留批次由 _settle_perturb 沉降 partial）
+_PERTURB_REQS: dict[str, PerturbRequest] = {}
+
+
+def _settle_perturb(data: dict) -> dict:
+    """重启/取消遗留的 running 扰动评测沉降 partial（进程中断不复活）。"""
+    if data.get("state") == "running" and data.get("perturb_id") not in _tasks:
+        data["state"] = "partial"
+        data["error"] = "扰动评测协程中断（进程重启或服务关闭），已生成部分不可用"
+        save_perturb(data["perturb_id"], data)
+    return data
+
+
+async def _run_perturb(perturb_id: str, req: PerturbRequest, data: dict):
+    """后台扰动评测：构建扰动集 → 单模型作答 → 判别式指标/生成式单臂评审 → 落盘。"""
+    try:
+        dataset = load_dataset(req.dataset_name)
+        if dataset is None:
+            raise ValueError(f"评测集 '{req.dataset_name}' 不存在")
+        task_set = build_task_set_from_dataset(dataset)
+        perturbed = build_perturb_set(task_set, req.modes, req.intensities, req.seed)
+
+        model_cfg = {
+            "name": req.model.name, "url": req.model.url, "key": req.model.key or "",
+            "temperature": req.model.temperature, "max_tokens": req.model.max_tokens,
+            "top_p": req.model.top_p, "code_verify_mode": "off",
+            "prompt_strategy": req.prompt_strategy,
+        }
+
+        async def progress_cb(_label, done, total):
+            data["progress"] = f"{done}/{total}"
+
+        answers = await _execute_model("P", model_cfg, perturbed["tasks"], None,
+                                       progress_cb, embedding_cfg=None)
+
+        # 生成式题单臂评审（可选 judge；缺省该类题得分 N/A）
+        single_scores: dict[str, float] = {}
+        invalid = 0
+        if req.judge is not None:
+            judge_cfg = {"name": req.judge.name, "url": req.judge.url,
+                         "key": req.judge.key or ""}
+            gen_tasks = [t for t in perturbed["tasks"] if t.get("type") == "生成式"]
+            answers_map = {a["id"]: a for a in answers.get("answers", [])}
+            gen_answers = [answers_map[t["id"]] for t in gen_tasks
+                           if t["id"] in answers_map]
+            if gen_answers:
+                sa = await run_single_arm_judge(
+                    {"tasks": gen_tasks, "meta": {}},
+                    {"model": model_cfg["name"], "answers": gen_answers},
+                    judge_cfg)
+                single_scores = {v["id"]: v.get("score")
+                                 for v in sa.get("scores", [])}
+                invalid = sa.get("meta", {}).get("invalid", 0)
+
+        answers_map = {a["id"]: a for a in answers.get("answers", [])}
+        per_task: list[dict] = []
+        for t in perturbed["tasks"]:
+            entry = answers_map.get(t["id"])
+            meta = t.get("meta") or {}
+            api = (entry or {}).get("api_info") or {}
+            score = None
+            if t.get("type") == "生成式":
+                score = single_scores.get(t["id"])
+            elif entry is not None:
+                score = score_task_metric(t, entry)
+            per_task.append({
+                "task_id": t["id"],
+                "origin_id": meta.get("origin_id", t["id"]),
+                "mode": meta.get("perturb_mode", "原版"),
+                "intensity": meta.get("perturb_intensity", 0.0),
+                "score": score,
+                "raw_answer": (entry or {}).get("raw_answer", "")[:2000] or None,
+                "latency_ms": api.get("latency_ms"),
+                "tokens": (api.get("prompt_tokens") or 0)
+                          + (api.get("completion_tokens") or 0),
+            })
+
+        curves = build_robustness_curves(per_task, req.modes)
+        bias = await bias_analysis(per_task)
+        warnings = [
+            {"code": "perturb_skipped", "task_id": s.get("task_id"),
+             "mode": s.get("mode"), "message": s.get("reason", "")}
+            for s in perturbed["meta"].get("skipped", [])
+        ]
+        if invalid:
+            warnings.append({
+                "code": "perturb_judge_invalid",
+                "message": f"单臂评审 invalid {invalid} 题，对应生成式题得分按 N/A 处理",
+            })
+
+        data.update({
+            "state": "ready",
+            "per_task": per_task,
+            "curves": curves,
+            "bias": bias,
+            "warnings": warnings,
+            "progress": "done",
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+        audit.perturb_completed(perturb_id, len(per_task))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        data["state"] = "error"
+        data["error"] = f"扰动评测失败: {exc}"
+    else:
+        # 正常完成即清除内存请求（含 Key）；取消路径保留（进程将退出）
+        _PERTURB_REQS.pop(perturb_id, None)
+    finally:
+        save_perturb(perturb_id, data)
+
+
+@app.post("/api/perturb", response_model=None)
+async def create_perturb(req: PerturbRequest):
+    """创建对抗扰动评测（后台执行）。SSRF 校验 model/judge URL；非法模式 400。"""
+    invalid = [m for m in req.modes if m not in PERTURB_MODES]
+    if invalid:
+        raise HTTPException(400, f"非法扰动模式: {invalid}（合法值 {PERTURB_MODES}）")
+    try:
+        validate_upstream_url(req.model.url)
+        if req.judge is not None:
+            validate_upstream_url(req.judge.url)
+    except UpstreamUrlError as e:
+        raise HTTPException(400, f"模型 URL 校验失败: {e}")
+    if load_dataset(req.dataset_name) is None:
+        raise HTTPException(404, f"评测集 '{req.dataset_name}' 不存在")
+
+    active = sum(1 for k in _tasks if str(k).startswith("prb_"))
+    if active >= _PERTURB_MAX_ACTIVE:
+        raise HTTPException(429, f"当前已有 {active} 个扰动评测在执行，请稍后再试")
+
+    perturb_id = "prb_" + create_job_id()
+    data = {
+        "perturb_id": perturb_id,
+        "state": "running",
+        "error": None,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "model_name": req.model.name,
+        "model_url": req.model.url,
+        "model_key_masked": "***",
+        "dataset": req.dataset_name,
+        "modes": req.modes,
+        "intensities": req.intensities,
+        "seed": req.seed,
+        "has_judge": req.judge is not None,
+        "judge_name": req.judge.name if req.judge else None,
+        "progress": "0/0",
+        "per_task": [],
+        "curves": {},
+        "bias": {},
+        "warnings": [],
+    }
+    save_perturb(perturb_id, data)
+    _PERTURB_REQS[perturb_id] = req  # 仅内存（含 Key），随进程销毁
+    task = asyncio.create_task(_run_perturb(perturb_id, req, data))
+    _tasks[perturb_id] = task
+    task.add_done_callback(lambda t, pid=perturb_id: _task_done(pid, t))
+    audit.perturb_started(perturb_id)
+    return {"ok": True, "perturb_id": perturb_id, "state": "running"}
+
+
+@app.get("/api/perturb")
+async def perturb_list():
+    return {"perturbs": list_perturbs()}
+
+
+@app.get("/api/perturb/{perturb_id}")
+async def perturb_detail(perturb_id: str):
+    if not is_valid_perturb_id(perturb_id):
+        raise HTTPException(400, "invalid perturb_id format")
+    data = load_perturb(perturb_id)
+    if data is None:
+        raise HTTPException(404, "perturb not found")
+    return _settle_perturb(data)
+
+
+# ---- 排行榜（迭代六）----
+
+@app.post("/api/leaderboard", response_model=None)
+async def create_leaderboard(req: LeaderboardRequest):
+    """由 N 个已完成 job（同一评测集）聚合排行榜。校验失败 400。"""
+    try:
+        data = build_leaderboard(req.job_ids, name=req.name)
+    except LeaderboardError as e:
+        raise HTTPException(400, str(e))
+    lb_id = "lb_" + create_job_id()
+    payload = {
+        "lb_id": lb_id,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **data,
+    }
+    save_leaderboard(lb_id, payload)
+    audit.leaderboard_created(lb_id)
+    return {"ok": True, "lb_id": lb_id, "models": payload["models"]}
+
+
+@app.get("/api/leaderboard")
+async def leaderboard_list():
+    return {"leaderboards": list_leaderboards()}
+
+
+@app.get("/api/leaderboard/{lb_id}")
+async def leaderboard_detail(lb_id: str):
+    if not is_valid_lb_id(lb_id):
+        raise HTTPException(400, "invalid lb_id format")
+    data = load_leaderboard(lb_id)
+    if data is None:
+        raise HTTPException(404, "leaderboard not found")
+    return data
+
+
+# ---- KPI 看板（迭代六）----
+
+@app.get("/api/dashboard")
+async def dashboard():
+    """KPI 看板：硬件利用率（CPU 增量采样，GPU N/A）+ 历史 job 耗时/token 趋势。"""
+    return {
+        "hw": collect_hw(),
+        "jobs_trend": build_jobs_trend(list_jobs()),
+    }
 
 
 @app.get("/api/generate")
@@ -837,6 +1092,7 @@ async def start_eval(req: StartRequest):
         "verdict": None,
         "rounds_answers": [],
         "reveal": None,
+        "started_at": time.time(),  # 迭代六：KPI 看板评测耗时（duration_sec）
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "sse_queue": asyncio.Queue(),
         "repeat_n": req.repeat_n,
@@ -1289,6 +1545,27 @@ def _round_verdict_from_judge(
     }
 
 
+def _job_duration_sec(job_id: str, cfg: dict) -> float | None:
+    """评测耗时（秒）：内存 started_at 优先；重启恢复路径回退 config.created_at。
+
+    两处均缺失（极旧历史记录）→ None（前端空态 N/A）。
+    """
+    t0 = None
+    j = _jobs.get(job_id)
+    if j and j.get("started_at"):
+        t0 = float(j["started_at"])
+    else:
+        ca = (cfg or {}).get("created_at") or ""
+        if ca:
+            try:
+                t0 = datetime.fromisoformat(ca.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                t0 = None
+    if t0 is None:
+        return None
+    return round(time.time() - t0, 1)
+
+
 def _finalize_job(
     job_id: str,
     verdict: dict,
@@ -1312,6 +1589,8 @@ def _finalize_job(
         save_round_verdicts(job_id, round_verdicts)
     report = build_report(cfg, task_set, answers_a, answers_b, verdict, rounds_answers,
                           embedding_config)
+    # 迭代六：KPI 看板评测耗时（内存 started_at 优先，磁盘路径回退 config.created_at）
+    report["kpi"]["duration_sec"] = _job_duration_sec(job_id, cfg)
     report["env_snapshot"] = load_env_snapshot(job_id) or collect_env_snapshot()
     save_report(job_id, {
         "config": sanitize_config(cfg),

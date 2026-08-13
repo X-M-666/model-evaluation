@@ -180,6 +180,85 @@ def test_pages_have_no_js_or_csp_errors(_page):
     assert not csp_violations, f"CSP 违规: {csp_violations}"
 
 
+# ---------------- 迭代六：扰动 / 排行榜 / KPI 看板页面冒烟 ----------------
+
+def test_iter6_pages_render_without_js_errors(_page):
+    """新页面（扰动/排行榜/KPI 看板）加载无 JS/CSP 异常，关键元素存在。"""
+    page_errors, csp_violations = [], []
+    _page.on("pageerror", lambda e: page_errors.append(str(e)))
+    _page.on("console", lambda m: csp_violations.append(m.text)
+             if "Content-Security-Policy" in m.text else None)
+
+    _page.goto(f"{BASE}/perturb.html")
+    _page.wait_for_selector("#runBtn")
+    assert _page.locator("#modeBox input[type=checkbox]").count() == 5
+    assert _page.locator("#runBtn").is_visible()
+
+    _page.goto(f"{BASE}/leaderboard.html")
+    _page.wait_for_selector("#createBtn")
+    assert _page.locator("#createBtn").is_visible()
+
+    _page.goto(f"{BASE}/dashboard.html")
+    _page.wait_for_selector("#kpiCards")
+    assert _page.locator("#cpuVal").is_visible()
+
+    _page.goto(f"{BASE}/")
+    _page.wait_for_timeout(300)
+    # index 入口链接
+    assert _page.locator('a[href="/perturb.html"]').count() == 1
+    assert _page.locator('a[href="/leaderboard.html"]').count() == 1
+    assert _page.locator('a[href="/dashboard.html"]').count() == 1
+
+    assert not page_errors, f"页面 JS 异常: {page_errors}"
+    assert not csp_violations, f"CSP 违规: {csp_violations}"
+
+
+def test_iter6_perturb_page_runs_pipeline(_page, tmp_path, monkeypatch):
+    """扰动页全链路（TestClient 层已覆盖管线，此处验证页面 → API 提交 → 轮询展示）。"""
+    from backend.engine.perturb import build_perturb_set
+
+    async def _fake_execute(model_label, config, tasks, stability_repeat,
+                            progress_cb=None, embedding_cfg=None):
+        answers = []
+        for t in tasks:
+            answers.append({"id": t["id"], "raw_answer": "答案",
+                            "api_info": {"status": "ok", "attempts": 1,
+                                         "truncated": False, "error": None,
+                                         "latency_ms": 10, "prompt_tokens": 5,
+                                         "completion_tokens": 3,
+                                         "repeat_index": 1}})
+        return {"model": config["name"], "answers": answers}
+    monkeypatch.setattr("backend.main._execute_model", _fake_execute)
+
+    _upload_dataset(_page, "扰动演示集", dim="知识能力", prompt="公司总部位于北京，请问 1+1=?")
+    page_errors = []
+    _page.on("pageerror", lambda e: page_errors.append(str(e)))
+    _page.goto(f"{BASE}/perturb.html")
+    _page.wait_for_function(
+        "document.getElementById('dsSel') && document.getElementById('dsSel').options.length > 0",
+        timeout=15000)
+    assert not page_errors, f"perturb.html JS 异常: {page_errors}"
+    _page.select_option("#dsSel", value="扰动演示集")
+    _page.fill("#m-url", "https://8.8.8.8/v1")
+    _page.fill("#m-name", "演示模型")
+    _page.fill("#m-key", "sk-demo")
+    _page.check('#modeBox input[value="属性扰动-地域"]')
+    _page.click("#runBtn")
+    _page.wait_for_selector("#resultCard", state="visible", timeout=15000)
+    _page.wait_for_timeout(3000)
+    assert not page_errors, f"perturb.html 运行期 JS 异常: {page_errors}"
+    # API 侧校验：扰动记录已完成且带明细
+    per_r = _page.request.get(f"{BASE}/api/perturb")
+    ids = [x["perturb_id"] for x in per_r.json().get("perturbs", [])]
+    assert ids, "无扰动记录"
+    api_data = _page.request.get(f"{BASE}/api/perturb/{ids[-1]}").json()
+    assert api_data.get("state") == "ready"
+    assert len(api_data.get("per_task") or []) >= 2
+    # 页面侧校验：衰减曲线与逐题明细已渲染
+    _page.wait_for_selector("#chartCurve canvas", timeout=15000)
+    _page.wait_for_selector("#taskTable table", timeout=15000)
+
+
 def test_review_page_full_flow_renders_and_submits(_page):
     """mock 答案（无 code_verify 字段）评审页可完整渲染并提交（回归 cv=null 崩溃）。"""
     data = prepare_mock_job(seed=2026)

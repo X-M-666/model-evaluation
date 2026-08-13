@@ -114,6 +114,22 @@ def badcase_attribution(case_id: str, path: str, actor: str = "local") -> None:
     _append({"event": "badcase_attribution", "target": case_id, "path": path, "actor": actor})
 
 
+def perturb_started(perturb_id: str, actor: str = "local") -> None:
+    """扰动评测启动（迭代六）。"""
+    _append({"event": "perturb_started", "target": perturb_id, "actor": actor})
+
+
+def perturb_completed(perturb_id: str, count: int, actor: str = "local") -> None:
+    """扰动评测完成（迭代六，count=扰动任务数）。"""
+    _append({"event": "perturb_completed", "target": perturb_id,
+             "count": count, "actor": actor})
+
+
+def leaderboard_created(lb_id: str, actor: str = "local") -> None:
+    """排行榜创建（迭代六）。"""
+    _append({"event": "leaderboard_created", "target": lb_id, "actor": actor})
+
+
 def read_events() -> list[dict[str, Any]]:
     """读取全部审计事件（测试与运维排查用）。"""
     p = _log_path()

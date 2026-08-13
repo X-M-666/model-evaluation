@@ -1,0 +1,266 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>N 模型排行榜</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,'Segoe UI',sans-serif;margin:0}
+.wrap{max-width:1180px;margin:0 auto;padding:24px}
+h1{font-size:22px;color:#f0f6fc}
+h2{font-size:15px;color:#f0883e;margin-bottom:8px}
+.sub{color:#8b949e;font-size:13px;margin-top:6px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-top:16px}
+.hint{color:#8b949e;font-size:12px}
+label{display:block;font-size:13px;color:#8b949e;margin-bottom:4px;margin-top:12px}
+input,select{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:13px;box-sizing:border-box}
+button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px}
+.btn{background:#1f6feb;color:#fff}
+.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:6px;background:#30363d}
+.badge.gold{background:#e3b341;color:#0d1117}
+.badge.silver{background:#8b949e;color:#0d1117}
+.badge.bronze{background:#b0883e;color:#0d1117}
+.badge.ok{background:#238636;color:#fff}
+.badge.no{background:#da3633;color:#fff}
+.badge.warn{background:#f0883e;color:#0d1117}
+.chart{width:100%;height:340px}
+.chart-sm{width:100%;height:300px}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+th,td{padding:6px 10px;border-bottom:1px solid #21262d;text-align:left}
+th{color:#8b949e;font-weight:normal}
+td.rank1{background:#3a2f0e}
+a{color:#58a6ff}
+.loading{text-align:center;padding:40px;color:#8b949e}
+.empty{text-align:center;padding:40px;color:#8b949e}
+.job-item{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #21262d;font-size:13px}
+.job-item input{width:auto;margin:0}
+.lb-item{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #21262d;cursor:pointer}
+.lb-item:hover{background:#0d1117}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+</style>
+<script src="/static/echarts.min.js"></script>
+</head>
+<body>
+<div class="wrap">
+<h1>🏆 N 模型排行榜</h1>
+<p class="sub" id="subInfo">由 N 个已完成评测（同一评测集）聚合：分维度排名 + 综合分 + 胜率矩阵 + bootstrap CI 标注</p>
+
+<div class="card">
+<h2>创建排行榜</h2>
+<p class="hint">选择 N 个「已完成」且使用<strong>同一评测集</strong>的历史评测（每 job 为一个模型的对决；同一模型可出现在多个 job，同题取最新分）。口径：双盲成对评审分经 reveal 归一化后跨 job 聚合，安全与价值观不计入排名。</p>
+<label>名称（可选）<input id="lb-name" placeholder="如 2026-08 榜单"></label>
+<div id="jobList"><div class="loading">加载历史评测中...</div></div>
+<button class="btn" id="createBtn" style="margin-top:14px">生成排行榜</button>
+<span class="hint" id="createMsg"></span>
+</div>
+
+<div class="card">
+<h2>已有排行榜</h2>
+<div id="lbList"><div class="empty">暂无</div></div>
+</div>
+
+<div class="card" id="viewCard" style="display:none">
+<h2 id="viewTitle"></h2>
+<p class="sub" id="viewMeta"></p>
+<p class="hint" id="viewNote" style="margin-top:6px"></p>
+<div class="grid">
+  <div class="card" style="margin-top:12px"><h2>综合分排名</h2><div id="compositeTable"></div></div>
+  <div class="card" style="margin-top:12px"><h2>分维度得分（点击行查看维度详情）</h2><div id="dimTable"></div></div>
+</div>
+<div class="card" style="margin-top:12px"><h2>胜率矩阵 + 置信区间（行模型 vs 列模型）</h2><div id="winTable"></div></div>
+<div class="grid">
+  <div class="card" style="margin-top:12px"><h2>维度能力雷达（多模型叠加）</h2><div id="chartRadar" class="chart"></div></div>
+  <div class="card" style="margin-top:12px"><h2>逐题得分分布（箱线图）</h2><div id="chartBox" class="chart"></div></div>
+  <div class="card" style="margin-top:12px"><h2>K-召回率（Top-K 达标覆盖，阈值 6.0）</h2><div id="chartK" class="chart"></div></div>
+  <div class="card" style="margin-top:12px"><h2>得分-延迟/Token 散点</h2><div id="chartScatter" class="chart"></div></div>
+</div>
+</div>
+</div>
+
+<script>
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function getToken(){ return localStorage.getItem('duel_token') || ''; }
+async function apiFetch(url, opts={}){
+  const headers = Object.assign({}, opts.headers);
+  const token = getToken();
+  if(token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(url, Object.assign({}, opts, {headers}));
+  if(r.status === 401) throw new Error('未授权：请在首页顶部设置访问令牌');
+  return r;
+}
+const PALETTE = ['#58a6ff','#3fb950','#f0883e','#8957e5','#f85149','#e3b341','#39c5cf','#bc8cff'];
+let CURRENT = null;
+
+async function loadJobs(){
+  const r = await apiFetch('/api/history');
+  const jobs = (await r.json()).jobs || [];
+  const done = jobs.filter(j=>j.state === 'completed');
+  document.getElementById('jobList').innerHTML = done.length
+    ? done.map(j=>`<div class="job-item"><input type="checkbox" value="${esc(j.job_id)}">
+        <span>${esc(j.job_id)}</span><span class="hint">${esc(j.model_a)} vs ${esc(j.model_b)}</span>
+        <span class="hint">${esc(j.created_at||'')}</span></div>`).join('')
+    : '<div class="empty">暂无已完成评测（先完成一次评测）</div>';
+}
+async function loadList(){
+  const r = await apiFetch('/api/leaderboard');
+  const list = (await r.json()).leaderboards || [];
+  document.getElementById('lbList').innerHTML = list.length ? list.map(x=>`
+    <div class="lb-item" data-id="${esc(x.lb_id)}">
+      <div><strong>${esc(x.name||x.lb_id)}</strong>
+        <span class="hint">${esc(x.created_at||'')} · ${esc(x.dataset||'')} · ${(x.models||[]).join(' / ')}</span></div>
+      <div><span class="hint">${x.n_jobs} jobs</span></div>
+    </div>`).join('') : '<div class="empty">暂无排行榜</div>';
+}
+async function create(){
+  const ids = Array.from(document.querySelectorAll('#jobList input:checked')).map(i=>i.value);
+  document.getElementById('createMsg').textContent = '';
+  if(ids.length < 2){ document.getElementById('createMsg').textContent = '请至少选择 2 个已完成评测（同一评测集）'; return; }
+  try{
+    const r = await apiFetch('/api/leaderboard', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name: document.getElementById('lb-name').value.trim() || null, job_ids: ids})});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || ('HTTP '+r.status));
+    document.getElementById('createMsg').textContent = '已生成：' + d.lb_id;
+    openLb(d.lb_id);
+    loadList();
+  }catch(e){ document.getElementById('createMsg').textContent = '失败：' + e.message; }
+}
+async function openLb(id){
+  const r = await apiFetch('/api/leaderboard/' + id);
+  const d = await r.json();
+  CURRENT = d;
+  document.getElementById('viewCard').style.display = 'block';
+  document.getElementById('viewTitle').textContent = d.name || d.lb_id;
+  document.getElementById('viewMeta').textContent =
+    `数据集 ${d.dataset||'-'} · ${d.models.length} 个模型 · ${d.jobs.length} 个 job · 创建 ${d.created_at||''}`;
+  document.getElementById('viewNote').textContent = d.note || '';
+  renderComposite(d);
+  renderDims(d);
+  renderWinMatrix(d);
+  renderRadar(d);
+  renderBox(d);
+  renderK(d);
+  renderScatter(d);
+}
+function rankBadge(rank){
+  if(rank === 1) return '<span class="badge gold">🥇 1</span>';
+  if(rank === 2) return '<span class="badge silver">🥈 2</span>';
+  if(rank === 3) return '<span class="badge bronze">🥉 3</span>';
+  return '<span class="badge">'+rank+'</span>';
+}
+function renderComposite(d){
+  const models = d.models;
+  const rows = models.map(m=>{
+    const c = d.composite[m];
+    return `<tr><td>${rankBadge(d.ranks[m])}</td><td><strong>${esc(m)}</strong></td>
+      <td>${c.score} / ${c.max}</td><td>${c.n_scored}</td></tr>`;
+  }).join('');
+  document.getElementById('compositeTable').innerHTML =
+    `<table><thead><tr><th>名次</th><th>模型</th><th>综合分（满分）</th><th>计分题数</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function renderDims(d){
+  const dims = d.dims || [];
+  const head = `<th>维度</th>` + d.models.map(m=>`<th>${esc(m)}</th>`).join('');
+  const rows = dims.map(dim=>{
+    const vals = d.models.map(m=>d.per_dim[dim] ? (d.per_dim[dim][m]||0) : 0);
+    const maxIdx = vals.indexOf(Math.max(...vals));
+    return `<tr><td>${esc(dim)}</td>` + d.models.map((m,i)=>`<td class="${i===maxIdx?'rank1':''}">${vals[i]}</td>`).join('') + `</tr>`;
+  }).join('');
+  document.getElementById('dimTable').innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+}
+function renderWinMatrix(d){
+  const head = `<th>模型</th>` + d.models.map(m=>`<th>${esc(m)}</th>`).join('');
+  const rows = d.models.map(m1=>{
+    const cells = d.models.map(m2=>{
+      if(m1 === m2) return '<td>—</td>';
+      const wm = (d.win_matrix[m1]||{})[m2];
+      const ci = (d.ci[m1]||{})[m2];
+      if(!wm || !ci) return '<td>-</td>';
+      const badge = ci.significant ? '<span class="badge ok">显著</span>' : '<span class="badge warn">差异不显著</span>';
+      return `<td>${wm.wins}胜/${wm.ties}平/${wm.losses}负<br>
+        <span class="hint">Δ=${ci.mean} CI[${ci.ci[0]}, ${ci.ci[1]}] ${badge}</span></td>`;
+    }).join('');
+    return `<tr><td><strong>${esc(m1)}</strong></td>${cells}</tr>`;
+  }).join('');
+  document.getElementById('winTable').innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+}
+function renderRadar(d){
+  const dims = d.radar.dimensions || [];
+  const chart = echarts.init(document.getElementById('chartRadar'));
+  const series = d.models.map((m,i)=>({
+    name: m, type: 'radar',
+    itemStyle:{color:PALETTE[i%PALETTE.length]},
+    lineStyle:{width:2},
+    data:[dims.map(dim=>{ const v=(d.radar.avg[m]||{})[dim]; return v==null?0:v; })],
+  }));
+  chart.setOption({
+    backgroundColor:'transparent',
+    tooltip:{},
+    legend:{textStyle:{color:'#8b949e'}, bottom:0},
+    radar:{indicator: dims.map(dim=>({name:dim, max:10})), axisName:{color:'#8b949e'},
+      splitArea:{areaStyle:{color:['#161b22','#0d1117']}}, splitLine:{lineStyle:{color:'#21262d'}},
+      axisLine:{lineStyle:{color:'#21262d'}}},
+    series,
+  });
+}
+function renderBox(d){
+  const chart = echarts.init(document.getElementById('chartBox'));
+  const data = d.models.map((m,i)=>({
+    name: m, type: 'boxplot',
+    itemStyle:{color:PALETTE[i%PALETTE.length]},
+    data:[[(d.score_dist[m]||{}).min, (d.score_dist[m]||{}).q1, (d.score_dist[m]||{}).median, (d.score_dist[m]||{}).q3, (d.score_dist[m]||{}).max]],
+  }));
+  chart.setOption({
+    backgroundColor:'transparent',
+    tooltip:{},
+    legend:{textStyle:{color:'#8b949e'}, top:0},
+    xAxis:{type:'category', data:d.models, axisLabel:{color:'#8b949e'}},
+    yAxis:{type:'value', name:'得分', min:0, max:10, axisLabel:{color:'#8b949e'}, splitLine:{lineStyle:{color:'#21262d'}}},
+    series: data,
+  });
+}
+function renderK(d){
+  const chart = echarts.init(document.getElementById('chartK'));
+  const series = d.models.map((m,i)=>{
+    const k = d.k_recall[m] || {};
+    return {name:m, type:'line', smooth:true, symbolSize:6,
+      itemStyle:{color:PALETTE[i%PALETTE.length]},
+      data:(k.ks||[]).map((kk,idx)=>[kk, k.recalls[idx]])};
+  });
+  chart.setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'axis'},
+    legend:{textStyle:{color:'#8b949e'}, top:0},
+    xAxis:{type:'value', name:'K（按得分降序取前 K 题）', axisLabel:{color:'#8b949e'}, splitLine:{lineStyle:{color:'#21262d'}}},
+    yAxis:{type:'value', name:'达标覆盖率', min:0, max:1, axisLabel:{color:'#8b949e'}, splitLine:{lineStyle:{color:'#21262d'}}},
+    series,
+  });
+}
+function renderScatter(d){
+  const chart = echarts.init(document.getElementById('chartScatter'));
+  const series = d.models.map((m,i)=>({
+    name: m, type:'scatter',
+    itemStyle:{color:PALETTE[i%PALETTE.length], opacity:0.75},
+    data:(d.scatter[m]||[]).map(p=>[p.latency_ms||0, p.score, p.tokens||0, p.task_id]),
+  }));
+  chart.setOption({
+    backgroundColor:'transparent',
+    tooltip:{formatter: p=>`${p.seriesName}<br>${p.value[3]}<br>延迟 ${p.value[0]}ms · 得分 ${p.value[1]} · Token ${p.value[2]}`},
+    legend:{textStyle:{color:'#8b949e'}, top:0},
+    xAxis:{type:'value', name:'延迟 (ms)', axisLabel:{color:'#8b949e'}, splitLine:{lineStyle:{color:'#21262d'}}},
+    yAxis:{type:'value', name:'得分', min:0, max:10, axisLabel:{color:'#8b949e'}, splitLine:{lineStyle:{color:'#21262d'}}},
+    series,
+  });
+}
+document.getElementById('createBtn').addEventListener('click', create);
+document.getElementById('lbList').addEventListener('click', e=>{
+  const item = e.target.closest('.lb-item');
+  if(item) openLb(item.dataset.id);
+});
+loadJobs().catch(e=>{ document.getElementById('jobList').innerHTML = '<div class="loading">加载失败: '+esc(e.message)+'</div>'; });
+loadList().catch(()=>{});
+const params = new URLSearchParams(window.location.search);
+if(params.get('id')) openLb(params.get('id'));
+</script>
+</body>
+</html>

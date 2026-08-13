@@ -291,6 +291,16 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <h2>历史记录</h2>
 <div id="historyList"><em>加载中...</em></div>
 </div>
+
+<!-- 迭代六入口：扰动评测 / 排行榜 / KPI 看板 -->
+<div class="card" style="margin-top:24px">
+<h2>高级评测入口</h2>
+<div style="display:flex;gap:10px;flex-wrap:wrap">
+  <a href="/perturb.html" style="color:#58a6ff;text-decoration:none;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 16px;font-size:14px">⚔️ 对抗扰动评测 <span class="hint">鲁棒性衰减曲线 / 偏见公平性对照</span></a>
+  <a href="/leaderboard.html" style="color:#58a6ff;text-decoration:none;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 16px;font-size:14px">🏆 N 模型排行榜 <span class="hint">分维度排名 / 胜率矩阵 / CI 标注</span></a>
+  <a href="/dashboard.html" style="color:#58a6ff;text-decoration:none;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 16px;font-size:14px">📊 KPI 看板 <span class="hint">耗时 / Token 趋势 / CPU 利用率</span></a>
+</div>
+</div>
 </div>
 
 <script>

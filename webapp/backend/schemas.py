@@ -175,3 +175,30 @@ class ReviewDecisionRequest(BaseModel):
     """出题审核提交（迭代四）。action=approve 可选带 edits 覆盖字段（白名单）。"""
     action: str = Field(..., pattern=r"^(approve|reject)$")
     edits: dict | None = Field(None, description="人工编辑字段（approve 时生效，字段白名单）")
+
+
+class PerturbRequest(BaseModel):
+    """对抗扰动评测请求（迭代六）。model 为被测模型（Key 仅内存）。
+
+    modes ⊆ {改写, 噪声注入, 属性扰动-性别, 属性扰动-地域, 属性扰动-文化}；
+    intensities 缺省用各模式默认梯度；judge 为生成式题单臂评审配置
+    （缺省时生成式题得分 N/A，仅输出文本指标与一致性）。
+    """
+    model_config = {"protected_namespaces": ()}
+    model: ModelConfig = Field(..., description="被测模型配置（Key 仅内存）")
+    dataset_name: str = Field(..., max_length=200, description="评测集名称（必填）")
+    modes: list[str] = Field(default_factory=lambda: ["改写", "噪声注入"],
+                             description="扰动模式列表")
+    intensities: dict[str, list[float]] | None = Field(
+        None, description="各模式强度梯度，缺省用默认梯度")
+    seed: int | None = Field(None, description="扰动随机种子（确定性可复现）")
+    judge: ModelConfig | None = Field(None, description="单臂评审模型（生成式题打分）")
+    prompt_strategy: str = Field("cot", pattern=r"^(cot|direct|fewshot)$",
+                                 description="执行侧提示策略")
+
+
+class LeaderboardRequest(BaseModel):
+    """排行榜创建请求（迭代六）：由 N 个已完成 job（同一评测集）聚合。"""
+    name: str | None = Field(None, max_length=200, description="排行榜名称（可选）")
+    job_ids: list[str] = Field(..., min_length=1, max_length=20,
+                               description="参与聚合的已完成 job_id 列表")

@@ -18,7 +18,9 @@ from backend.main import app
 
 client = TestClient(app)
 
-PAGES = ["/", "/report.html", "/review.html"]
+PAGES = ["/", "/report.html", "/review.html", "/gen_review.html",
+         "/badcases.html", "/perturb.html", "/leaderboard.html",
+         "/dashboard.html"]
 
 INLINE_EVENT_RE = re.compile(r'\son\w+\s*=')
 

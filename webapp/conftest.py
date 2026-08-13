@@ -98,6 +98,8 @@ def _isolate_storage(tmp_path_factory):
     orig_stats = storage.STATS_DIR
     orig_generated = storage.GENERATED_DIR
     orig_badcases = storage.BADCASES_DIR
+    orig_perturb = storage.PERTURB_DIR
+    orig_leaderboards = storage.LEADERBOARD_DIR
     orig_models = models_registry.MODELS_DIR
     storage.BASE_DIR = tmp_path_factory.mktemp("history")
     storage.DATASETS_DIR = tmp_path_factory.mktemp("datasets")
@@ -105,6 +107,8 @@ def _isolate_storage(tmp_path_factory):
     storage.SATURATION_FILE = storage.STATS_DIR / "saturation.json"
     storage.GENERATED_DIR = tmp_path_factory.mktemp("generated")
     storage.BADCASES_DIR = tmp_path_factory.mktemp("badcases")
+    storage.PERTURB_DIR = tmp_path_factory.mktemp("perturb")
+    storage.LEADERBOARD_DIR = tmp_path_factory.mktemp("leaderboards")
     models_registry.MODELS_DIR = tmp_path_factory.mktemp("models")
     models_registry.clear_memory_keys()
     for jid in list(main_module._jobs):
@@ -120,4 +124,6 @@ def _isolate_storage(tmp_path_factory):
     storage.SATURATION_FILE = orig_stats / "saturation.json"
     storage.GENERATED_DIR = orig_generated
     storage.BADCASES_DIR = orig_badcases
+    storage.PERTURB_DIR = orig_perturb
+    storage.LEADERBOARD_DIR = orig_leaderboards
     models_registry.MODELS_DIR = orig_models
