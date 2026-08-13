@@ -180,7 +180,11 @@ def test_api_models_delete_missing_404(client):
 def test_api_stats_saturation_empty(client):
     r = client.get("/api/stats/saturation")
     assert r.status_code == 200
-    assert r.json() == {"jobs": []}
+    data = r.json()
+    assert data["jobs"] == []
+    # 迭代五：trend 段（空态）与旧 jobs 字段共存
+    assert data["trend"]["available"] is False
+    assert data["trend"]["datasets"] == {}
 
 
 def test_models_api_audited(client):

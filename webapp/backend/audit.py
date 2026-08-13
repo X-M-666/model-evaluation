@@ -89,6 +89,31 @@ def eval_judged(job_id: str, actor: str = "local") -> None:
     _append({"event": "eval_judged", "job_id": job_id, "actor": actor})
 
 
+def task_generate_started(gen_id: str, actor: str = "local") -> None:
+    """LLM 出题批次创建（迭代四）。"""
+    _append({"event": "task_generate_started", "target": gen_id, "actor": actor})
+
+
+def task_reviewed(item_id: str, action: str, actor: str = "local") -> None:
+    """出题审核提交（approve/reject，迭代四）。"""
+    _append({"event": "task_reviewed", "target": item_id, "path": action, "actor": actor})
+
+
+def dataset_exported(job_id: str, actor: str = "local") -> None:
+    """评测包导出（迭代四）。"""
+    _append({"event": "dataset_exported", "target": job_id, "actor": actor})
+
+
+def badcase_mined(job_id: str, count: int, actor: str = "local") -> None:
+    """bad case 挖掘入库（迭代五：job 完成时）。"""
+    _append({"event": "badcase_mined", "target": job_id, "count": count, "actor": actor})
+
+
+def badcase_attribution(case_id: str, path: str, actor: str = "local") -> None:
+    """bad case 归因更新（迭代五）：path=llm|confirm|revert。"""
+    _append({"event": "badcase_attribution", "target": case_id, "path": path, "actor": actor})
+
+
 def read_events() -> list[dict[str, Any]]:
     """读取全部审计事件（测试与运维排查用）。"""
     p = _log_path()

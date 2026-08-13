@@ -3,10 +3,16 @@
 不存储 API Key，仅在内存中保留 Key。"""
 from __future__ import annotations
 
+import hashlib
+import io
 import json
+import os
+import platform
 import re
 import shutil
+import sys
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -52,6 +58,61 @@ def _job_dir(job_id: str) -> Path:
 
 def create_job_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+
+
+def collect_env_snapshot() -> dict[str, Any]:
+    """采集运行环境快照（迭代四）：OS/Python/CPU/关键运行时信息，无任何密钥。"""
+    import importlib.metadata as _md
+
+    def _pkg(name: str) -> str | None:
+        try:
+            return _md.version(name)
+        except Exception:
+            return None
+
+    return {
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "processor": platform.processor() or "",
+            "python_impl": platform.python_implementation(),
+            "python_version": platform.python_version(),
+            "python_executable": sys.executable,
+        },
+        "cwd": os.getcwd(),
+        "packages": {
+            "fastapi": _pkg("fastapi"),
+            "uvicorn": _pkg("uvicorn"),
+            "httpx": _pkg("httpx"),
+            "pydantic": _pkg("pydantic"),
+            "numpy": _pkg("numpy"),
+            "pandas": _pkg("pandas"),
+        },
+    }
+
+
+def save_env_snapshot(job_id: str) -> Path:
+    """写环境快照 <job>/env.json（迭代四：评测可复现性元数据，无密钥）。"""
+    p = _job_dir(job_id) / "env.json"
+    p.write_text(json.dumps(collect_env_snapshot(), ensure_ascii=False, indent=2),
+                 encoding="utf-8")
+    return p
+
+
+def load_env_snapshot(job_id: str) -> dict[str, Any] | None:
+    """读取环境快照；不存在/损坏时返回 None（零破坏）。"""
+    try:
+        p = _job_path(job_id) / "env.json"
+    except ValueError:
+        return None
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
 
 
 def save_config(job_id: str, config: dict) -> None:
@@ -232,6 +293,44 @@ def get_job_status(job_id: str) -> dict[str, Any] | None:
     })
 
 
+# 导出白名单（迭代四）：仅这些文件进入评测包，杜绝目录/未知文件外泄
+EXPORT_NAMES = [
+    "tasks.json", "answers-a.json", "answers-b.json", "verdict.json",
+    "report.json", "config.json", "round-verdicts.json",
+    "hybrid-review.json", "env.json",
+]
+
+
+def build_export_zip(job_id: str) -> bytes:
+    """打包评测包（迭代四）：白名单文件 + MANIFEST.json（逐文件 sha256）。
+
+    校验 job_id 格式与目录越界（与 _job_path 同防护）；文件不存在则跳过。
+    返回 zip 字节（内存组装，不落盘）。
+    """
+    d = _job_path(job_id)
+    names = list(EXPORT_NAMES)
+    names += sorted(p.name for p in d.glob("answers-*-r*.json"))
+    buf = io.BytesIO()
+    manifest: dict[str, Any] = {
+        "job_id": job_id,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "files": {},
+        "total": 0,
+    }
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in names:
+            p = d / name
+            if not p.exists():
+                continue
+            data = p.read_bytes()
+            zf.writestr(name, data)
+            manifest["files"][name] = hashlib.sha256(data).hexdigest()
+            manifest["total"] += 1
+        zf.writestr("MANIFEST.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2))
+    return buf.getvalue()
+
+
 def list_jobs() -> list[dict[str, Any]]:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     jobs = []
@@ -276,7 +375,7 @@ def get_job_files(job_id: str) -> dict[str, Any] | None:
     result = {}
     names = ["tasks.json", "answers-a.json", "answers-b.json", "verdict.json",
              "report.json", "config.json", "round-verdicts.json",
-             "hybrid-review.json"]
+             "hybrid-review.json", "env.json"]
     names += sorted(p.name for p in d.glob("answers-*-r*.json"))
     for name in names:
         p = d / name
@@ -295,15 +394,22 @@ DATASETS_DIR = Path(__file__).resolve().parent.parent / "data" / "datasets"
 # 金标集目录（迭代三）：<name>.json，结构 {name, items, source, created_at}
 GOLD_DIR = Path(__file__).resolve().parent.parent / "data" / "gold"
 
-# 跨 job 历史汇总（迭代一：接口与幂等写入，真实接入在后续迭代）
+# 出题待审核批次池（迭代四）：<gen_id>.json，结构见 save_generation_batch
+GENERATED_DIR = Path(__file__).resolve().parent.parent / "data" / "generated"
+
+# 跨 job 历史汇总（迭代一：接口与幂等写入，迭代五：main.py 接线 + dataset 分组）
 STATS_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".eval" / "stats"
 SATURATION_FILE = STATS_DIR / "saturation.json"
 
+# Bad Case 库（迭代五）：<case_id>.json，结构见 save_badcase
+BADCASES_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".eval" / "badcases"
 
-def update_saturation(job_id: str, entries: list[dict]) -> bool:
+
+def update_saturation(job_id: str, entries: list[dict], dataset: str | None = None) -> bool:
     """向跨 job 汇总表追加一轮评测的逐题结果（按 job_id 幂等：重复调用跳过）。
 
     entries 为 [{id, dimension, type, answer_x, answer_y, winner}]。
+    dataset：评测集名（迭代五，供饱和度趋势按数据集分组；缺省不记录）。
     返回 True=首次写入成功；False=已存在（幂等跳过）或写入失败。
     """
     if not is_valid_job_id(job_id):
@@ -314,11 +420,14 @@ def update_saturation(job_id: str, entries: list[dict]) -> bool:
         for job in data.get("jobs", []):
             if job.get("job_id") == job_id:
                 return False
-        data.setdefault("jobs", []).append({
+        record: dict[str, Any] = {
             "job_id": job_id,
             "entries": entries,
             "updated_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        if dataset:
+            record["dataset"] = dataset
+        data.setdefault("jobs", []).append(record)
         SATURATION_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return True
     except Exception:
@@ -336,6 +445,113 @@ def get_saturation() -> dict:
         return data
     except (json.JSONDecodeError, OSError):
         return {"jobs": []}
+
+
+# ---- Bad Case 库（迭代五） ----
+
+# case_id = bc_<job_id>_<task_id 消毒>，job_id 段与 create_job_id 同格式
+BAD_CASE_ID_RE = re.compile(r"^bc_\d{8}_\d{6}_[0-9a-f]{6}_[0-9A-Za-z_]+$")
+
+
+def is_valid_badcase_id(case_id: str) -> bool:
+    """case_id 必须符合 save_badcase 生成格式（防路径穿越）。"""
+    return isinstance(case_id, str) and bool(BAD_CASE_ID_RE.fullmatch(case_id))
+
+
+def make_badcase_id(job_id: str, task_id: str) -> str:
+    """由 job_id + task_id 生成 case_id（task_id 消毒为安全文件名段）。"""
+    return f"bc_{job_id}_{_safe_dataset_name(str(task_id))}"
+
+
+def save_badcase(case: dict) -> Path:
+    """写入一条 bad case 记录（按 case_id 覆盖更新）。"""
+    case_id = case.get("case_id", "")
+    if not is_valid_badcase_id(case_id):
+        raise ValueError(f"非法 case_id: {case_id!r}")
+    BADCASES_DIR.mkdir(parents=True, exist_ok=True)
+    p = BADCASES_DIR / f"{case_id}.json"
+    p.write_text(json.dumps(case, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_badcase(case_id: str) -> dict | None:
+    """读取单条 bad case；非法 id / 不存在 / 损坏返回 None。"""
+    if not is_valid_badcase_id(case_id):
+        return None
+    p = BADCASES_DIR / f"{case_id}.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def list_badcases(job_id: str | None = None) -> list[dict]:
+    """列出 bad case 摘要（新→旧）；job_id 非空时仅返回该 job 的记录。"""
+    BADCASES_DIR.mkdir(parents=True, exist_ok=True)
+    result = []
+    for p in sorted(BADCASES_DIR.glob("bc_*.json"), reverse=True):
+        try:
+            case = json.loads(p.read_text(encoding="utf-8"))
+            if job_id and case.get("job_id") != job_id:
+                continue
+            attribution = case.get("attribution") or {}
+            result.append({
+                "case_id": case.get("case_id", p.stem),
+                "job_id": case.get("job_id", ""),
+                "task_id": case.get("task_id", ""),
+                # 归因后以 attribution.label 为权威分类（LLM/人工确认均可更新）
+                "category": attribution.get("label") or case.get("category", "未归类"),
+                "sources": case.get("sources", []),
+                "model": case.get("model", "both"),
+                "score": case.get("score", {}),
+                "confirmed": bool(attribution.get("confirmed")),
+                "attribution_by": attribution.get("by", "auto"),
+                "suggestion": attribution.get("suggestion", ""),
+                "created_at": case.get("created_at", ""),
+            })
+        except (json.JSONDecodeError, OSError):
+            continue
+    return result
+
+
+def delete_badcase(case_id: str) -> bool:
+    """删除一条 bad case。"""
+    if not is_valid_badcase_id(case_id):
+        return False
+    p = BADCASES_DIR / f"{case_id}.json"
+    if not p.exists():
+        return False
+    p.unlink()
+    return True
+
+
+def update_badcase_attribution(case_id: str, attribution: dict) -> dict | None:
+    """更新归因字段（人工确认/改标/驳回），返回更新后的记录；不存在返回 None。"""
+    case = load_badcase(case_id)
+    if case is None:
+        return None
+    merged = dict(case.get("attribution") or {})
+    merged.update({k: v for k, v in attribution.items() if v is not None})
+    case["attribution"] = merged
+    save_badcase(case)
+    return case
+
+
+def export_badcases_json(job_id: str | None = None) -> str:
+    """导出 bad case 清单（含修订建议），序列化为 JSON 字符串。"""
+    cases = []
+    for p in sorted(BADCASES_DIR.glob("bc_*.json")):
+        try:
+            case = json.loads(p.read_text(encoding="utf-8"))
+            if job_id and case.get("job_id") != job_id:
+                continue
+            cases.append(case)
+        except (json.JSONDecodeError, OSError):
+            continue
+    return json.dumps({"job_id": job_id, "total": len(cases), "cases": cases},
+                      ensure_ascii=False, indent=2)
 
 
 # Windows 文件名非法字符（含路径分隔、控制字符），全部替换为下划线
@@ -505,3 +721,76 @@ def load_hybrid_review(job_id: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+# ---- 出题待审核批次池（迭代四） ----
+
+# 系统生成 gen_id 的唯一合法格式（main 生成：gen_ + create_job_id）
+GEN_ID_RE = re.compile(r"^gen_\d{8}_\d{6}_[0-9a-f]{6}$")
+
+
+def is_valid_gen_id(gen_id: str) -> bool:
+    """gen_id 必须符合系统生成格式（防路径穿越）。"""
+    return isinstance(gen_id, str) and bool(GEN_ID_RE.fullmatch(gen_id))
+
+
+def _ensure_generated_dir():
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_generation_batch(gen_id: str, data: dict) -> Path:
+    """保存出题批次（含 spec/items/状态）。spec 不含 gen_config URL/Key 明文。"""
+    if not is_valid_gen_id(gen_id):
+        raise ValueError(f"非法 gen_id: {gen_id!r}")
+    _ensure_generated_dir()
+    p = GENERATED_DIR / f"{gen_id}.json"
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_generation_batch(gen_id: str) -> dict | None:
+    """读取出题批次；缺失/损坏返回 None。"""
+    if not is_valid_gen_id(gen_id):
+        return None
+    p = GENERATED_DIR / f"{gen_id}.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def list_generation_batches() -> list[dict]:
+    """列出全部出题批次摘要（含题目状态分布）。"""
+    _ensure_generated_dir()
+    result = []
+    for p in sorted(GENERATED_DIR.glob("gen_*.json")):
+        data = load_generation_batch(p.stem)
+        if data is None:
+            continue
+        items = data.get("items", []) if isinstance(data.get("items"), list) else []
+        stats = {"total": len(items), "pending": 0, "approved": 0, "rejected": 0}
+        for it in items:
+            st = it.get("status")
+            if st in stats:
+                stats[st] += 1
+        result.append({
+            "gen_id": p.stem,
+            "state": data.get("state", "unknown"),
+            "created_at": data.get("created_at", ""),
+            "task_type": (data.get("spec") or {}).get("task_type", ""),
+            "dimension": (data.get("spec") or {}).get("dimension", ""),
+            "target_dataset": (data.get("spec") or {}).get("target_dataset"),
+            "gen_name": (data.get("spec") or {}).get("gen_name", ""),
+            "items": stats,
+        })
+    return result
+
+
+def bump_dataset_version(version: str | None) -> str:
+    """评测集版本递增：v1 → v2 ……；非 v{n} 形从 v1 起算。"""
+    m = re.match(r"^v(\d+)$", str(version or "").strip())
+    n = int(m.group(1)) if m else 0
+    return f"v{n + 1}"

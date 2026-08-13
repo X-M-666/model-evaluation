@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>出题批次审核</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,'Segoe UI',sans-serif;margin:0}
+.wrap{max-width:900px;margin:0 auto;padding:24px}
+h1{font-size:22px;color:#f0f6fc}
+h2{font-size:15px;color:#f0883e;margin-bottom:8px}
+.sub{color:#8b949e;font-size:13px;margin-top:6px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-top:16px}
+.hint{color:#8b949e;font-size:12px}
+.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:6px;background:#30363d}
+.badge.dim{background:#1f6feb;color:#fff}
+.badge.lv{background:#8957e5;color:#fff}
+.badge.ok{background:#238636;color:#fff}
+.badge.no{background:#da3633;color:#fff}
+.item{border:1px solid #21262d;border-radius:8px;padding:14px;margin-top:12px;background:#0d1117}
+.item h3{margin:0 0 8px;font-size:15px;color:#f0f6fc}
+.prompt{font-size:13px;color:#8b949e;white-space:pre-wrap;line-height:1.6}
+.ctx{margin-top:10px;padding:10px 12px;background:#10161f;border-left:3px solid #3fb950;border-radius:0 6px 6px 0;font-size:12px;color:#8b949e;white-space:pre-wrap}
+.checks{margin-top:8px;font-size:12px}
+.checks span{margin-right:10px}
+.edits{margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.edits label{font-size:12px;color:#8b949e}
+.edits input,.edits textarea{width:100%;margin-top:4px;padding:6px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:13px}
+.edits textarea{min-height:60px}
+.btns{margin-top:12px;display:flex;gap:10px}
+button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px}
+.btn-ok{background:#238636;color:#fff}
+.btn-no{background:#da3633;color:#fff}
+.btn-ok:disabled,.btn-no:disabled{opacity:.4;cursor:not-allowed}
+.status-done{color:#8b949e;font-size:12px;margin-top:8px}
+.state-banner{padding:10px 14px;border-radius:8px;font-size:14px;margin-top:12px}
+.loading{text-align:center;padding:60px;color:#8b949e}
+a{color:#58a6ff}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>📝 出题批次审核</h1>
+<p class="sub" id="subInfo">加载中...</p>
+<div id="banner"></div>
+<div id="content"><div class="loading">加载中...</div></div>
+</div>
+<script>
+const params = new URLSearchParams(window.location.search);
+const genId = params.get('gen');
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function getToken(){ return localStorage.getItem('duel_token') || ''; }
+async function apiFetch(url, opts={}){
+  const headers = Object.assign({}, opts.headers);
+  const token = getToken();
+  if(token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(url, Object.assign({}, opts, {headers}));
+  if(r.status === 401) throw new Error('未授权：请在首页顶部设置访问令牌');
+  return r;
+}
+function stateBanner(d){
+  const map = {
+    generating:['生成中...','#58a6ff'],
+    ready:['可审核（全部题目完成）','#3fb950'],
+    partial:['部分完成（生成中断，可审核已完成题目）','#f0883e'],
+    error:['出题失败','#f85149'],
+    rejected:['批次已关闭','#8b949e'],
+  };
+  const [txt, col] = map[d.state] || [d.state, '#8b949e'];
+  return `<div class="state-banner" style="background:rgba(0,0,0,.25);border:1px solid ${col};color:${col}">● ${esc(txt)}${d.error ? '：' + esc(d.error) : ''}</div>`;
+}
+async function submitAction(itemId, action){
+  const edits = {};
+  if(action === 'approve'){
+    document.querySelectorAll(`.edit-${CSS.escape(itemId)}`).forEach(el=>{
+      if(el.value != null && String(el.value).trim() !== '') edits[el.dataset.field] = el.value.trim();
+    });
+  }
+  const r = await apiFetch(`/api/generate/${genId}/items/${itemId}/review`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action, edits: action === 'approve' ? edits : null}),
+  });
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(d.detail || ('HTTP '+r.status));
+  return d;
+}
+function itemHtml(it){
+  const t = it.task || {};
+  const c = it.checks || {};
+  const st = it.status || 'pending';
+  const done = st !== 'pending';
+  const flag = (name, ok) => ok == null ? '' :
+    `<span class="badge ${ok ? 'ok' : 'no'}">${esc(name)}${ok ? '✓' : '✗'}</span>`;
+  const solvable = c.solvable ? (c.solvable.status === 'verified' ? '<span class="badge ok">可解✓</span>'
+    : `<span class="badge no">需人工复核</span>`) : '';
+  const checks = c.dedup ? `<div class="checks">${flag('去重', c.dedup.ok)}${flag('防泄漏', c.leakage && c.leakage.ok)}${flag('细则', c.rubric && c.rubric.ok)}${solvable}${flag('安全', (c.safety && c.safety.status === 'passed'))}</div>` : '';
+  return `<div class="item" data-id="${esc(it.item_id)}">
+    <h3>${esc(it.item_id)} <span class="badge dim">${esc(t.dimension||'')}</span><span class="badge lv">${esc(t.difficulty||'')}</span>${done ? '<span class="badge ' + (st==='approved'?'ok':'no') + '">'+esc(st)+'</span>' : ''}</h3>
+    <div class="prompt">${esc(t.prompt)}</div>
+    ${t.context ? `<div class="ctx"><strong>📄 参考文档</strong>\n${esc(t.context)}</div>` : ''}
+    ${checks}
+    ${t.rubric_note ? `<div class="checks">📋 ${esc(t.rubric_note)}</div>` : ''}
+    <div class="edits">
+      <label>题面 prompt<input class="edit-${esc(it.item_id)}" data-field="prompt" value="${esc(t.prompt)}" /></label>
+      <label>标准答案 expected<input class="edit-${esc(it.item_id)}" data-field="expected" value="${esc(t.expected||'')}" /></label>
+      <label>难度 difficulty<input class="edit-${esc(it.item_id)}" data-field="difficulty" value="${esc(t.difficulty||'')}" /></label>
+      <label>评分标准 rubric_note<textarea class="edit-${esc(it.item_id)}" data-field="rubric_note">${esc(t.rubric_note||'')}</textarea></label>
+    </div>
+    <div class="btns">
+      <button class="btn-ok" data-act="approve" ${done?'disabled':''}>批准入库</button>
+      <button class="btn-no" data-act="reject" ${done?'disabled':''}>驳回</button>
+      <span class="hint" style="align-self:center">${done && it.dataset ? '已入库 → ' + esc(it.dataset) + ' (' + esc(it.version) + ')' : ''}</span>
+    </div>
+    <div class="status-done" id="msg-${esc(it.item_id)}"></div>
+  </div>`;
+}
+async function load(){
+  const box = document.getElementById('content');
+  try{
+    const r = await apiFetch(`/api/generate/${genId}`);
+    if(!r.ok) throw new Error((await r.json()).detail || '加载失败');
+    const d = await r.json();
+    document.getElementById('subInfo').textContent =
+      `批次 ${esc(d.gen_id)} | 状态 ${esc(d.state)} | 维度 ${esc(d.spec && d.spec.dimension || '')} | 目标评测集 ${esc(d.spec && d.spec.target_dataset || '（自动命名）')} | 已审核 ${esc(d.item_stats && d.item_stats.approved)}/${esc(d.item_stats && d.item_stats.total)}`;
+    document.getElementById('banner').innerHTML = stateBanner(d);
+    const items = d.items || [];
+    if(!items.length){ box.innerHTML = '<div class="loading">批次暂无题目（生成中或已清空）</div>'; return; }
+    box.innerHTML = items.map(itemHtml).join('');
+    box.querySelectorAll('button[data-act]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        const itemId = btn.closest('.item').dataset.id;
+        const msg = document.getElementById('msg-'+itemId);
+        try{
+          const res = await submitAction(itemId, btn.dataset.act);
+          msg.textContent = (btn.dataset.act === 'approve' ? '已批准' : '已驳回') +
+            (res.dataset ? ` → ${res.dataset} v${res.version}` : '') + ' ✓';
+          load();
+        }catch(e){ msg.textContent = '失败：' + e.message; }
+      });
+    });
+  }catch(e){
+    box.innerHTML = `<div class="loading">加载失败: ${esc(e.message||e)}，<a href="/">返回首页</a></div>`;
+  }
+}
+if(!genId){
+  document.getElementById('content').innerHTML = '<div class="loading">缺少 gen 参数，<a href="/">返回首页</a></div>';
+}else{
+  load();
+}
+</script>
+</body>
+</html>

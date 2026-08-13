@@ -30,6 +30,14 @@ _CODE_SEM = asyncio.Semaphore(2)
 COT_SUFFIX = "\n\n请一步一步思考，并在最后给出明确、独立的结论。"
 
 
+def _context_block(task: dict[str, Any]) -> str:
+    """任务携带参考文档（RAG/上下文忠实性，迭代四）：非空时置于题目之前。"""
+    ctx = (task.get("context") or "").strip()
+    if not ctx:
+        return ""
+    return f"【参考文档】\n{ctx}\n\n【任务】\n"
+
+
 def build_prompt(task: dict[str, Any], strategy: str = "cot") -> str:
     """按提示策略构造发给模型的最终 prompt（纯函数，确定性可测）。
 
@@ -37,9 +45,12 @@ def build_prompt(task: dict[str, Any], strategy: str = "cot") -> str:
     - direct：原样透传 prompt；
     - fewshot：注入 test_cases 示例（输入/输出对）；无 test_cases 时回退 direct
       （与 cot 互斥，按用户选择执行）。
+
+    迭代四：任务携带 context 时，任何策略下均以「【参考文档】…【任务】」块
+    置于题面之前（RAG 忠实性评测要求模型可被观察到引用上下文）。
     """
     s = (strategy or "cot").strip().lower()
-    prompt = (task.get("prompt") or "").strip()
+    prompt = _context_block(task) + (task.get("prompt") or "").strip()
     if s == "direct":
         return prompt
     if s == "fewshot":

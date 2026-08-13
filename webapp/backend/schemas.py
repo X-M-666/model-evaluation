@@ -154,3 +154,24 @@ class EmbeddingConfig(BaseModel):
     url: str | None = Field(None, max_length=500, description="embedding API base URL")
     key: str | None = Field(None, description="embedding API Key（仅存内存）")
     name: str | None = Field(None, description="embedding 模型名")
+
+
+class GenerateRequest(BaseModel):
+    """LLM 出题请求（迭代四）。gen_config 必填（出题模型，Key 仅存内存）。
+
+    target_dataset：审核通过后追加的目标数据集（缺省在审核通过时新建）。
+    dimension 为空表示由前端/调用方指定（后端必填校验在路由层完成）。
+    options: {cot: bool, few_shots: bool, with_context: bool}
+    """
+    gen_config: ModelConfig | None = Field(None, description="出题模型配置（Key 仅内存）")
+    target_dataset: str | None = Field(None, max_length=200, description="审核入库目标数据集")
+    task_type: str = Field("判别式", pattern=r"^(判别式|生成式)$")
+    dimension: str | None = Field(None, max_length=100, description="目标维度（空=随机）")
+    count: int = Field(5, ge=1, le=20, description="生成题数（1-20，默认 5）")
+    options: dict = Field(default_factory=dict, description="出题选项（cot/few_shots/with_context）")
+
+
+class ReviewDecisionRequest(BaseModel):
+    """出题审核提交（迭代四）。action=approve 可选带 edits 覆盖字段（白名单）。"""
+    action: str = Field(..., pattern=r"^(approve|reject)$")
+    edits: dict | None = Field(None, description="人工编辑字段（approve 时生效，字段白名单）")

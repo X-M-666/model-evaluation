@@ -99,7 +99,14 @@ def _build_blind_prompt(
 维度：{dim}
 题目：
 {prompt_text}
-
+"""
+    ctx = (task.get("context") or "").strip()
+    if ctx:
+        prompt += f"""
+【参考文档（题目携带的上下文材料，供核对答案忠实性）】
+{ctx}
+"""
+    prompt += f"""
 【评分标准】
 {rubric_note}
 """
@@ -384,7 +391,14 @@ def _build_single_arm_prompt(task: dict[str, Any], answer: dict[str, Any]) -> st
 维度：{dim}
 题目：
 {task['prompt']}
-
+"""
+    ctx = (task.get("context") or "").strip()
+    if ctx:
+        prompt += f"""
+【参考文档（题目携带的上下文材料，供核对答案忠实性）】
+{ctx}
+"""
+    prompt += f"""
 【评分标准】
 {rubric_note}
 """

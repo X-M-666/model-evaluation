@@ -94,6 +94,7 @@ def build_review_view(
         "benchmark": task.get("benchmark", ""),
         "difficulty": task.get("difficulty", ""),
         "prompt": task.get("prompt", ""),
+        "context": (task.get("context") or "").strip(),
         "rubric_note": task.get("rubric_note", ""),
         "test_cases": task.get("test_cases", []),
         "answer_x": _entry_view(x_entries),

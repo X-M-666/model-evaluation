@@ -205,6 +205,34 @@ def metric_consistency(runs: list[str]) -> float | None:
     return round(sum(sims) / len(sims), 4) if sims else None
 
 
+# RAG/上下文忠实性（迭代四）：答案 vs 参考文档的 n-gram 支持度阈值
+GROUNDING_SUPPORT_THRESHOLD = 0.35
+
+
+@_metric("grounding_faithfulness")
+def metric_grounding_faithfulness(answer: str, context: str) -> float:
+    """忠实度：答案与参考文档的 n-gram 余弦（纯 n-gram、零依赖）。
+
+    答案大量援引/复述文档片段 → 接近 1；与文档无关的自由发挥 → 接近 0。
+    """
+    ans, ctx = (answer or "").strip(), (context or "").strip()
+    if not ans or not ctx:
+        return 0.0
+    return round(cosine(ngram_vec(ans), ngram_vec(ctx)), 4)
+
+
+@_metric("answer_relevancy")
+def metric_answer_relevancy(answer: str, prompt: str) -> float:
+    """相关性：答案与题面 prompt 的 n-gram 余弦（纯 n-gram、零依赖）。
+
+    答非所问（复述文档但未回应问题）时相关度低，与忠实度互补。
+    """
+    ans, q = (answer or "").strip(), (prompt or "").strip()
+    if not ans or not q:
+        return 0.0
+    return round(cosine(ngram_vec(ans), ngram_vec(q)), 4)
+
+
 def _discriminative(
     task: dict[str, Any],
     main: dict[str, Any],

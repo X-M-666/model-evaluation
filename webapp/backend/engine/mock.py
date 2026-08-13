@@ -157,6 +157,12 @@ def prepare_mock_job(seed: int | None = None) -> dict[str, Any]:
         dim = t["dimension"]
         templates = ANSWER_TEMPLATES.get(dim, ["(模拟回答)"])
 
+        # 带参考文档的题目（RAG 演示，迭代四）：答案改写自文档开头 → 忠实度演示
+        ctx = (t.get("context") or "").strip()
+        if ctx:
+            head = ctx.replace("\n", " ")[:90]
+            templates = [f"根据提供的参考文档回答：{head}……（文档要点，忠实转述）"]
+
         # 每个模型随机选一套答案模板
         ans_a_text = random.choice(templates)
         ans_b_text = random.choice(templates)

@@ -13,6 +13,7 @@ import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,11 +33,14 @@ from backend.engine.human_review import (
 )
 from backend.engine.report_builder import build_report, reveal_answers
 from backend.engine.parsers import get_parser, supported_extensions
+from backend.engine.generator import run_generation_pipeline, EDIT_ALLOWED_FIELDS
 from backend.engine.datasets import (
     _as_str,
     MAX_NAME_LEN,
+    MAX_DATASET_TASKS,
     DatasetValidationError,
     validate_json_dataset,
+    validate_standard_dataset,
 )
 from backend import audit
 from backend import sse_ticket
@@ -52,11 +56,22 @@ from backend.storage import (
     is_valid_job_id,
     list_gold, save_gold, delete_gold, load_gold, save_hybrid_review,
     load_hybrid_review,
+    save_generation_batch, load_generation_batch, list_generation_batches,
+    bump_dataset_version, is_valid_gen_id,
+    save_env_snapshot, load_env_snapshot, collect_env_snapshot,
+    build_export_zip,
+    save_badcase, load_badcase, list_badcases, delete_badcase,
+    update_badcase_attribution, export_badcases_json,
 )
 from backend.gold import ensure_demo_gold, compute_meta_eval
+from backend.engine.rag_demo import ensure_demo_rag_dataset
+from backend.engine.badcase import (
+    BAD_CASE_CATEGORIES, UNCATEGORIZED, mine_bad_cases, attribute_badcase,
+)
+from backend.engine.stats import saturation_trend
 from backend.schemas import (
     StartRequest, StartResponse, ReviewSubmission, ModelRegisterRequest,
-    GoldSetRequest,
+    GoldSetRequest, GenerateRequest, ReviewDecisionRequest,
 )
 from backend.security import redact_sensitive, sanitize_config
 from backend.models_registry import (
@@ -116,6 +131,7 @@ async def _shutdown_cancel_all():
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_demo_gold()  # 迭代三：gold 目录为空时载入 demo 金标（source="demo"）
+    ensure_demo_rag_dataset()  # 迭代四：内置 RAG 演示集（带 context 参考文档）
     yield
     await _shutdown_cancel_all()
 
@@ -183,6 +199,18 @@ async def report_page():
 @app.get("/review.html", response_class=HTMLResponse)
 async def review_page():
     return _page_response("review.html")
+
+
+@app.get("/gen_review.html", response_class=HTMLResponse)
+async def gen_review_page():
+    """出题批次审核页（迭代四）：approve（含编辑）/reject → 数据集入库。"""
+    return _page_response("gen_review.html")
+
+
+@app.get("/badcases.html", response_class=HTMLResponse)
+async def badcases_page():
+    """bad case 页（迭代五）：列表/分类分布/归因报告/导出。"""
+    return _page_response("badcases.html")
 
 
 @app.get("/api/dims")
@@ -333,6 +361,228 @@ async def remove_dataset(name: str):
     return {"ok": True}
 
 
+# ---- LLM 出题与待审核批次（迭代四） ----
+
+_GENERATION_MAX_ACTIVE = 3
+
+
+def _require_gen_id(gen_id: str) -> str:
+    """校验 gen_id 为系统生成格式（防路径穿越）。"""
+    if not is_valid_gen_id(gen_id):
+        raise HTTPException(400, "invalid gen_id format")
+    return gen_id
+
+
+def _settle_generation(batch: dict) -> dict:
+    """重启/取消遗留的 generating 批次落为 partial（进程中断的生成不复活）。"""
+    if batch.get("state") == "generating" and batch.get("gen_id") not in _tasks:
+        batch["state"] = "partial"
+        batch["error"] = "生成协程中断（进程重启或服务关闭），已完成题目可继续审核"
+        save_generation_batch(batch["gen_id"], batch)
+    return batch
+
+
+def _item_stats(items: list[dict]) -> dict:
+    stats = {"total": len(items), "pending": 0, "approved": 0, "rejected": 0}
+    for it in items:
+        st = it.get("status")
+        if st in stats:
+            stats[st] += 1
+    return stats
+
+
+async def _run_generation(gen_id: str, gen_config: dict, req: GenerateRequest):
+    """后台出题协程：生成 → 五级校验 → 批次置 ready。错误落盘不复活。"""
+    try:
+        pool = None
+        if req.target_dataset:
+            ds = load_dataset(req.target_dataset)
+            if ds:
+                pool = [str(t.get("prompt", "")) for t in ds.get("tasks", []) if isinstance(t, dict)]
+        spec = {
+            "task_type": req.task_type,
+            "dimension": req.dimension or "知识能力",
+            "count": req.count,
+            "options": req.options or {},
+            "target_dataset": req.target_dataset,
+            "gen_name": gen_config.get("name", ""),
+            "gen_key_masked": "***",
+        }
+        items = await run_generation_pipeline(gen_config, spec, pool=pool)
+        batch = load_generation_batch(gen_id)
+        if batch is None:
+            return
+        batch["items"] = [
+            {
+                "item_id": f"{gen_id}-{i + 1}",
+                "task": it["task"],
+                "checks": it["checks"],
+                "issues": it["issues"],
+                "ok": it["ok"],
+                "status": "pending",
+                "edits": None,
+                "reviewed_at": None,
+            }
+            for i, it in enumerate(items)
+        ]
+        batch["state"] = "ready"
+        save_generation_batch(gen_id, batch)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        batch = load_generation_batch(gen_id)
+        if batch is not None:
+            batch["state"] = "error"
+            batch["error"] = f"出题失败: {exc}"
+            save_generation_batch(gen_id, batch)
+
+
+@app.post("/api/generate", response_model=None)
+async def generate_tasks(req: GenerateRequest):
+    """创建 LLM 出题批次（后台执行）。gen_config 必填（Key 仅内存，不落盘）。"""
+    if req.gen_config is None:
+        raise HTTPException(
+            400,
+            "必须提供 gen_config 出题模型配置（出题面板可一键复用评审模型配置）",
+        )
+    try:
+        validate_upstream_url(req.gen_config.url)
+    except UpstreamUrlError as e:
+        raise HTTPException(400, f"出题模型 URL 校验失败: {e}")
+
+    # 出题协程计入活动上限（与评测任务共池，避免并发模型调用失控）
+    active = sum(1 for k in _tasks if str(k).startswith("gen_"))
+    if active >= _GENERATION_MAX_ACTIVE:
+        raise HTTPException(429, f"当前已有 {active} 个出题任务在执行，请稍后再试")
+
+    gen_id = "gen_" + create_job_id()
+    gen_cfg = {
+        "name": req.gen_config.name,
+        "url": req.gen_config.url,
+        "key": req.gen_config.key or "",
+    }
+    batch = {
+        "gen_id": gen_id,
+        "state": "generating",
+        "error": None,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "spec": {
+            "task_type": req.task_type,
+            "dimension": req.dimension,
+            "count": req.count,
+            "options": req.options or {},
+            "target_dataset": req.target_dataset,
+            "gen_name": gen_cfg["name"],
+            "gen_key_masked": "***",
+        },
+        "items": [],
+    }
+    save_generation_batch(gen_id, batch)
+    task = asyncio.create_task(_run_generation(gen_id, gen_cfg, req))
+    _tasks[gen_id] = task
+    task.add_done_callback(lambda t, gid=gen_id: _task_done(gid, t))
+    audit.task_generate_started(gen_id)
+    return {"ok": True, "gen_id": gen_id, "state": "generating", "count": req.count}
+
+
+@app.get("/api/generate")
+async def generate_list():
+    return {"batches": list_generation_batches()}
+
+
+@app.get("/api/generate/{gen_id}")
+async def generate_detail(gen_id: str):
+    _require_gen_id(gen_id)
+    batch = load_generation_batch(gen_id)
+    if batch is None:
+        raise HTTPException(404, "generation batch not found")
+    batch = _settle_generation(batch)
+    return {
+        "gen_id": batch["gen_id"],
+        "state": batch["state"],
+        "error": batch.get("error"),
+        "created_at": batch.get("created_at", ""),
+        "spec": batch.get("spec", {}),
+        "item_stats": _item_stats(batch.get("items", [])),
+        "items": batch.get("items", []),
+    }
+
+
+@app.post("/api/generate/{gen_id}/items/{item_id}/review")
+async def review_generated(gen_id: str, item_id: str, req: ReviewDecisionRequest):
+    """审核提交：approve（可选 edits）→ 目标数据集入库 + 版本递增；reject 终态。"""
+    _require_gen_id(gen_id)
+    batch = load_generation_batch(gen_id)
+    if batch is None:
+        raise HTTPException(404, "generation batch not found")
+    batch = _settle_generation(batch)
+    if batch["state"] not in ("ready", "partial"):
+        raise HTTPException(409, f"批次尚未完成生成（state={batch['state']}），无法审核")
+    if not item_id.startswith(gen_id + "-"):
+        raise HTTPException(404, "item not found")
+    item = next((it for it in batch.get("items", []) if it.get("item_id") == item_id), None)
+    if item is None:
+        raise HTTPException(404, "item not found")
+    if item.get("status") != "pending":
+        raise HTTPException(409, f"该题目已审核（status={item.get('status')}），驳回为终态")
+
+    if req.action == "reject":
+        item["status"] = "rejected"
+        item["reviewed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        save_generation_batch(gen_id, batch)
+        audit.task_reviewed(item_id, "reject")
+        return {"ok": True, "status": "rejected"}
+
+    # approve：合并人工编辑（字段白名单 E6）
+    task = dict(item.get("task", {}))
+    if req.edits:
+        bad = [k for k in req.edits if k not in EDIT_ALLOWED_FIELDS]
+        if bad:
+            raise HTTPException(400, f"不允许编辑字段: {', '.join(sorted(bad))}")
+        task = {**task, **{k: v for k, v in req.edits.items() if v is not None}}
+
+    # 单题校验（E1：包装为整集校验路径，不调私有函数）
+    try:
+        validated = validate_standard_dataset({"name": "pending", "tasks": [task]})
+        task = validated["tasks"][0]
+    except DatasetValidationError as e:
+        raise HTTPException(400, f"题目校验失败: {e}")
+
+    # 目标数据集：缺省自动命名；追加 + 版本递增 + 来源标注
+    spec = batch.get("spec", {})
+    ds_name = spec.get("target_dataset") or f"LLM生成集_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    dataset = load_dataset(ds_name) or {
+        "name": ds_name,
+        "description": "由出题审核生成（LLM 出题 + 人工审核）",
+        "tasks": [],
+    }
+    if len(dataset.get("tasks", [])) >= MAX_DATASET_TASKS:
+        raise HTTPException(400, f"数据集题目数已达上限 {MAX_DATASET_TASKS}，无法追加")
+    # 单题校验赋予的自动 id（T1）可能与既有题目冲突：改为按现有 id 扫描取最小空闲号
+    used_ids = {str(t.get("id", "")) for t in dataset.get("tasks", []) if isinstance(t, dict)}
+    n = 1
+    while f"T{n}" in used_ids:
+        n += 1
+    task["id"] = f"T{n}"
+    next_version = bump_dataset_version(dataset.get("version") or "v0")
+    dataset["version"] = next_version
+    dataset["source"] = "generated"
+    dataset["tasks"] = list(dataset.get("tasks", [])) + [task]
+    try:
+        save_dataset(ds_name, dataset)
+    except DatasetValidationError as e:
+        raise HTTPException(400, f"数据集校验失败: {e}")
+
+    item["status"] = "approved"
+    item["edits"] = req.edits
+    item["dataset"] = ds_name
+    item["version"] = next_version
+    item["reviewed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    save_generation_batch(gen_id, batch)
+    audit.task_reviewed(item_id, "approve")
+    return {"ok": True, "status": "approved", "dataset": ds_name, "version": next_version}
+
+
 # ---- 金标集（迭代三） ----
 
 @app.get("/api/gold")
@@ -419,12 +669,16 @@ async def models_delete(model_id: str):
     return {"ok": True}
 
 
-# ---- 跨 job 历史汇总（迭代一：接口就绪，数据由后续迭代真实接入） ----
+# ---- 跨 job 历史汇总与饱和度监测（迭代一接口 + 迭代五趋势） ----
 
 @app.get("/api/stats/saturation")
 async def stats_saturation():
-    """读取跨 job 逐题结果汇总表（.eval/stats/saturation.json，幂等追加）。"""
-    return redact_sensitive(get_saturation())
+    """跨 job 逐题结果汇总表 + 饱和度趋势（jobs 字段兼容旧客户端，trend 为迭代五新增）。"""
+    data = get_saturation()
+    return redact_sensitive({
+        "jobs": data.get("jobs", []),
+        "trend": saturation_trend(data),
+    })
 
 
 # ---- 连通性测试 ----
@@ -571,6 +825,7 @@ async def start_eval(req: StartRequest):
     }
     save_config(job_id, config_data)
     save_task_set(job_id, task_set)
+    save_env_snapshot(job_id)  # 迭代四：环境快照（OS/Python/依赖版本，无密钥）
 
     _jobs[job_id] = {
         "state": "executing",
@@ -1057,6 +1312,7 @@ def _finalize_job(
         save_round_verdicts(job_id, round_verdicts)
     report = build_report(cfg, task_set, answers_a, answers_b, verdict, rounds_answers,
                           embedding_config)
+    report["env_snapshot"] = load_env_snapshot(job_id) or collect_env_snapshot()
     save_report(job_id, {
         "config": sanitize_config(cfg),
         "tasks": task_set,
@@ -1065,6 +1321,7 @@ def _finalize_job(
         "verdict": verdict,
         "report": report,
     })
+    _finalize_badcases(job_id, verdict, task_set, answers_a, answers_b, report, cfg)
     if job_id in _jobs:
         j = _jobs[job_id]
         j["verdict"] = verdict
@@ -1074,6 +1331,184 @@ def _finalize_job(
         j["round_verdicts"] = round_verdicts
         j["state"] = "completed"
         j["progress"] = "done"
+
+
+# ---- Bad Case 与饱和度（迭代五） ----
+
+def _finalize_badcases(
+    job_id: str, verdict: dict, task_set: dict,
+    answers_a: dict, answers_b: dict, report: dict, cfg: dict,
+) -> None:
+    """job 完成收尾：saturation 幂等写入 + bad case 同步挖掘入库 + 后台异步归因。
+
+    挖掘为纯规则（零网络，即时产出满足「一次评测自动产出 bad case 库」）；
+    LLM 归因复用 review.judge 配置异步跑批，失败逐条静默降级「未归类」。
+    """
+    # 1. 跨 job 历史汇总（饱和度监测数据源，按 job_id 幂等）
+    type_map = {t.get("id"): t.get("type", "判别式") for t in task_set.get("tasks", [])}
+    entries = [
+        {
+            "id": s.get("id"),
+            "dimension": s.get("dimension", ""),
+            "type": type_map.get(s.get("id"), "判别式"),
+            "answer_x": s.get("answer_x"),
+            "answer_y": s.get("answer_y"),
+            "winner": s.get("winner", "tie"),
+        }
+        for s in verdict.get("scores", [])
+    ]
+    update_saturation(job_id, entries, dataset=cfg.get("dataset_name"))
+
+    # 2. bad case 挖掘入库（同步）
+    answers_x, answers_y = reveal_answers(answers_a, answers_b, verdict)
+    per_task_metrics = (report.get("metrics") or {}).get("per_task") if isinstance(report, dict) else None
+    cases = mine_bad_cases(job_id, task_set, verdict, answers_x, answers_y,
+                           per_task_metrics, dataset_name=cfg.get("dataset_name"))
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for c in cases:
+        c["created_at"] = now
+        try:
+            save_badcase(c)
+        except Exception:
+            continue
+    if cases:
+        audit.badcase_mined(job_id, len(cases))
+
+    # 3. 后台异步 LLM 归因（复用 review.judge；无配置/失败则保持未归类）
+    review = cfg.get("review") or {}
+    judge_cfg = review.get("judge") if isinstance(review, dict) else None
+    if cases and judge_cfg and judge_cfg.get("url"):
+        task_map = {t.get("id"): t for t in task_set.get("tasks", [])}
+        _spawn_attribution(job_id, cases, task_map, judge_cfg)
+
+
+def _spawn_attribution(
+    job_id: str, cases: list[dict], task_map: dict, judge_cfg: dict,
+) -> None:
+    """在独立 daemon 线程的事件循环中跑归因跑批。
+
+    _finalize_badcases 处于同步链深处，若直接 create_task，归因协程可能
+    在宿主事件循环收尾（asyncio.run 驱动的测试）前从未被调度。独立线程
+    自带 loop（asyncio.run），测试与真实环境均确定运行；daemon 不阻塞主线程。
+    """
+    import threading
+
+    def _runner():
+        try:
+            asyncio.run(_attribute_cases_async(job_id, cases, task_map, judge_cfg))
+        except Exception:
+            pass
+
+    threading.Thread(target=_runner, name=f"badcase-{job_id}", daemon=True).start()
+
+
+async def _attribute_cases_async(
+    job_id: str, cases: list[dict], task_map: dict, judge_cfg: dict,
+) -> None:
+    """后台归因跑批：逐条 LLM 归因，失败保持未归类；整体不抛异常。"""
+    for c in cases:
+        try:
+            task = task_map.get(c["task_id"]) or {}
+            result = await attribute_badcase(c, task, judge_cfg)
+            if result is None:
+                continue
+            updated = update_badcase_attribution(c["case_id"], result)
+            if updated is not None:
+                audit.badcase_attribution(c["case_id"], "llm")
+        except Exception:
+            continue
+
+
+def _require_badcase_id(case_id: str) -> str:
+    """校验 bad case id 为系统生成格式（防路径穿越）。"""
+    from backend.storage import is_valid_badcase_id
+    if not is_valid_badcase_id(case_id):
+        raise HTTPException(400, "invalid case_id format")
+    return case_id
+
+
+@app.get("/api/badcases")
+async def badcases_list(job_id: str | None = None, category: str | None = None,
+                        confirmed: str | None = None):
+    """bad case 列表（按 job/分类/确认态筛选，新→旧）。"""
+    cases = list_badcases(job_id)
+    if category:
+        cases = [c for c in cases if c["category"] == category]
+    if confirmed is not None:
+        want = confirmed.lower() in ("1", "true", "yes")
+        cases = [c for c in cases if c["confirmed"] == want]
+    return {"total": len(cases), "cases": cases}
+
+
+@app.get("/api/badcases/stats")
+async def badcases_stats(job_id: str | None = None):
+    """分类分布 + 来源分布 + 总数（图表数据源）。"""
+    cases = list_badcases(job_id)
+    by_category: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    confirmed = 0
+    for c in cases:
+        by_category[c["category"]] = by_category.get(c["category"], 0) + 1
+        for s in c.get("sources", []):
+            by_source[s] = by_source.get(s, 0) + 1
+        if c.get("confirmed"):
+            confirmed += 1
+    return {
+        "total": len(cases),
+        "confirmed": confirmed,
+        "by_category": by_category,
+        "by_source": by_source,
+        "categories": list(BAD_CASE_CATEGORIES) + [UNCATEGORIZED],
+    }
+
+
+@app.get("/api/badcases/export")
+async def badcases_export(job_id: str | None = None):
+    """导出 bad case 清单 JSON（含修订建议），可指定 job。"""
+    from fastapi.responses import Response
+    content = export_badcases_json(job_id)
+    fname = f"badcases-{job_id}.json" if job_id else "badcases-all.json"
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.get("/api/badcases/{case_id}")
+async def badcase_detail(case_id: str):
+    """bad case 详情（含证据全量，供归因报告与跳转报告原文）。"""
+    _require_badcase_id(case_id)
+    case = load_badcase(case_id)
+    if case is None:
+        raise HTTPException(404, "bad case not found")
+    return redact_sensitive(case)
+
+
+@app.post("/api/badcases/{case_id}/attribution")
+async def badcase_attribution_confirm(case_id: str, req: dict):
+    """人工确认/改标归因（body: {category, suggestion?}；驳回传 category=null）。"""
+    _require_badcase_id(case_id)
+    case = load_badcase(case_id)
+    if case is None:
+        raise HTTPException(404, "bad case not found")
+    category = req.get("category")
+    if category is not None and category not in BAD_CASE_CATEGORIES:
+        raise HTTPException(400, f"category 必须是五类之一: {', '.join(BAD_CASE_CATEGORIES)}")
+    label = category or UNCATEGORIZED
+    suggestion = req.get("suggestion")
+    if suggestion is not None and not isinstance(suggestion, str):
+        raise HTTPException(400, "suggestion 必须是字符串")
+    updated = update_badcase_attribution(case_id, {
+        "label": label,
+        "by": "human",
+        "confirmed": True,
+        "basis": req.get("basis") or (case.get("attribution") or {}).get("basis") or "",
+        "suggestion": suggestion if suggestion is not None else (case.get("attribution") or {}).get("suggestion") or "",
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    audit.badcase_attribution(case_id, "confirm" if category else "revert")
+    return {"ok": True, "case_id": case_id, "category": label, "confirmed": True}
 
 
 # ---- 人工双盲评审 ----
@@ -1503,6 +1938,9 @@ async def eval_report(job_id: str):
                     j["config"], j["task_set"], j["answers_a"], j["answers_b"],
                     j["verdict"], rounds_answers, j.get("embedding_cfg"),
                 )
+                payload["report"]["env_snapshot"] = (
+                    load_env_snapshot(job_id) or collect_env_snapshot()
+                )
                 return redact_sensitive(payload)
         raise HTTPException(404, "job not found or not completed")
 
@@ -1559,6 +1997,30 @@ async def eval_report(job_id: str):
         "verdict": verdict,
         "report": rich,
     }
+
+
+@app.get("/api/eval/{job_id}/export")
+async def eval_export(job_id: str):
+    """导出评测包（迭代四）：仅 completed 可导出 zip + MANIFEST sha256。
+
+    未完成/运行中 409；非法 job_id 或任务不存在 404（复用 _require_job_id
+    与 get_job_status 的磁盘态判定，重启后仍可导出）。
+    """
+    job_id = _require_job_id(job_id)
+    st = get_job_status(job_id)
+    if st is None:
+        raise HTTPException(404, "job not found")
+    if st["state"] != "completed":
+        raise HTTPException(409, f"任务未完成（state={st['state']}），完成后方可导出")
+
+    data = build_export_zip(job_id)
+    audit.dataset_exported(job_id)
+    filename = f"eval-{job_id}.zip"
+    return StreamingResponse(
+        iter([data]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.delete("/api/history/{job_id}")

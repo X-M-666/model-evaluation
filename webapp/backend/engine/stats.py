@@ -216,3 +216,97 @@ def consistency_rate(
             if round_winners[i] == round_winners[j]:
                 agreed += 1
     return round(agreed / total, 4) if total else 0.0
+
+
+# 基准饱和度（迭代五）：得分率升幅阈值与最少样本（可配常量）
+SATURATION_RISE = 0.15
+SATURATION_MIN_SAMPLE = 3
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def saturation_trend(
+    saturation: dict[str, Any],
+    dataset: str | None = None,
+    rise: float = SATURATION_RISE,
+    min_sample: int = SATURATION_MIN_SAMPLE,
+) -> dict[str, Any]:
+    """基准饱和度趋势监测（纯函数，迭代五）：历史得分率上升 → 提示题库过时。
+
+    输入为 storage.get_saturation()（jobs: [{job_id, updated_at, dataset?,
+    entries: [{id, dimension, type, answer_x, answer_y, winner}]}]）。
+    得分率 = 双侧评审分均值 / 10（评审分 0-10；多轮 entries 已是稳定空间均值）。
+
+    每 task 按时间序取得分率序列，前一半均值 vs 后一半均值：
+    升幅 ≥ rise 且两侧各 ≥ min_sample 次记录 → 该 task 判「饱和（题库过时）」。
+    dataset 非空时仅统计该数据集；否则按数据集分组（无 dataset 记录归 "__all__"）。
+
+    返回：
+        {"available", "datasets": {name: {"saturated", "delta", "tasks",
+         "note", "per_task"}}, "note"}
+        available=False（无历史数据）时 datasets 为空、note 提示待数据积累。
+    """
+    jobs = saturation.get("jobs", []) if isinstance(saturation, dict) else []
+    if not jobs:
+        return {"available": False, "datasets": {}, "note": "暂无历史评测数据，饱和度监测待数据积累后生效"}
+
+    ordered = sorted(jobs, key=lambda j: str(j.get("updated_at", "")))
+
+    def _match(ds: str) -> bool:
+        if dataset is None:
+            return True
+        return ds == dataset or ds == "__all__"
+
+    datasets: dict[str, Any] = {}
+    names = sorted({str(j.get("dataset") or "__all__") for j in ordered if _match(str(j.get("dataset") or "__all__"))})
+    for ds in names:
+        per_task: dict[str, list[tuple[str, float]]] = {}
+        for j in ordered:
+            if str(j.get("dataset") or "__all__") != ds:
+                continue
+            ts = str(j.get("updated_at", ""))
+            for e in j.get("entries", []):
+                if not isinstance(e, dict) or e.get("id") is None:
+                    continue
+                try:
+                    rate = (float(e.get("answer_x", 0)) + float(e.get("answer_y", 0))) / 2.0 / 10.0
+                except (TypeError, ValueError):
+                    continue
+                per_task.setdefault(str(e.get("id")), []).append((ts, rate))
+        task_results: dict[str, dict[str, Any]] = {}
+        for tid, history in per_task.items():
+            series = [r for _, r in sorted(history, key=lambda kv: kv[0])]
+            n = len(series)
+            if n < 2 * min_sample:
+                continue
+            split = n // 2
+            first = _mean(series[:split])
+            second = _mean(series[split:])
+            delta = second - first
+            task_results[tid] = {
+                "saturated": delta >= rise,
+                "delta": round(delta, 4),
+                "samples": n,
+                "rate": round(second, 4),
+            }
+        if not task_results:
+            datasets[ds] = {"saturated": False, "delta": 0.0, "tasks": 0,
+                            "note": f"样本不足（每个题目至少 {min_sample} 次历史记录方可判定）"}
+            continue
+        best = max(task_results.values(), key=lambda v: v["delta"])
+        saturated_any = any(v["saturated"] for v in task_results.values())
+        datasets[ds] = {
+            "saturated": saturated_any,
+            "delta": best["delta"],
+            "tasks": len(task_results),
+            "note": "题库可能过时：历史通过率持续上升" if saturated_any
+                    else "历史得分率未见持续上升趋势",
+            "per_task": task_results,
+        }
+
+    if not datasets:
+        return {"available": False, "datasets": {}, "note": "暂无满足样本要求的历史数据，饱和度监测待数据积累后生效"}
+    return {"available": True, "datasets": datasets,
+            "note": "按数据集分组监测历史得分率升幅（阈值 +15%、每任务样本≥3）"}

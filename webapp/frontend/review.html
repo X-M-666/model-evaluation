@@ -145,6 +145,7 @@ function render(){
         <h3>${esc(item.id)} <span class="badge dim">${esc(item.dimension)}</span>
           <span class="badge lv">${esc(item.difficulty||'')}</span> ${agentBadge}</h3>
         <div style="font-size:13px;color:#8b949e;margin-top:6px;white-space:pre-wrap">${esc(item.prompt)}</div>
+        ${item.context ? `<div class="rubric" style="border-left-color:#3fb950"><strong>📄 参考文档</strong>（题目携带，供核对答案忠实性）\n${esc(item.context)}</div>` : ''}
         ${item.rubric_note ? `<div class="rubric">📋 ${esc(item.rubric_note)}</div>` : ''}
         ${item.test_cases && item.test_cases.length ? `<div class="test-cases"><strong>测试用例参考：</strong>${item.test_cases.map(tc=>`<div class="tc">· ${esc(tc.input)} → ${esc(tc.expected)}</div>`).join('')}</div>` : ''}
         <div class="answer-grid">

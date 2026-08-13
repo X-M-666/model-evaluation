@@ -188,11 +188,45 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 
     <label style="margin-top:16px">已有评测集</label>
     <div id="dataset-list" class="dataset-list"><em>加载中...</em></div>
+    <div id="saturation-hint" style="display:none;margin-top:10px;padding:10px;border:1px solid #f0883e;border-radius:6px;background:rgba(240,136,62,.08);font-size:13px"></div>
     <div style="margin-top:10px">
       <label>选择评测集</label>
       <select id="ds-select"><option value="">（未选择）</option></select>
     </div>
   </div>
+</div>
+</div>
+
+<!-- LLM 出题（迭代四） -->
+<div class="card">
+<h2>LLM 出题 <span class="hint">AI 生成题目 → 人工审核 → 入库为评测集</span></h2>
+<div class="param-row">
+  <label style="flex:0 0 220px">出题模型配置<div class="hint">OpenAI 兼容；留空则复用上方评审模型</div>
+    <input id="gen-url" placeholder="https://api.openai.com/v1"></label>
+  <label style="flex:0 0 220px">模型名称<div class="hint">可选</div><input id="gen-name" placeholder="gpt-4o"></label>
+  <label style="flex:0 0 220px">API Key<div class="hint">仅内存，不落盘</div><input id="gen-key" type="password" placeholder="sk-..."></label>
+</div>
+<div class="param-row">
+  <label style="flex:0 0 220px">维度<input id="gen-dim" list="dim-list" value="知识能力"></label>
+  <datalist id="dim-list"></datalist>
+  <label style="flex:0 0 220px">题型
+    <select id="gen-type"><option value="判别式">判别式</option><option value="生成式">生成式</option></select>
+  </label>
+  <label style="flex:0 0 220px">生成数量<div class="hint">1-20，默认5</div><input id="gen-count" type="number" value="5" min="1" max="20"></label>
+</div>
+<div class="param-row">
+  <label style="flex:0 0 220px">目标评测集<div class="hint">留空=审核后自动命名</div><input id="gen-dataset" placeholder="如：生成集A"></label>
+  <label style="flex:1 0 220px">
+    <input type="checkbox" id="gen-cot" checked> 启用 CoT 思考提示
+    <input type="checkbox" id="gen-ctx" style="margin-left:14px"> 生成带参考文档（RAG context）的题目
+  </label>
+</div>
+<button class="btn-upload" id="genBtn">生成题目</button>
+<span id="gen-result" class="hint" style="margin-left:10px"></span>
+
+<div style="margin-top:16px">
+  <label>待审核批次</label>
+  <div id="gen-batches" class="dataset-list"><em>加载中...</em></div>
 </div>
 </div>
 
@@ -864,6 +898,79 @@ document.getElementById('model-list').addEventListener('click', e=>{
   if(lib) lib.value = btn.dataset.id;
 });
 loadModels();
+
+// ---- LLM 出题（迭代四） ----
+function genPayload(){
+  const count = Math.max(1, Math.min(20, parseInt(document.getElementById('gen-count').value || '5', 10) || 5));
+  const url = document.getElementById('gen-url').value.trim() || document.getElementById('j-url').value.trim();
+  const key = document.getElementById('gen-key').value.trim() || document.getElementById('j-key').value.trim();
+  const name = document.getElementById('gen-name').value.trim() || document.getElementById('j-name').value.trim();
+  const options = {cot: document.getElementById('gen-cot').checked,
+                   with_context: document.getElementById('gen-ctx').checked};
+  return {
+    gen_config: {url: url || 'https://api.openai.com/v1', key, name, temperature: 0.7, max_tokens: 1000},
+    dimension: document.getElementById('gen-dim').value.trim() || '知识能力',
+    task_type: document.getElementById('gen-type').value,
+    count,
+    target_dataset: document.getElementById('gen-dataset').value.trim() || null,
+    options,
+  };
+}
+async function startGen(){
+  const res = document.getElementById('gen-result');
+  res.textContent = '生成中...';
+  try{
+    const r = await apiFetch(API+'/api/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(genPayload())});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || ('HTTP '+r.status));
+    res.textContent = `已创建批次 ${d.gen_id}（${d.count} 题），完成后请进入批次审核页`;
+    loadGenBatches();
+  }catch(e){ res.textContent = '出题失败：' + e.message; }
+}
+async function loadGenBatches(){
+  const box = document.getElementById('gen-batches');
+  try{
+    const r = await apiFetch(API+'/api/generate');
+    const d = await r.json();
+    const batches = d.batches || [];
+    window.__genList = batches;
+    if(!batches.length){ box.innerHTML = '<em>暂无待审核批次</em>'; return; }
+    const ST = {ready:['ready','可审核','#3fb950'], partial:['partial','部分完成','#f0883e'],
+                generating:['generating','生成中','#58a6ff'], error:['error','出错','#f85149']};
+    box.innerHTML = batches.map((b,i)=>{
+      const [cls, txt, col] = ST[b.state] || [b.state, b.state, '#8b949e'];
+      const stats = b.items ? `${b.items.approved}/${b.items.total}` : '-';
+      return `<div class="ds-item">
+        <div><strong>${esc(b.gen_id)}</strong> <span class="badge dim">${esc(b.dimension||'')}</span>
+          <span style="color:${col}">● ${txt}</span></div>
+        <div class="hint" style="font-size:12px">${esc(b.gen_name||'')} · 已审核 ${stats} · ${esc(b.created_at||'')}</div>
+        <div style="margin-top:6px">
+          <a href="/gen_review.html?gen=${b.gen_id}" class="btn-upload" style="text-decoration:none;padding:4px 12px;font-size:12px">审核</a>
+        </div>
+      </div>`;
+    }).join('');
+  }catch(e){ box.innerHTML = '<em>批次加载失败：'+esc(e.message)+'</em>'; }
+}
+document.getElementById('genBtn').addEventListener('click', startGen);
+document.getElementById('dim-list').innerHTML = dims.map(d=>`<option value="${esc(d)}">`).join('');
+loadGenBatches();
+
+// ---- 饱和度监测提示（迭代五） ----
+async function loadSaturationHint(){
+  const el = document.getElementById('saturation-hint');
+  try{
+    const r = await apiFetch(API+'/api/stats/saturation');
+    const d = await r.json();
+    const t = d.trend || {};
+    if(!t.available || !t.datasets){ el.style.display = 'none'; return; }
+    const saturated = Object.entries(t.datasets)
+      .filter(([,v])=>v.saturated).map(([k])=>esc(k));
+    if(!saturated.length){ el.style.display = 'none'; return; }
+    el.innerHTML = `⚠️ <strong>基准饱和度提示</strong>：评测集「${saturated.join('、')}」历史得分率持续上升（题库可能过时），建议更新题目或人工复核修订。`;
+    el.style.display = 'block';
+  }catch(_){ el.style.display = 'none'; }
+}
+loadSaturationHint();
 </script>
 </body>
 </html>

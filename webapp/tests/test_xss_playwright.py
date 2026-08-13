@@ -108,7 +108,7 @@ def test_payload_dataset_renders_without_execution(_page):
     # 注入内容不得产生任何 HTML 元素
     assert _page.locator('.ds-item img, .ds-item svg, .ds-item script').count() == 0
     # 维度文本应原样展示（含引号载荷），只是纯文本
-    assert "XSS_QUOTE" in _page.locator(".ds-item").first.text_content()
+    assert "XSS_QUOTE" in _page.locator(".ds-item", has_text="XSS_QUOTE").first.text_content()
     # 功能不回归：dims 复选框正常渲染（迭代一：八大维度）
     assert _page.locator("#dims-box input[type=checkbox]").count() == 8
 

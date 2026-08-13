@@ -52,6 +52,10 @@ td{color:#c9d1d9}
 <div class="wrap">
 <h1>📊 评测报告</h1>
 <p class="sub" id="subInfo">加载中...</p>
+<div style="margin:8px 0 12px" id="exportBar" style="display:none">
+  <button id="exportBtn" style="padding:8px 16px;background:#238636;color:#fff;border:none;border-radius:6px;cursor:pointer">⬇ 导出评测包（zip）</button>
+  <a href="#" id="badcaseLink" style="display:none;padding:8px 16px;background:#8957e5;color:#fff;border-radius:6px;text-decoration:none;margin-left:10px">🕵️ Bad Case（<span id="badcaseCount">0</span>）</a>
+</div>
 <div style="margin-bottom:16px">
 <a href="/">← 返回配置</a>
 <span style="margin:0 8px;color:#30363d">|</span>
@@ -85,6 +89,9 @@ td{color:#c9d1d9}
 <h2>精确分析（规则化统计）</h2>
 <div id="analysisBody"></div>
 </div>
+
+<div class="card" id="groundingCard" style="display:none"></div>
+<div class="card" id="badcaseCard" style="display:none"></div>
 
 <div class="card" id="metaEvalCard" style="display:none"></div>
 <div class="card" id="consistencyCard" style="display:none"></div>
@@ -197,6 +204,8 @@ function renderReport(data){
     renderAnalysis(rep.analysis || []);
     renderMetaEval(rep);
     renderConsistency(rep);
+    renderGrounding(rep);
+    renderBadcases();
   }else{
     document.getElementById('statCard').style.display='none';
     document.querySelectorAll('.chart-card').forEach(c=>c.style.display='none');
@@ -247,6 +256,79 @@ function renderConsistency(rep){
       ${perRows || '<tr><td colspan="3" style="color:#8b949e">无逐题数据</td></tr>'}
     </table>`;
 }
+
+// ---- Bad Case 概览（迭代五） ----
+async function renderBadcases(){
+  const link = document.getElementById('badcaseLink');
+  try{
+    const r = await apiFetch(`/api/badcases/stats?job_id=${jobId}`);
+    const s = await r.json();
+    document.getElementById('badcaseCount').textContent = s.total || 0;
+    if(s.total > 0){
+      link.style.display = 'inline-block';
+      link.href = `/badcases.html?job=${jobId}`;
+      const el = document.getElementById('badcaseCard');
+      el.style.display = 'block';
+      const catColor = {事实错误:'#f0883e', 语义错误:'#58a6ff', 推理错误:'#8957e5', 安全偏见输出:'#f85149', 执行错误:'#3fb950', 未归类:'#8b949e'};
+      const topCat = Object.entries(s.by_category||{}).sort((a,b)=>b[1]-a[1]).slice(0,3)
+        .map(([k,v])=>`<span class="badge" style="background:${catColor[k]||'#30363d'}">${esc(k)} ${v}</span>`).join(' ');
+      el.innerHTML = `<h2>🕵️ Bad Case 概览</h2>
+        <p style="font-size:13px;color:#c9d1d9">本评测自动产出 <strong>${s.total}</strong> 条 bad case（已确认 ${s.confirmed}），分类 top：${topCat || '—'}</p>
+        <a href="/badcases.html?job=${jobId}" style="font-size:13px">进入 Bad Case 库 →</a>`;
+    }
+  }catch(_){ /* 无数据/失败静默 */ }
+}
+
+// ---- RAG 忠实性段（迭代四，带 context 的题目） ----
+function renderGrounding(rep){
+  const el = document.getElementById('groundingCard');
+  const g = rep?.metrics?.grounding;
+  if(!g){ el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  const fmtPct = n => n == null ? '—' : (n*100).toFixed(0)+'%';
+  const side = (label, col, s) => {
+    const c = s || {};
+    const f = c.faithfulness, r = c.answer_relevancy;
+    const grounded = c.grounded ? '<span style="color:#3fb950">✔ 有据</span>'
+      : (c.reason === 'no_answer' ? '<span style="color:#f85149">无回答</span>'
+         : '<span style="color:#f85149">⚠ 无据/低支持</span>');
+    return `<tr><td>${label}</td><td style="color:${col}">${fmtPct(f)}</td><td>${fmtPct(r)}</td><td>${grounded}</td></tr>`;
+  };
+  const rows = (rep.metrics.per_task||[]).filter(t=>t.grounding).map(t=>`
+    <tr><td style="color:#c9d1d9">${esc(t.id)}</td>
+      ${side('答案X', '#58a6ff', t.grounding.x)}
+      ${side('答案Y', '#f0883e', t.grounding.y)}
+    </tr>`).join('');
+  el.innerHTML = `<h2>RAG 忠实性（grounding，${g.context_tasks} 题带参考文档）</h2>
+    <p class="hint" style="color:#8b949e;font-size:12px;margin:4px 0 8px">忠实度=答案与参考文档的 n-gram 相似度；≥${(g.threshold*100).toFixed(0)}% 判为有据。X 侧有据 ${g.grounded_x}/${g.context_tasks}，Y 侧有据 ${g.grounded_y}/${g.context_tasks}</p>
+    <table style="width:100%;font-size:13px;border-collapse:collapse">
+      <tr style="color:#8b949e;text-align:left"><th style="padding:4px 6px">题目</th><th style="padding:4px 6px">侧</th><th style="padding:4px 6px">忠实度</th><th style="padding:4px 6px">相关性</th><th style="padding:4px 6px">判定</th></tr>
+      ${rows}
+    </table>`;
+}
+
+// ---- 导出评测包（迭代四） ----
+async function exportZip(){
+  const token = getToken();
+  const headers = {};
+  if(token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(`/api/eval/${jobId}/export`, {headers});
+  if(!r.ok){
+    const t = await r.text().catch(()=> '');
+    alert('导出失败：' + (t || r.status));
+    return;
+  }
+  const blob = await r.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `eval-${jobId}.zip`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+document.addEventListener('DOMContentLoaded', () => {
+  const b = document.getElementById('exportBtn');
+  if(b) b.addEventListener('click', exportZip);
+});
 
 function renderCharts(rep){
   const ch = rep.charts || {};

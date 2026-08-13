@@ -11,7 +11,10 @@ from __future__ import annotations
 import statistics
 from typing import Any
 
-from backend.engine.metrics import compute_task_metrics
+from backend.engine.metrics import (
+    GROUNDING_SUPPORT_THRESHOLD, compute_task_metrics,
+    metric_answer_relevancy, metric_grounding_faithfulness,
+)
 from backend.engine.stats import MIN_SAMPLE, significance_note
 from backend.engine.tasks import STABILITY_DIMENSION
 
@@ -297,22 +300,64 @@ def _build_metrics(
 
     score_map = {s["id"]: s for s in verdict.get("scores", [])}
     per_task: list[dict[str, Any]] = []
+    grounding_ctx_tasks = 0
+    grounding_grounded_x = 0
+    grounding_grounded_y = 0
     for t in task_set.get("tasks", []):
         sid = t["id"]
         sc = score_map.get(sid, {})
-        per_task.append({
+        item: dict[str, Any] = {
             "id": sid,
             "dimension": t.get("dimension", "自定义"),
             "x": compute_task_metrics(t, entries("a" if x_file == "a" else "b", sid),
                                       sc.get("answer_x")),
             "y": compute_task_metrics(t, entries("b" if y_file == "b" else "a", sid),
                                       sc.get("answer_y")),
-        })
+        }
+        ctx = (t.get("context") or "").strip()
+        if ctx:
+            gx = _grounding_side(ctx, entries("a" if x_file == "a" else "b", sid),
+                                 t.get("prompt", ""))
+            gy = _grounding_side(ctx, entries("b" if y_file == "b" else "a", sid),
+                                 t.get("prompt", ""))
+            item["grounding"] = {"x": gx, "y": gy}
+            grounding_ctx_tasks += 1
+            grounding_grounded_x += int(gx["grounded"])
+            grounding_grounded_y += int(gy["grounded"])
+        per_task.append(item)
     provider = {
         "kind": (embedding_config or {}).get("provider") or "auto",
         "error": (embedding_config or {}).get("error"),
     }
-    return {"provider": provider, "per_task": per_task}
+    result: dict[str, Any] = {"provider": provider, "per_task": per_task}
+    if grounding_ctx_tasks:
+        result["grounding"] = {
+            "context_tasks": grounding_ctx_tasks,
+            "grounded_x": grounding_grounded_x,
+            "grounded_y": grounding_grounded_y,
+            "threshold": GROUNDING_SUPPORT_THRESHOLD,
+        }
+    return result
+
+
+def _grounding_side(context: str, side_entries: list[dict[str, Any]],
+                    prompt: str) -> dict[str, Any]:
+    """单侧 RAG 忠实性：最近一次成功运行取 raw_answer；缺失视为不通过。"""
+    raw = ""
+    for e in (side_entries or []):
+        if (e.get("api_info") or {}).get("status") == "ok" and e.get("raw_answer"):
+            raw = e["raw_answer"]
+    if not raw.strip():
+        return {"faithfulness": None, "answer_relevancy": None,
+                "grounded": False, "reason": "no_answer"}
+    faith = metric_grounding_faithfulness(raw, context)
+    rel = metric_answer_relevancy(raw, prompt)
+    return {
+        "faithfulness": faith,
+        "answer_relevancy": rel,
+        "grounded": round(faith, 4) >= GROUNDING_SUPPORT_THRESHOLD,
+        "reason": None,
+    }
 
 
 def _build_significance(
