@@ -188,7 +188,7 @@ def test_upload_whitespace_filename_stem_falls_back(client):
     assert r.json()["name"] == "ok"
 
 
-# ---------------- 并发上限 ----------------
+# ---------------- 并发调度（迭代七：排队替代 429） ----------------
 
 PUBLIC_URL = "https://8.8.8.8/v1"
 
@@ -200,27 +200,44 @@ def _payload() -> dict:
     }
 
 
-def test_concurrency_limit_reached_429(client):
+def test_concurrency_over_quota_queues(client):
+    """并发超配额不再 429：新任务排队等待调度。"""
+    main_module._SCHEDULER.clear()
     main_module._jobs.clear()
     for i in range(2):
         main_module._jobs[f"fake-job-{i}"] = {
             "state": "executing",
             "config": {"model_a": {"url": "https://example.com/v1", "name": "x"}},
         }
+    # 调度器运行集同步填满配额（模拟两个任务占用槽位）
+    for i in range(2):
+        main_module._SCHEDULER.submit(f"fake-job-{i}")
+        main_module._SCHEDULER.next_batch()
     r = client.post("/api/eval/start", json=_payload())
-    assert r.status_code == 429
-    assert "2" in r.json()["detail"]
+    assert r.status_code == 200
+    jid = r.json()["job_id"]
+    assert main_module._jobs[jid]["state"] == "queued"
+    view = main_module._SCHEDULER.queue_view()
+    assert view[0]["job_id"] == jid and view[0]["position"] == 1
+    main_module._jobs.clear()
+    main_module._SCHEDULER.clear()
 
 
 def test_concurrency_pending_counts(client):
+    main_module._SCHEDULER.clear()
     main_module._jobs.clear()
     for i in range(2):
         main_module._jobs[f"fake-pending-{i}"] = {
             "state": "pending",
             "config": {"model_a": {"url": "https://example.com/v1", "name": "x"}},
         }
+        main_module._SCHEDULER.submit(f"fake-pending-{i}")
+        main_module._SCHEDULER.next_batch()
     r = client.post("/api/eval/start", json=_payload())
-    assert r.status_code == 429
+    assert r.status_code == 200
+    assert main_module._jobs[r.json()["job_id"]]["state"] == "queued"
+    main_module._jobs.clear()
+    main_module._SCHEDULER.clear()
 
 
 def test_concurrency_mock_not_counted(client, monkeypatch):

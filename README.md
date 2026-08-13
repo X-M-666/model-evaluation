@@ -51,7 +51,7 @@ $env:MODEL_DUEL_RATE_LIMIT = "30"                  # 可选：每 IP 每分钟�
 - 共享模式下 `/docs`、`/openapi.json` 等接口文档同样需要令牌访问（单机模式保持开放便于调试）
 - 写请求（POST/PUT/DELETE）校验 Origin/Referer 与 Host 同源，阻止跨站请求伪造（CSRF）
 - 写请求限流：共享模式下每 IP 每分钟最多 30 次（`MODEL_DUEL_RATE_LIMIT` 可调）
-- 评测接口并发上限 2 个任务（防资源耗尽），文件上传上限 5MB、JSON 粘贴上限 2MB、数据集上限 200 题；超限请求在读取阶段即被截断，不会整体读入内存
+- 评测并发配额默认 2 个任务（防资源耗尽，`MODEL_DUEL_CONCURRENCY` 可调）；超并发任务自动进入优先级队列排队（任务调度页可调优先级/取消，benchmark 批次复用同一队列）；文件上传上限 5MB、JSON 粘贴上限 2MB、数据集上限 200 题；超限请求在读取阶段即被截断，不会整体读入内存
 - SSE 进度流（EventSource 无法携带自定义 header）：前端先通过已认证的 `POST /api/eval/{job_id}/events/ticket` 换取**短时（默认 60 秒）、单次、仅限该任务 events 路由**的随机 ticket，URL 只携带 ticket，用后即焚；长期管理员令牌不出现在 URL、Referer 或访问日志中，反向代理 / WAF / APM 日志不会记录长期令牌（`MODEL_DUEL_SSE_TICKET_TTL` 可调有效期）。ticket 认证失败（如浏览器断线自动重连复用已消费 ticket）静默返回 `204` 且不记审计，避免日志与审计噪声；未携带 ticket 的未认证请求仍返回 `401` 并记录审计
 - **SSRF 防护**：模型 URL 仅允许公网 http/https 目标（自动解析全部 IP，拒绝回环/私网/链路本地/云元数据地址，如 `127.0.0.1`、`169.254.169.254`、`192.168.x.x`、`::1`）；内网网关/代理场景需显式设置 `MODEL_DUEL_ALLOW_PRIVATE_UPSTREAM=1` 放行私网目标
 - 生产环境**建议**置于反向代理后并启用 HTTPS（Origin 校验以浏览器视角的 Host 为准）；共享模式下**必须**启用 TLS 或置于可信反向代理之后，否则令牌与模型凭据会以明文在局域网传输

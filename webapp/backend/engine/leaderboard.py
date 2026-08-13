@@ -34,8 +34,11 @@ def _job_entry(files: dict[str, Any], label: str) -> dict[str, dict[str, Any]]:
 def extract_job_model_scores(job_id: str) -> dict[str, dict[str, dict[str, Any]]] | None:
     """抽取单个 job 的 {model: {task_id: {score, latency_ms, tokens}}}。
 
-    通过 verdict.revealed 归一化 X/Y 侧到真实模型名（a/b 文件标签由
-    answer_x_file/answer_y_file 决定）。无 verdict/无 reveal → None。
+    双盲格式：经 verdict.revealed 归一化 X/Y 侧到真实模型名（answer_x_file/
+    answer_y_file 决定 a/b 文件标签）。
+    单臂格式（迭代七 batch：verdict 无 revealed）：模型名取 config.model_a.name，
+    得分取 scores[].score，延迟/Token 从 answers-a.json 聚合。
+    无 verdict/无法解析 → None。
     """
     files = storage.get_job_files(job_id)
     if not files:
@@ -44,10 +47,10 @@ def extract_job_model_scores(job_id: str) -> dict[str, dict[str, dict[str, Any]]
     if not isinstance(verdict, dict):
         return None
     revealed = verdict.get("revealed") or {}
-    x_name = revealed.get("answer_x") or ""
-    y_name = revealed.get("answer_y") or ""
-    if not x_name or not y_name:
-        return None
+    if not revealed.get("answer_x") or not revealed.get("answer_y"):
+        return _extract_single_arm(files, verdict)
+    x_name = revealed.get("answer_x")
+    y_name = revealed.get("answer_y")
     x_file = revealed.get("answer_x_file") or "a"
     y_file = revealed.get("answer_y_file") or "b"
     ans_a = _job_entry(files, x_file)
@@ -70,6 +73,31 @@ def extract_job_model_scores(job_id: str) -> dict[str, dict[str, dict[str, Any]]
             "latency_ms": (entry_y.get("api_info") or {}).get("latency_ms"),
             "tokens": ((entry_y.get("api_info") or {}).get("prompt_tokens") or 0)
                       + ((entry_y.get("api_info") or {}).get("completion_tokens") or 0),
+        }
+    return out
+
+
+def _extract_single_arm(
+    files: dict[str, Any],
+    verdict: dict[str, Any],
+) -> dict[str, dict[str, dict[str, Any]]] | None:
+    """单臂格式（迭代七 batch 执行单元）：scores[{id,score}] + answers-a。"""
+    cfg = files.get("config.json") or {}
+    model_name = (cfg.get("model_a") or {}).get("name")
+    if not model_name:
+        return None
+    entries = _job_entry(files, "a")
+    out: dict[str, dict[str, dict[str, Any]]] = {model_name: {}}
+    for s in verdict.get("scores", []):
+        tid = s.get("id")
+        if not tid:
+            continue
+        entry = entries.get(tid) or {}
+        out[model_name][tid] = {
+            "score": s.get("score"),
+            "latency_ms": (entry.get("api_info") or {}).get("latency_ms"),
+            "tokens": ((entry.get("api_info") or {}).get("prompt_tokens") or 0)
+                      + ((entry.get("api_info") or {}).get("completion_tokens") or 0),
         }
     return out
 

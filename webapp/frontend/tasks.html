@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>任务调度</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,'Segoe UI',sans-serif;margin:0}
+.wrap{max-width:1080px;margin:0 auto;padding:24px}
+h1{font-size:22px;color:#f0f6fc}
+h2{font-size:15px;color:#f0883e;margin-bottom:8px}
+.sub{color:#8b949e;font-size:13px;margin-top:6px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-top:16px}
+.hint{color:#8b949e;font-size:12px}
+label{display:block;font-size:13px;color:#8b949e;margin-bottom:4px;margin-top:12px}
+input,select{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:13px;box-sizing:border-box}
+input[type=checkbox],input[type=number]{width:auto}
+button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px}
+.btn{background:#1f6feb;color:#fff}
+.btn-ok{background:#238636;color:#fff}
+.btn-danger{background:transparent;color:#f85149;border:1px solid #f85149}
+.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:6px;background:#30363d}
+.badge.q{background:#f0883e;color:#0d1117}
+.badge.run{background:#1f6feb;color:#fff}
+.badge.ok{background:#238636;color:#fff}
+.badge.err{background:#da3633;color:#fff}
+.badge.b{background:#8957e5;color:#fff}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+th,td{padding:6px 10px;border-bottom:1px solid #21262d;text-align:left}
+th{color:#8b949e;font-weight:normal}
+a{color:#58a6ff}
+.loading{text-align:center;padding:40px;color:#8b949e}
+.empty{text-align:center;padding:40px;color:#8b949e}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.bm-models{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
+.bm-models label{display:inline-flex;align-items:center;gap:4px;margin:0;font-size:13px;color:#c9d1d9;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px 10px;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>🗂️ 任务调度</h1>
+<p class="sub" id="subInfo">优先级队列 + 并发配额（<span id="quotaInfo">-</span>）：超并发评测自动排队，可调整优先级 / 取消排队任务</p>
+
+<div class="card">
+<h2>排队中 <span class="badge q" id="qCount">0</span></h2>
+<div id="queuedList"><div class="empty">暂无排队任务</div></div>
+</div>
+
+<div class="card">
+<h2>运行中 <span class="badge run" id="rCount">0</span></h2>
+<div id="runningList"><div class="empty">暂无运行中任务</div></div>
+</div>
+
+<div class="card">
+<h2>benchmark 批次</h2>
+<div class="row" style="margin-top:10px">
+  <label style="flex:1;min-width:180px">评测集
+    <select id="bm-ds"></select>
+  </label>
+  <label style="flex:1;min-width:180px">模型配置库（多选）
+    <div class="bm-models" id="bm-models"></div>
+  </label>
+  <label>轮次 M <input id="bm-rounds" type="number" min="1" max="20" value="1" style="width:70px"></label>
+  <label>优先级 <input id="bm-priority" type="number" min="-10" max="10" value="0" style="width:70px"></label>
+  <label style="flex:1;min-width:200px">评审模型 URL（生成式题单臂）
+    <input id="bm-judge-url" placeholder="可留空（生成式题得分 N/A）">
+  </label>
+  <label>评审模型名 <input id="bm-judge-name" style="width:140px"></label>
+  <label>评审 Key <input id="bm-judge-key" type="password" style="width:140px"></label>
+</div>
+<button class="btn-ok" id="bm-create" style="margin-top:14px">创建 benchmark 批次</button>
+<span class="hint" id="bm-msg"></span>
+<h2 style="margin-top:18px">已有批次</h2>
+<div id="batchList"><div class="empty">暂无批次</div></div>
+</div>
+</div>
+
+<script>
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function getToken(){ return localStorage.getItem('duel_token') || ''; }
+async function apiFetch(url, opts={}){
+  const headers = Object.assign({}, opts.headers);
+  const token = getToken();
+  if(token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(url, Object.assign({}, opts, {headers}));
+  if(r.status === 401) throw new Error('未授权：请在首页顶部设置访问令牌');
+  return r;
+}
+const STATE_BADGE = {queued:'<span class="badge q">排队</span>', executing:'<span class="badge run">执行中</span>',
+  judging:'<span class="badge run">评审中</span>', reviewing:'<span class="badge">人工评审</span>',
+  completed:'<span class="badge ok">完成</span>', error:'<span class="badge err">失败</span>',
+  cancelled:'<span class="badge err">已取消</span>', running:'<span class="badge run">运行中</span>',
+  done:'<span class="badge ok">完成</span>', partial:'<span class="badge err">部分失败</span>'};
+let TIMER = null;
+
+async function load(){
+  const r = await apiFetch('/api/tasks');
+  const d = await r.json();
+  document.getElementById('quotaInfo').textContent =
+    `${d.quota.active}/${d.quota.concurrency} 活跃`;
+  const queued = d.queued || [];
+  const running = d.running || [];
+  document.getElementById('qCount').textContent = queued.length;
+  document.getElementById('rCount').textContent = running.length;
+  document.getElementById('queuedList').innerHTML = queued.length ? `
+    <table><thead><tr><th>位置</th><th>类型</th><th>任务</th><th>模型</th><th>优先级</th><th>操作</th></tr></thead>
+    <tbody>${queued.map(t=>`
+      <tr><td>#${t.position}</td>
+        <td>${t.type==='batch'?'<span class="badge b">batch</span>':'<span class="badge q">评测</span>'}</td>
+        <td><a href="/report.html?job=${esc(t.job_id)}" target="_blank">${esc(t.job_id)}</a>
+          <div class="hint">${esc(t.created_at||'')}</div></td>
+        <td>${esc(t.model_a)}${t.model_b&&t.model_b!==t.model_a?' vs '+esc(t.model_b):''}</td>
+        <td><input type="number" min="-10" max="10" value="${t.priority}"
+            data-jid="${esc(t.job_id)}" class="prio-in" style="width:64px"></td>
+        <td><button class="btn" data-act="prio" data-jid="${esc(t.job_id)}">调整</button>
+            <button class="btn-danger" data-act="cancel" data-jid="${esc(t.job_id)}">取消</button></td></tr>`).join('')}
+    </tbody></table>` : '<div class="empty">暂无排队任务</div>';
+  document.getElementById('runningList').innerHTML = running.length ? `
+    <table><thead><tr><th>类型</th><th>任务</th><th>模型</th><th>状态</th><th>进度</th><th>操作</th></tr></thead>
+    <tbody>${running.map(t=>`
+      <tr><td>${t.type==='batch'?'<span class="badge b">batch</span>':'<span class="badge run">评测</span>'}</td>
+        <td><a href="/report.html?job=${esc(t.job_id)}" target="_blank">${esc(t.job_id)}</a></td>
+        <td>${esc(t.model_a)}${t.model_b&&t.model_b!==t.model_a?' vs '+esc(t.model_b):''}</td>
+        <td>${STATE_BADGE[t.state]||esc(t.state)}</td>
+        <td>${esc(t.progress||'')}</td>
+        <td><button class="btn-danger" data-act="cancel" data-jid="${esc(t.job_id)}">取消</button></td></tr>`).join('')}
+    </tbody></table>` : '<div class="empty">暂无运行中任务</div>';
+  renderBatches(d.batches || []);
+}
+function renderBatches(batches){
+  document.getElementById('batchList').innerHTML = batches.length ? `
+    <table><thead><tr><th>批次</th><th>模型</th><th>状态</th><th>排行榜</th></tr></thead>
+    <tbody>${batches.map(b=>`
+      <tr><td><strong>${esc(b.name||b.batch_id)}</strong>
+          <div class="hint">${esc(b.created_at||'')} · ${esc(b.dataset||'')} · ${b.n_jobs} jobs</div></td>
+        <td>${(b.models||[]).map(esc).join(' / ')}</td>
+        <td>${STATE_BADGE[b.state]||esc(b.state)}</td>
+        <td>${b.leaderboard_id
+          ? `<a href="/leaderboard.html?id=${esc(b.leaderboard_id)}" target="_blank">查看排行榜 →</a>`
+          : '<span class="hint">未生成</span>'}</td></tr>`).join('')}
+    </tbody></table>` : '<div class="empty">暂无批次</div>';
+}
+async function actCancel(jid){
+  if(!confirm('确认取消任务 ' + jid + ' ？（排队中直接移除，运行中终止并删除）')) return;
+  try{
+    const r = await apiFetch('/api/history/' + jid, {method:'DELETE'});
+    if(!r.ok) throw new Error((await r.json()).detail || 'HTTP '+r.status);
+    load();
+  }catch(e){ alert('取消失败：' + e.message); }
+}
+async function actPrio(jid, input){
+  try{
+    const r = await apiFetch('/api/tasks/' + jid + '/priority', {method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({priority: parseInt(input.value) || 0})});
+    if(!r.ok) throw new Error((await r.json()).detail || 'HTTP '+r.status);
+    load();
+  }catch(e){ alert('调整失败：' + e.message); }
+}
+async function loadDatasets(){
+  const r = await apiFetch('/api/datasets');
+  const list = ((await r.json()).datasets) || [];
+  document.getElementById('bm-ds').innerHTML = list.map(d=>
+    `<option value="${esc(d.name)}">${esc(d.name)}（${d.task_count} 题）</option>`).join('');
+}
+async function loadModels(){
+  const r = await apiFetch('/api/models');
+  const list = ((await r.json()).models) || [];
+  document.getElementById('bm-models').innerHTML = list.length ? list.map(m=>
+    `<label><input type="checkbox" value="${esc(m.id)}"> ${esc(m.name)}${m.has_key?'':'（Key 未补录）'}</label>`).join('')
+    : '<span class="hint">暂无模型配置（先到首页配置库注册）</span>';
+}
+async function createBatch(){
+  const ids = Array.from(document.querySelectorAll('#bm-models input:checked')).map(i=>i.value);
+  const msg = document.getElementById('bm-msg');
+  if(ids.length < 2){ msg.textContent = '请至少选择 2 个模型'; return; }
+  const judgeUrl = document.getElementById('bm-judge-url').value.trim();
+  const body = {
+    dataset_name: document.getElementById('bm-ds').value,
+    model_ids: ids,
+    rounds: parseInt(document.getElementById('bm-rounds').value) || 1,
+    priority: parseInt(document.getElementById('bm-priority').value) || 0,
+    review: judgeUrl ? {mode:'pure_agent', judge:{
+      url: judgeUrl,
+      name: document.getElementById('bm-judge-name').value.trim() || 'judge',
+      key: document.getElementById('bm-judge-key').value.trim() || null,
+      temperature: 0.0, max_tokens: 4096,
+    }} : null,
+  };
+  msg.textContent = '提交中...';
+  try{
+    const r = await apiFetch('/api/benchmark', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || ('HTTP '+r.status));
+    msg.textContent = '已创建批次：' + d.batch_id + '（' + d.jobs.length + ' 个执行单元）';
+    load();
+  }catch(e){ msg.textContent = '失败：' + e.message; }
+}
+document.getElementById('queuedList').addEventListener('click', e=>{
+  const btn = e.target.closest('button[data-act]');
+  if(!btn) return;
+  if(btn.dataset.act === 'cancel') actCancel(btn.dataset.jid);
+  if(btn.dataset.act === 'prio'){
+    const input = document.querySelector(`.prio-in[data-jid="${btn.dataset.jid}"]`);
+    actPrio(btn.dataset.jid, input);
+  }
+});
+document.getElementById('runningList').addEventListener('click', e=>{
+  const btn = e.target.closest('button[data-act="cancel"]');
+  if(btn) actCancel(btn.dataset.jid);
+});
+document.getElementById('bm-create').addEventListener('click', createBatch);
+async function init(){
+  await loadDatasets();
+  await loadModels();
+  await load();
+  TIMER = setInterval(load, 3000);  // 轮询兜底（队列进度）
+}
+init().catch(e=>{ document.getElementById('queuedList').innerHTML = '<div class="loading">加载失败: '+esc(e.message)+'</div>'; });
+window.addEventListener('beforeunload', ()=>{ if(TIMER) clearInterval(TIMER); });
+</script>
+</body>
+</html>

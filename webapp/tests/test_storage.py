@@ -85,6 +85,21 @@ def test_state_executing_answers_a_only():
     assert storage._job_state(storage.BASE_DIR / _jid("st-a")) == "pending"
 
 
+def test_state_queued_config_only():
+    """迭代七：仅 config.json（tasks.json 延后落盘）→ queued。"""
+    _write(_jid("st-q"), "config.json", "{}")
+    assert storage._job_state(storage.BASE_DIR / _jid("st-q")) == "queued"
+
+
+def test_state_queued_then_executing():
+    """落盘 tasks.json 后 queued → executing（排队 → 派发语义）。"""
+    jid = _jid("st-q2")
+    _write(jid, "config.json", "{}")
+    assert storage._job_state(storage.BASE_DIR / jid) == "queued"
+    _write(jid, "tasks.json", "{}")
+    assert storage._job_state(storage.BASE_DIR / jid) == "executing"
+
+
 def test_state_reviewing_both_answers():
     _write(_jid("st-rev"), "answers-a.json", "{}")
     _write(_jid("st-rev"), "answers-b.json", "{}")
@@ -354,3 +369,54 @@ def test_saturation_corrupt_recovers_empty():
     storage.SATURATION_FILE.parent.mkdir(parents=True, exist_ok=True)
     storage.SATURATION_FILE.write_text("{broken", encoding="utf-8")
     assert storage.get_saturation() == {"jobs": []}
+
+
+# ---------------- 迭代七：benchmark 批次 ----------------
+
+def _bid(tag: str) -> str:
+    return "batch_" + _jid(tag)
+
+
+def test_batch_crud():
+    storage.save_batch(_bid("b1"), {"batch_id": _bid("b1"), "state": "running",
+                                    "jobs": ["j1"], "models": ["m1"]})
+    data = storage.load_batch(_bid("b1"))
+    assert data["state"] == "running"
+    assert storage.load_batch(_bid("nope")) is None
+    summary = {x["batch_id"]: x for x in storage.list_batches()}
+    assert summary[_bid("b1")]["n_jobs"] == 1
+
+
+def test_batch_id_validation():
+    with pytest.raises(ValueError):
+        storage.save_batch("../bad", {})
+    assert storage.is_valid_batch_id(_bid("ok")) is True
+    assert storage.is_valid_batch_id("batch_bad") is False
+
+
+def test_batch_corrupt_recovers_none():
+    storage._ensure_batches_dir()
+    (storage.BATCHES_DIR / f"{_bid('c')}.json").write_text("{broken", encoding="utf-8")
+    assert storage.load_batch(_bid("c")) is None
+
+
+# ---------------- 迭代七：断点续跑增量答案 ----------------
+
+def test_answers_inc_idempotent_merge():
+    jid = _jid("inc1")
+    storage.save_answers_inc(jid, "T1", {"id": "T1", "raw_answer": "a1"})
+    storage.save_answers_inc(jid, "T2", {"id": "T2", "raw_answer": "a2"})
+    storage.save_answers_inc(jid, "T1", {"id": "T1", "raw_answer": "a1v2"})  # 幂等覆盖
+    data = storage.load_answers_inc(jid)
+    assert set(data) == {"T1", "T2"}
+    assert data["T1"]["raw_answer"] == "a1v2"
+    assert storage.partial_answers_count(jid) == 2
+
+
+def test_answers_inc_missing_and_corrupt():
+    assert storage.load_answers_inc(_jid("inc-none")) == {}
+    jid = _jid("inc-bad")
+    storage.save_answers_inc(jid, "T1", {})
+    (storage.BASE_DIR / jid / "answers-inc.json").write_text("{broken", encoding="utf-8")
+    assert storage.load_answers_inc(jid) == {}
+    assert storage.partial_answers_count(jid) == 0

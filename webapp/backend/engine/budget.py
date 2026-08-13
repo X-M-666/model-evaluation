@@ -23,18 +23,25 @@ def estimate_tokens(
     task_count: int,
     repeat_n: int,
     judge_mode: str = "human",
+    n_models: int = 1,
 ) -> dict[str, Any]:
-    """预估总 token 消耗（执行 + 评审两段）。"""
+    """预估总 token 消耗（执行 + 评审两段）。
+
+    n_models（迭代七）：benchmark 批次按模型数放大（执行段 ×N、
+    评审段 ×N×题数）；旧调用缺省 1，零破坏。
+    """
     n = max(task_count, 0)
     rounds = max(repeat_n, 1)
-    exec_tokens = n * rounds * EXEC_PER_TASK_TOKENS
-    judge_tokens = n * JUDGE_PER_TASK_TOKENS if judge_mode == "pure_agent" else 0
+    models = max(n_models, 1)
+    exec_tokens = n * rounds * models * EXEC_PER_TASK_TOKENS
+    judge_tokens = n * models * JUDGE_PER_TASK_TOKENS if judge_mode == "pure_agent" else 0
     return {
         "execution_tokens": exec_tokens,
         "judging_tokens": judge_tokens,
         "total": exec_tokens + judge_tokens,
         "tasks": n,
         "rounds": rounds,
+        "models": models,
         "judge_mode": judge_mode,
     }
 
@@ -44,6 +51,7 @@ def check_budget(
     task_count: int,
     repeat_n: int,
     judge_mode: str = "human",
+    n_models: int = 1,
 ) -> dict[str, Any]:
     """预算检查（纯计算）。
 
@@ -60,7 +68,7 @@ def check_budget(
     cfg = budget_config or {}
     limit = int(cfg.get("max_tokens") or 0)
     mode = cfg.get("mode") or "warn"
-    est = estimate_tokens(task_count, repeat_n, judge_mode)
+    est = estimate_tokens(task_count, repeat_n, judge_mode, n_models)
     if limit <= 0:
         return {"limited": False, "allowed": True, "mode": mode,
                 "estimated": est["total"], "limit": 0, "exceed": 0}

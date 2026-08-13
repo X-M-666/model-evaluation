@@ -202,15 +202,66 @@ def test_iter6_pages_render_without_js_errors(_page):
     _page.wait_for_selector("#kpiCards")
     assert _page.locator("#cpuVal").is_visible()
 
+    _page.goto(f"{BASE}/tasks.html")
+    _page.wait_for_selector("#bm-create")
+    assert _page.locator("#bm-create").is_visible()
+
     _page.goto(f"{BASE}/")
     _page.wait_for_timeout(300)
-    # index 入口链接
+    # 入口链接
+    assert _page.locator('a[href="/tasks.html"]').count() == 1
     assert _page.locator('a[href="/perturb.html"]').count() == 1
     assert _page.locator('a[href="/leaderboard.html"]').count() == 1
     assert _page.locator('a[href="/dashboard.html"]').count() == 1
 
     assert not page_errors, f"页面 JS 异常: {page_errors}"
     assert not csp_violations, f"CSP 违规: {csp_violations}"
+
+
+def test_iter7_tasks_page_queue_flow(_page):
+    """任务调度页：排队任务展示 + 优先级调整 + 取消（API 驱动）。"""
+    page_errors = []
+    _page.on("pageerror", lambda e: page_errors.append(str(e)))
+    _page.goto(f"{BASE}/tasks.html")
+    _page.wait_for_selector("#bm-create")
+
+    # 填满配额制造排队任务（临时替换调度器，测试结束恢复）
+    from backend import main as main_module
+    from backend.scheduler import Scheduler
+    orig = main_module._SCHEDULER
+    sched = Scheduler(concurrency=1)
+    main_module._SCHEDULER = sched
+    jid = "slot7-1"
+    main_module._jobs[jid] = {"state": "executing",
+                              "config": {"model_a": {"url": "https://8.8.8.8/v1",
+                                                     "name": "s"}}}
+    sched.submit(jid)
+    sched.next_batch()
+    payload = json.dumps({
+        "model_a": {"url": "https://8.8.8.8/v1", "key": "k", "name": "Q模型A",
+                    "temperature": 0.7, "max_tokens": 100},
+        "model_b": {"url": "https://8.8.8.8/v1", "key": "k", "name": "Q模型B",
+                    "temperature": 0.7, "max_tokens": 100},
+    })
+    r = _page.request.post(f"{BASE}/api/eval/start", data=payload,
+                           headers={"Content-Type": "application/json"})
+    assert r.ok, r.text
+    queued_jid = r.json()["job_id"]
+
+    try:
+        _page.reload()
+        _page.wait_for_selector("#queuedList table")
+        assert _page.locator("#queuedList .prio-in").count() >= 1
+        # 取消排队任务
+        _page.on("dialog", lambda d: d.accept())
+        _page.locator('#queuedList button[data-act="cancel"]').first.click()
+        _page.wait_for_timeout(600)
+        assert _page.locator("#queuedList table").count() == 0
+        assert not page_errors, f"tasks.html JS 异常: {page_errors}"
+    finally:
+        main_module._SCHEDULER = orig
+        main_module._jobs.pop(jid, None)
+        main_module._jobs.pop(queued_jid, None)
 
 
 def test_iter6_perturb_page_runs_pipeline(_page, tmp_path, monkeypatch):

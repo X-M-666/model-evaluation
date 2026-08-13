@@ -65,6 +65,8 @@ from backend.storage import (
     update_badcase_attribution, export_badcases_json,
     save_perturb, load_perturb, list_perturbs, is_valid_perturb_id,
     save_leaderboard, load_leaderboard, list_leaderboards, is_valid_lb_id,
+    save_batch, load_batch, list_batches, is_valid_batch_id,
+    save_answers_inc, load_answers_inc, partial_answers_count,
 )
 from backend.gold import ensure_demo_gold, compute_meta_eval
 from backend.engine.rag_demo import ensure_demo_rag_dataset
@@ -79,10 +81,11 @@ from backend.engine.perturb import (
 from backend.engine.leaderboard import build_leaderboard, LeaderboardError
 from backend.engine.dashboard import build_jobs_trend
 from backend.hwmon import collect_hw
+from backend.scheduler import Scheduler
 from backend.schemas import (
     StartRequest, StartResponse, ReviewSubmission, ModelRegisterRequest,
     GoldSetRequest, GenerateRequest, ReviewDecisionRequest,
-    PerturbRequest, LeaderboardRequest,
+    PerturbRequest, LeaderboardRequest, BenchmarkRequest, PriorityRequest,
 )
 from backend.security import redact_sensitive, sanitize_config
 from backend.models_registry import (
@@ -117,8 +120,9 @@ def _require_job_id(job_id: str) -> str:
 
 
 def _task_done(job_id: str, task: asyncio.Task):
-    """后台任务结束回调：回收引用并消费异常，避免未获取 Task 异常告警。"""
+    """后台任务结束回调：回收引用、释放调度配额并消费异常，避免未获取 Task 异常告警。"""
     _tasks.pop(job_id, None)
+    _scheduler_release(job_id)  # 迭代七：终态/取消兜底释放配额
     if task.cancelled():
         return
     try:
@@ -143,8 +147,23 @@ async def _shutdown_cancel_all():
 async def lifespan(_app: FastAPI):
     ensure_demo_gold()  # 迭代三：gold 目录为空时载入 demo 金标（source="demo"）
     ensure_demo_rag_dataset()  # 迭代四：内置 RAG 演示集（带 context 参考文档）
+    _settle_queued_on_restart()  # 迭代七：重启后排队任务沉降 error（v1 内存队列）
     yield
     await _shutdown_cancel_all()
+
+
+def _settle_queued_on_restart() -> None:
+    """重启沉降：磁盘态 queued（仅 config.json）任务置 error，提示不自动恢复。
+
+    v1 内存队列不持久化，排队任务随进程重启丢失；error 标记保证历史列表
+    可见且不悬置（磁盘无 cancelled 态，error 可见性等价）。
+    """
+    for j in list_jobs():
+        if j.get("state") == "queued":
+            try:
+                save_error(j["job_id"], "排队任务随重启取消（v1 内存队列，不自动恢复，可删除）")
+            except Exception:
+                continue
 
 
 app = FastAPI(title="模型对决评测平台", version="0.3.0", lifespan=lifespan)
@@ -152,6 +171,41 @@ app.middleware("http")(security_middleware)
 
 _jobs: dict[str, dict] = {}
 _tasks: dict[str, asyncio.Task] = {}
+
+# 迭代七：任务调度器（迭代 0 契约落地）——优先级队列 + 并发配额，
+# 替代硬编码 MAX_ACTIVE_JOBS=2 与 429 拒绝；配额可由环境变量弹性调整
+# （MODEL_DUEL_CONCURRENCY，默认 2，即 CPU 池化 v1 形态）。
+_SCHEDULER = Scheduler(concurrency=int(os.environ.get("MODEL_DUEL_CONCURRENCY", "2") or 2))
+
+
+def _job_running(j: dict) -> bool:
+    """job 是否占用调度配额（执行+评审阶段）。"""
+    return j.get("state") in ("executing", "judging") and not str(
+        j.get("config", {}).get("model_a", {}).get("url", "")
+    ).startswith("mock")
+
+
+async def _dispatch_pending() -> None:
+    """调度器派发胶水：配额内弹候选 → 建后台任务（沿用 _tasks/_task_done）。
+
+    batch 执行单元（config.batch_id）走 _run_batch_job，其余走 _run_eval。
+    """
+    for job_id in _SCHEDULER.next_batch():
+        j = _jobs.get(job_id)
+        if j is None:
+            continue
+        if (j.get("config") or {}).get("batch_id"):
+            task = asyncio.create_task(_run_batch_job(job_id))
+        else:
+            task = asyncio.create_task(_run_eval(job_id))
+        _tasks[job_id] = task
+        task.add_done_callback(lambda t, jid=job_id: _task_done(jid, t))
+
+
+def _scheduler_release(job_id: str) -> None:
+    """释放配额并补派发（幂等；reviewing/终态/取消路径统一调用）。"""
+    if _SCHEDULER.release(job_id):
+        asyncio.create_task(_dispatch_pending())
 
 
 async def _read_body_limited(request: Request, limit: int) -> bytes:
@@ -239,6 +293,12 @@ async def leaderboard_page():
 async def dashboard_page():
     """KPI 看板页（迭代六）：耗时/token 趋势 + CPU/GPU 硬件利用率。"""
     return _page_response("dashboard.html")
+
+
+@app.get("/tasks.html", response_class=HTMLResponse)
+async def tasks_page():
+    """任务调度页（迭代七）：排队/运行视图、优先级调整、benchmark 批次。"""
+    return _page_response("tasks.html")
 
 
 @app.get("/api/dims")
@@ -740,6 +800,469 @@ async def dashboard():
     }
 
 
+# ---- 任务调度视图（迭代七）----
+
+def _task_view_entry(job_id: str, j: dict, kind: str) -> dict:
+    cfg = j.get("config") or {}
+    if cfg.get("batch_id"):
+        kind = "batch"
+    return {
+        "job_id": job_id,
+        "type": kind,
+        "state": j.get("state"),
+        "progress": j.get("progress"),
+        "model_a": (cfg.get("model_a") or {}).get("name", "?"),
+        "model_b": (cfg.get("model_b") or {}).get("name", "?"),
+        "created_at": j.get("created_at"),
+        "priority": j.get("priority", 0),
+        "batch_id": cfg.get("batch_id"),
+    }
+
+
+@app.get("/api/tasks")
+async def tasks_view():
+    """任务队列视图：排队（含位置/优先级）+ 运行中 + 批次摘要。"""
+    queued = []
+    for item in _SCHEDULER.queue_view():
+        j = _jobs.get(item["job_id"])
+        if j is None:
+            continue
+        entry = _task_view_entry(item["job_id"], j, "eval")
+        entry["position"] = item["position"]
+        entry["priority"] = item["priority"]
+        queued.append(entry)
+    running = [
+        _task_view_entry(job_id, j, "eval")
+        for job_id, j in _jobs.items()
+        if _job_running(j)
+    ]
+    return {
+        "quota": {"concurrency": _SCHEDULER.concurrency(),
+                  "active": _SCHEDULER.active_count(),
+                  "queued": len(queued)},
+        "queued": queued,
+        "running": running,
+        "batches": list_batches(),
+    }
+
+
+@app.put("/api/tasks/{job_id}/priority")
+async def tasks_set_priority(job_id: str, req: PriorityRequest):
+    """调整排队中任务优先级（重排序）；运行中/终态 409；不存在 404。"""
+    job_id = _require_job_id(job_id)
+    j = _jobs.get(job_id)
+    if j is None:
+        raise HTTPException(404, "job not found")
+    if j.get("state") != "queued":
+        raise HTTPException(409, f"仅排队中任务可调整优先级（当前 state={j.get('state')}）")
+    if not _SCHEDULER.set_priority(job_id, req.priority):
+        raise HTTPException(409, "任务不在调度队列中")
+    j["priority"] = req.priority
+    audit.priority_changed(job_id, str(req.priority))
+    position = next((x["position"] for x in _SCHEDULER.queue_view()
+                     if x["job_id"] == job_id), None)
+    return {"ok": True, "job_id": job_id, "priority": req.priority, "position": position}
+
+
+@app.post("/api/eval/{job_id}/resume")
+async def resume_eval(job_id: str):
+    """断点续跑（迭代七）：磁盘态部分完成任务重新入队，跳过已完成题。
+
+    仅对运行中崩溃/异常遗留的磁盘态任务（_jobs 无条目、磁盘 state 为
+    executing/error、增量答案 >0）生效；运行中任务 409，无部分答案 409。
+    """
+    job_id = _require_job_id(job_id)
+    if job_id in _jobs:
+        raise HTTPException(409, f"任务运行中（state={_jobs[job_id].get('state')}），无需续跑")
+    st = get_job_status(job_id)
+    if st is None:
+        raise HTTPException(404, "job not found")
+    if st["state"] not in ("executing", "error"):
+        raise HTTPException(409, f"任务状态 {st['state']} 不可续跑（仅 executing/error 且存在部分答案）")
+    partial = partial_answers_count(job_id)
+    if partial <= 0:
+        raise HTTPException(409, "磁盘无部分答案，无可续跑内容")
+
+    cfg = st["config"]
+    task_set = _load_job_task_set(job_id)
+    if task_set is None:
+        raise HTTPException(409, "任务集缺失，无法续跑")
+    _jobs[job_id] = {
+        "state": "queued",
+        "progress": "0/0",
+        "task_set": task_set,
+        "config": cfg,
+        "answers_a": None,
+        "answers_b": None,
+        "verdict": None,
+        "rounds_answers": [],
+        "reveal": None,
+        "started_at": time.time(),
+        "created_at": (cfg.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+        "sse_queue": asyncio.Queue(),
+        "repeat_n": int(cfg.get("repeat_n") or 1),
+        "budget_warned": False,
+        "health_warned": False,
+        "embedding_cfg": cfg.get("embedding"),
+        "priority": 0,
+        "resumed": True,
+    }
+    _SCHEDULER.submit(job_id, priority=0)
+    await _dispatch_pending()
+    audit.eval_resumed(job_id)
+    return {"ok": True, "job_id": job_id, "state": "queued", "partial": partial}
+
+
+# ---- benchmark 批次（迭代七）----
+
+def _on_batch_job_done(batch_id: str, job_id: str) -> None:
+    """批次子任务终态回调（幂等计数）：全部终态时聚合排行榜并置批次终态。
+
+    completed job 聚合进排行榜（build_leaderboard 复用）；error/cancelled
+    模型标注 N/A 排除；不足 2 个完成模型 → 无排行榜 + note。
+    """
+    batch = load_batch(batch_id)
+    if batch is None or batch.get("state") in ("done", "partial"):
+        return
+    states: dict[str, str] = {}
+    for jid in batch.get("jobs", []):
+        if jid in _jobs:
+            states[jid] = _jobs[jid].get("state", "executing")
+        else:
+            st = get_job_status(jid)
+            states[jid] = (st or {}).get("state", "executing")
+    if any(states.get(jid) not in TERMINAL_STATES for jid in batch.get("jobs", [])):
+        save_batch(batch_id, batch)
+        return
+    completed = [jid for jid in batch.get("jobs", []) if states.get(jid) == "completed"]
+    failed = [jid for jid in batch.get("jobs", []) if states.get(jid) != "completed"]
+    partial = bool(failed)
+    batch["state"] = "partial" if partial else "done"
+    batch["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    batch["failed_models"] = [
+        (_jobs[jid].get("config", {}).get("model_a", {}).get("name", "?")
+         if jid in _jobs and _jobs[jid].get("config")
+         else (get_job_status(jid) or {}).get("config", {}).get("model_a", {}).get("name", "?"))
+        for jid in failed
+    ]
+    if len(completed) >= 2:
+        try:
+            lb = build_leaderboard(completed, name=batch.get("name"))
+            lb_id = "lb_" + create_job_id()
+            save_leaderboard(lb_id, {
+                "lb_id": lb_id,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "batch_id": batch_id,
+                **lb,
+            })
+            batch["leaderboard_id"] = lb_id
+            audit.leaderboard_created(lb_id)
+        except LeaderboardError as e:
+            batch["aggregation_error"] = str(e)
+    else:
+        batch["aggregation_error"] = "不足 2 个完成模型，无法生成排行榜"
+    save_batch(batch_id, batch)
+    audit.benchmark_done(batch_id, partial)
+
+
+async def _run_batch_job(job_id: str):
+    """batch 执行单元：单模型 M 轮作答 + 单臂评分 → 单臂 verdict + slim report。
+
+    判别式/代码题 = score_task_metric 逐轮均值（0-10）；生成式题 =
+    run_single_arm_judge 逐轮单臂分均值（judge 缺省该类题 N/A + warning）。
+    """
+    j = _jobs.get(job_id)
+    if j is not None and j.get("state") == "queued":
+        j["state"] = "executing"
+        save_task_set(job_id, j["task_set"])
+        save_env_snapshot(job_id)
+        await _push_event(job_id, {"state": "executing", "progress": "0/0"})
+    try:
+        j = _jobs.get(job_id)
+        if j is None:
+            return
+        cfg = j["config"]
+        task_set = j["task_set"]
+        model_cfg = cfg["model_a"]
+        rounds = int(j.get("repeat_n", 1)) or 1
+
+        async def progress_cb(_label, done, total):
+            jj = _jobs.get(job_id)
+            if jj is None or jj.get("state") == "cancelling":
+                return
+            jj["progress"] = f"{done}/{total}"
+            await _push_event(job_id, {"state": "executing", "progress": f"{done}/{total}"})
+
+        all_rounds: list[dict] = []
+        for r_idx in range(rounds):
+            if _job_cancelled(job_id):
+                raise JobCancelled
+            answers = await _execute_model("A", model_cfg, task_set["tasks"], None,
+                                           progress_cb)
+            save_answers(job_id, f"a-r{r_idx + 1}", answers)
+            all_rounds.append(answers)
+        save_answers(job_id, "a", all_rounds[-1])
+        save_answers(job_id, "b", {"model": model_cfg["name"], "answers": []})
+
+        if _job_cancelled(job_id):
+            raise JobCancelled
+
+        judge_cfg = (cfg.get("review") or {}).get("judge")
+        gen_tasks = [t for t in task_set["tasks"] if t.get("type") == "生成式"]
+
+        disc_scores: dict[str, list[float]] = {}
+        gen_scores: dict[str, list[float]] = {}
+        invalid = 0
+        for round_ans in all_rounds:
+            ans_map = {a["id"]: a for a in round_ans.get("answers", [])}
+            for t in task_set["tasks"]:
+                if t.get("type") != "生成式":
+                    entry = ans_map.get(t["id"])
+                    if entry is None:
+                        continue
+                    s = score_task_metric(t, entry)
+                    if s is not None:
+                        disc_scores.setdefault(t["id"], []).append(s)
+            if judge_cfg and gen_tasks:
+                gen_answers = [ans_map[t["id"]] for t in gen_tasks if t["id"] in ans_map]
+                if gen_answers:
+                    sa = await run_single_arm_judge(
+                        {"tasks": gen_tasks, "meta": {}},
+                        {"model": model_cfg["name"], "answers": gen_answers},
+                        judge_cfg)
+                    invalid += sa.get("meta", {}).get("invalid", 0)
+                    for v in sa.get("scores", []):
+                        if not v.get("_invalid"):
+                            gen_scores.setdefault(v["id"], []).append(v.get("score", 0.0))
+
+        scores: list[dict] = []
+        warnings: list[dict] = []
+        for t in task_set["tasks"]:
+            tid = t["id"]
+            if t.get("type") == "生成式":
+                vals = gen_scores.get(tid, [])
+                score = round(sum(vals) / len(vals), 2) if vals else None
+                if score is None and judge_cfg is None:
+                    warnings.append({"code": "batch_judge_missing", "task_id": tid,
+                                     "message": "未提供 judge 配置，生成式题得分 N/A"})
+            else:
+                vals = disc_scores.get(tid, [])
+                score = round(sum(vals) / len(vals), 2) if vals else None
+            scores.append({"id": tid, "dimension": t.get("dimension", ""),
+                           "score": score, "basis": "批内单臂评分（M 轮均值）",
+                           "_invalid": score is None})
+
+        valid = [s for s in scores if not s["_invalid"]]
+        verdict = {
+            "meta": {"total": len(scores), "valid": len(valid),
+                     "invalid": len(scores) - len(valid),
+                     "rounds": rounds, "mode": "single_arm",
+                     "excluded_ids": [t["id"] for t in task_set["tasks"]
+                                      if t.get("excluded_from_total")],
+                     "excluded_dimensions": sorted({t.get("dimension", "")
+                                                    for t in task_set["tasks"]
+                                                    if t.get("excluded_from_total")})},
+            "scores": scores,
+            "totals": {"score": round(sum(s["score"] or 0 for s in valid), 2),
+                       "max": round(10.0 * len(valid), 2)},
+        }
+        save_verdict(job_id, verdict)
+        report = {
+            "summary": {"model": model_cfg["name"], "n_tasks": len(scores),
+                        "rounds": rounds, "mode": "single_arm",
+                        "invalid": verdict["meta"]["invalid"]},
+            "kpi": {"duration_sec": _job_duration_sec(job_id, cfg)},
+            "warnings": warnings,
+        }
+        save_report(job_id, {
+            "config": sanitize_config(cfg),
+            "tasks": task_set,
+            "answers_a": all_rounds[-1] if all_rounds else {},
+            "answers_b": {"model": model_cfg["name"], "answers": []},
+            "verdict": verdict,
+            "report": report,
+        })
+        if job_id in _jobs:
+            _jobs[job_id].update({"verdict": verdict, "state": "completed",
+                                  "progress": "done"})
+        await _push_event(job_id, {"state": "completed"})
+        _on_batch_job_done(cfg["batch_id"], job_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        j = _jobs.get(job_id)
+        if j is not None:
+            j["state"] = "error"
+            j["error"] = f"批次执行失败: {e}"
+            await _push_event(job_id, {"state": "error", "error": str(e)})
+        _mark_error(job_id, f"批次执行失败: {e}")
+        cfg = (_jobs.get(job_id, {}).get("config") or {})
+        if cfg.get("batch_id"):
+            _on_batch_job_done(cfg["batch_id"], job_id)
+
+
+@app.post("/api/benchmark", response_model=None)
+async def create_benchmark(req: BenchmarkRequest):
+    """创建 benchmark 批次：1 任务集 × N 模型（配置库）× M 轮。
+
+    每模型一个执行单元（单臂评审），全部经调度器入队；Key 取进程内存。
+    """
+    dataset = load_dataset(req.dataset_name)
+    if dataset is None:
+        raise HTTPException(404, f"评测集 '{req.dataset_name}' 不存在")
+    try:
+        task_set = build_task_set_from_dataset(dataset)
+    except DatasetValidationError as e:
+        raise HTTPException(400, f"数据集格式错误: {e}")
+
+    seen_ids: set[str] = set()
+    models: list[dict] = []
+    for mid in req.model_ids:
+        if mid in seen_ids:
+            raise HTTPException(400, f"模型配置重复：{mid}")
+        seen_ids.add(mid)
+        info = get_model(mid)
+        if info is None:
+            raise HTTPException(400, f"模型配置不存在：{mid}")
+        key = get_key(mid)
+        if not key:
+            raise HTTPException(
+                400, f"模型「{info.get('name')}」未补录 API Key（配置库重启后需重新填写）")
+        models.append({
+            "id": mid, "name": info["name"], "url": info["url"], "key": key,
+            "temperature": info.get("temperature", 0.7),
+            "max_tokens": info.get("max_tokens", 4096),
+            "top_p": info.get("top_p"),
+        })
+
+    judge_cfg = None
+    if req.review is not None and req.review.judge is not None:
+        judge_cfg = {"name": req.review.judge.name, "url": req.review.judge.url,
+                     "key": req.review.judge.key or ""}
+        try:
+            validate_upstream_url(req.review.judge.url)
+        except UpstreamUrlError as e:
+            raise HTTPException(400, f"评审模型 URL 校验失败: {e}")
+
+    budget_check = check_budget(
+        req.budget.model_dump() if req.budget else None,
+        task_set["meta"]["total"], req.rounds,
+        "pure_agent" if judge_cfg else "human", len(models),
+    )
+    if budget_check["limited"] and not budget_check["allowed"]:
+        raise HTTPException(
+            400,
+            f"预算超限：预估消耗 {budget_check['estimated']} token"
+            f"（{len(models)} 模型 × {req.rounds} 轮），超过上限 "
+            f"{budget_check['limit']}（hard 模式拒绝启动）",
+        )
+
+    batch_id = "batch_" + create_job_id()
+    job_ids: list[str] = []
+    for m in models:
+        jid = create_job_id()
+        config_data = {
+            "model_a": {k: m[k] for k in ("name", "url", "key", "temperature",
+                                          "max_tokens", "top_p")},
+            "model_a_key_masked": "***",
+            "dims": None, "seed": None, "dataset_name": req.dataset_name,
+            "repeat_n": req.rounds, "num_questions": None,
+            "code_verify_mode": req.code_verify_mode,
+            "prompt_strategy": req.prompt_strategy,
+            "review": {"mode": "single_arm", "fail_open": False,
+                       "judge": judge_cfg, "k_top_human": 0},
+            "budget": req.budget.model_dump() if req.budget else None,
+            "embedding": req.embedding.model_dump() if req.embedding else None,
+            "batch_id": batch_id,
+            "model_id": m["id"],
+        }
+        save_config(jid, config_data)
+        _jobs[jid] = {
+            "state": "queued",
+            "progress": "0/0",
+            "task_set": task_set,
+            "config": config_data,
+            "answers_a": None, "answers_b": None, "verdict": None,
+            "rounds_answers": [], "reveal": None,
+            "started_at": time.time(),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "sse_queue": asyncio.Queue(),
+            "repeat_n": req.rounds,
+            "budget_warned": False, "health_warned": False,
+            "embedding_cfg": req.embedding.model_dump() if req.embedding else None,
+            "priority": req.priority,
+        }
+        _SCHEDULER.submit(jid, priority=req.priority)
+        job_ids.append(jid)
+
+    batch = {
+        "batch_id": batch_id,
+        "name": req.name or "",
+        "state": "running",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "dataset": req.dataset_name,
+        "models": [m["name"] for m in models],
+        "rounds": req.rounds,
+        "jobs": job_ids,
+        "leaderboard_id": None,
+        "failed_models": [],
+        "aggregation_error": None,
+        "finished_at": None,
+    }
+    save_batch(batch_id, batch)
+    audit.benchmark_started(batch_id, len(models))
+    await _dispatch_pending()
+    return {"ok": True, "batch_id": batch_id, "jobs": job_ids,
+            "models": batch["models"], "state": "running"}
+
+
+@app.get("/api/benchmark")
+async def benchmark_list():
+    return {"batches": list_batches()}
+
+
+@app.get("/api/benchmark/{batch_id}/leaderboard")
+async def benchmark_leaderboard(batch_id: str):
+    if not is_valid_batch_id(batch_id):
+        raise HTTPException(400, "invalid batch_id format")
+    batch = load_batch(batch_id)
+    if batch is None:
+        raise HTTPException(404, "batch not found")
+    lb_id = batch.get("leaderboard_id")
+    if not lb_id:
+        raise HTTPException(404, "排行榜尚未生成（批次未完成或完成模型不足 2 个）")
+    data = load_leaderboard(lb_id)
+    if data is None:
+        raise HTTPException(404, "leaderboard not found")
+    return data
+
+
+@app.get("/api/benchmark/{batch_id}")
+async def benchmark_detail(batch_id: str):
+    if not is_valid_batch_id(batch_id):
+        raise HTTPException(400, "invalid batch_id format")
+    batch = load_batch(batch_id)
+    if batch is None:
+        raise HTTPException(404, "batch not found")
+    jobs = []
+    for jid in batch.get("jobs", []):
+        if jid in _jobs:
+            st = _jobs[jid].get("state")
+            prog = _jobs[jid].get("progress")
+        else:
+            st = (get_job_status(jid) or {}).get("state")
+            prog = None
+        jobs.append({"job_id": jid, "state": st, "progress": prog})
+    n_terminal = sum(1 for x in jobs if x["state"] in TERMINAL_STATES)
+    n_total = len(jobs)
+    return {
+        **batch,
+        "progress": f"{n_terminal}/{n_total}",
+        "terminal": n_terminal,
+        "jobs": jobs,
+    }
+
+
 @app.get("/api/generate")
 async def generate_list():
     return {"batches": list_generation_batches()}
@@ -1003,16 +1526,7 @@ async def start_eval(req: StartRequest):
         except UpstreamUrlError as e:
             raise HTTPException(400, f"评审模型 URL 校验失败: {e}")
 
-    # 并发限制：执行中任务数（mock 不消耗外部资源，不计入；judging 阶段
-    # 评审模型真实调用，同样计入）
-    active = sum(
-        1 for j in _jobs.values()
-        if j.get("state") in ("pending", "executing", "judging")
-        and not str(j.get("config", {}).get("model_a", {}).get("url", "")).startswith("mock")
-    )
-    if active >= MAX_ACTIVE_JOBS:
-        raise HTTPException(429, f"当前已有 {active} 个评测任务在执行，请等待完成后再启动")
-
+    # 迭代七：并发超限不再 429 拒绝，改由调度器排队（优先级队列 + 配额派发）
     job_id = create_job_id()
     seed = req.seed if req.seed is not None else int(time.time()) % 100000
 
@@ -1079,11 +1593,10 @@ async def start_eval(req: StartRequest):
         "embedding": req.embedding.model_dump() if req.embedding else None,
     }
     save_config(job_id, config_data)
-    save_task_set(job_id, task_set)
-    save_env_snapshot(job_id)  # 迭代四：环境快照（OS/Python/依赖版本，无密钥）
+    # 迭代七：tasks.json/env 快照延后到调度派发时落盘（排队中磁盘态 = queued）
 
     _jobs[job_id] = {
-        "state": "executing",
+        "state": "queued",
         "progress": "0/0",
         "task_set": task_set,
         "config": config_data,
@@ -1099,12 +1612,20 @@ async def start_eval(req: StartRequest):
         "budget_warned": False,
         "health_warned": False,
         "embedding_cfg": req.embedding.model_dump() if req.embedding else None,
+        "priority": 0,
     }
 
-    task = asyncio.create_task(_run_eval(job_id))
-    _tasks[job_id] = task
-    task.add_done_callback(lambda t, jid=job_id: _task_done(jid, t))
+    _SCHEDULER.submit(job_id, priority=0)
     audit.eval_started(job_id)
+    await _dispatch_pending()
+    j = _jobs.get(job_id)
+    # 已派发（running 集含本 job）则不推 queued；仅真正排队时推送
+    if (j is not None and j.get("state") == "queued"
+            and job_id not in _SCHEDULER.running()):
+        position = next((x["position"] for x in _SCHEDULER.queue_view()
+                         if x["job_id"] == job_id), None)
+        await _push_event(job_id, {"state": "queued", "position": position})
+        audit.eval_queued(job_id)
     return StartResponse(job_id=job_id)
 
 
@@ -1136,8 +1657,37 @@ async def _request_cancel(job_id: str):
     await _push_event(job_id, {"state": "cancelling"})
 
 
+def _load_job_task_set(job_id: str) -> dict | None:
+    """从磁盘读取任务集（resume 路径：进程重启后 _jobs 无条目）。"""
+    files = get_job_files(job_id)
+    tasks = files.get("tasks.json") if files else None
+    return tasks if isinstance(tasks, dict) else None
+
+
+def _merge_inc_answers(answers: dict, inc_by_task: dict) -> dict:
+    """把磁盘增量答案按 task_id 并回答案池（resume 跳过题补齐两侧）。"""
+    if not inc_by_task:
+        return answers
+    have = {e.get("id") for e in answers.get("answers", [])}
+    merged = list(answers.get("answers", []))
+    for tid, entry in sorted(inc_by_task.items()):
+        if tid not in have:
+            merged.append(entry)
+    return {**answers, "answers": merged}
+
+
 async def _run_eval(job_id: str):
-    """后台执行入口：包装 _run_eval_impl，取消时统一收尾并终止任务。"""
+    """后台执行入口：包装 _run_eval_impl，取消时统一收尾并终止任务。
+
+    迭代七：派发时由 queued → executing，并在此刻落盘 tasks.json 与环境快照
+    （排队中磁盘态仅 config.json，保证状态推断一致）。
+    """
+    j = _jobs.get(job_id)
+    if j is not None and j.get("state") == "queued":
+        j["state"] = "executing"
+        save_task_set(job_id, j["task_set"])
+        save_env_snapshot(job_id)  # 迭代四：环境快照（OS/Python/依赖版本，无密钥）
+        await _push_event(job_id, {"state": "executing", "progress": "0/0"})
     try:
         await _run_eval_impl(job_id)
     except asyncio.CancelledError:
@@ -1192,6 +1742,18 @@ async def _run_eval_impl(job_id: str):
             _exec_kwargs = {}
             if j.get("embedding_cfg"):
                 _exec_kwargs["embedding_cfg"] = j["embedding_cfg"]
+            # 迭代七断点续跑：resume 任务跳过磁盘已完成题（双侧均有答案才跳过），
+            # 并通过 persist_cb 继续增量落盘（本轮新完成题随时可再次续跑）
+            if j.get("resumed"):
+                inc = load_answers_inc(job_id)
+                skip_ids = {
+                    tid for tid in {k.rsplit(":", 1)[1] for k in inc}
+                    if f"a:{tid}" in inc and f"b:{tid}" in inc
+                }
+                if skip_ids:
+                    _exec_kwargs["skip_ids"] = skip_ids
+                _exec_kwargs["persist_cb"] = lambda label, tid, e: save_answers_inc(
+                    job_id, f"{label}:{tid}", e)
             answers_a, answers_b = await execute_all(
                 task_set, config_a=cfg["model_a"], config_b=cfg["model_b"],
                 progress_cb=progress_cb, **_exec_kwargs,
@@ -1207,6 +1769,18 @@ async def _run_eval_impl(job_id: str):
             await _push_event(job_id, {"state": "error", "error": str(e)})
             _mark_error(job_id, f"模型调用失败: {e}")
             return
+
+        # resume 续跑：跳过题的两侧答案从磁盘增量合并回答案池
+        if j.get("resumed"):
+            inc = load_answers_inc(job_id)
+            if inc:
+                by_side = {"a": {}, "b": {}}
+                for key, entry in inc.items():
+                    side, _, tid = key.rpartition(":")
+                    if side in by_side:
+                        by_side[side][tid] = entry
+                answers_a = _merge_inc_answers(answers_a, by_side["a"])
+                answers_b = _merge_inc_answers(answers_b, by_side["b"])
 
         # execute_all 内部可能因取消标记而停止（gather 吞掉子协程异常），
         # 返回后必须复查：取消态一律不得落盘（防目录复活）。
@@ -1261,7 +1835,8 @@ async def _run_eval_impl(job_id: str):
     if review_mode in ("pure_agent", "hybrid"):
         await _run_agent_judging(job_id, all_rounds, reveal, cfg, task_set, review_mode)
     else:
-        # 进入人工评审阶段，等待用户打分
+        # 进入人工评审阶段，等待用户打分（迭代七：释放调度配额，后续任务可派发）
+        _scheduler_release(job_id)
         j["state"] = "reviewing"
         j["progress"] = "0/0"
         await _push_event(job_id, {"state": "reviewing"})
@@ -1350,6 +1925,7 @@ async def _run_agent_judging(
         _raise_if_cancelled()
         j = _jobs.get(job_id)
         if fail_open:
+            _scheduler_release(job_id)  # 迭代七：降级人工评审即释放配额
             j["state"] = "reviewing"
             j["progress"] = "0/0"
             await _push_event(job_id, {
@@ -1402,6 +1978,7 @@ async def _run_agent_judging(
             "state": "reviewing",
         })
         j = _jobs.get(job_id)
+        _scheduler_release(job_id)  # 迭代七：hybrid 进入人工复核即释放配额
         j["state"] = "reviewing"
         j["progress"] = "0/0"
         await _push_event(job_id, {"state": "reviewing", "mode": "hybrid", "k": k})
@@ -2314,6 +2891,16 @@ async def delete_history(job_id: str):
 
     job_id = _require_job_id(job_id)
     task = _tasks.get(job_id)
+    # 迭代七：排队中取消走独立分支（出队 + 删目录 + 审计，无 task.cancel）
+    j_entry = _jobs.get(job_id)
+    if task is None and j_entry is not None and j_entry.get("state") == "queued":
+        _SCHEDULER.cancel_queued(job_id)
+        _jobs.pop(job_id, None)
+        ok = delete_job(job_id)
+        if not ok:
+            raise HTTPException(404, "job not found")
+        audit.eval_cancelled(job_id)
+        return {"ok": True}
     if task is not None:
         if not task.done():
             await _request_cancel(job_id)

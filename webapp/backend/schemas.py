@@ -202,3 +202,28 @@ class LeaderboardRequest(BaseModel):
     name: str | None = Field(None, max_length=200, description="排行榜名称（可选）")
     job_ids: list[str] = Field(..., min_length=1, max_length=20,
                                description="参与聚合的已完成 job_id 列表")
+
+
+class BenchmarkRequest(BaseModel):
+    """benchmark 批次请求（迭代七）：1 任务集 × N 模型 × M 轮。
+
+    model_ids 引用模型配置库（Key 取进程内存，未补录 400 提示）；
+    每模型一个执行单元，单臂评审（判别式指标分 + 生成式单臂 rubric）。
+    """
+    model_config = {"protected_namespaces": ()}
+    dataset_name: str = Field(..., max_length=200, description="评测集名称（必填）")
+    model_ids: list[str] = Field(..., min_length=2, max_length=20,
+                                 description="模型配置库 id 列表（N≥2）")
+    rounds: int = Field(1, ge=1, le=20, description="每模型重复轮数 M")
+    priority: int = Field(0, ge=-10, le=10, description="批次任务优先级（越高越先调度）")
+    name: str | None = Field(None, max_length=200, description="批次名称（可选）")
+    review: ReviewConfig | None = Field(None, description="评审配置（judge 用于生成式题单臂）")
+    prompt_strategy: str = Field("cot", pattern=r"^(cot|direct|fewshot)$")
+    code_verify_mode: str = Field("off", pattern=r"^(off|native-sandbox)$")
+    budget: BudgetConfig | None = Field(None, description="预算熔断（按 N 模型放大预估）")
+    embedding: EmbeddingConfig | None = Field(None, description="embedding 配置")
+
+
+class PriorityRequest(BaseModel):
+    """任务优先级调整请求（迭代七，仅排队中可改）。"""
+    priority: int = Field(0, ge=-10, le=10, description="新优先级（-10..10）")

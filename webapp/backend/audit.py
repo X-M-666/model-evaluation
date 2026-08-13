@@ -130,6 +130,34 @@ def leaderboard_created(lb_id: str, actor: str = "local") -> None:
     _append({"event": "leaderboard_created", "target": lb_id, "actor": actor})
 
 
+def eval_queued(job_id: str, actor: str = "local") -> None:
+    """评测任务排队（迭代七：并发超限入队等待调度）。"""
+    _append({"event": "eval_queued", "job_id": job_id, "actor": actor})
+
+
+def priority_changed(job_id: str, priority: str, actor: str = "local") -> None:
+    """排队任务优先级调整（迭代七）。"""
+    _append({"event": "priority_changed", "target": job_id,
+             "path": priority, "actor": actor})
+
+
+def eval_resumed(job_id: str, actor: str = "local") -> None:
+    """断点续跑重新入队（迭代七）。"""
+    _append({"event": "eval_resumed", "target": job_id, "actor": actor})
+
+
+def benchmark_started(batch_id: str, count: int, actor: str = "local") -> None:
+    """benchmark 批次启动（迭代七，count=模型数）。"""
+    _append({"event": "benchmark_started", "target": batch_id,
+             "count": count, "actor": actor})
+
+
+def benchmark_done(batch_id: str, partial: bool, actor: str = "local") -> None:
+    """benchmark 批次终态（迭代七，partial=是否部分失败）。"""
+    _append({"event": "benchmark_done", "target": batch_id,
+             "path": "partial" if partial else "done", "actor": actor})
+
+
 def read_events() -> list[dict[str, Any]]:
     """读取全部审计事件（测试与运维排查用）。"""
     p = _log_path()

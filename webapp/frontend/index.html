@@ -292,10 +292,11 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <div id="historyList"><em>加载中...</em></div>
 </div>
 
-<!-- 迭代六入口：扰动评测 / 排行榜 / KPI 看板 -->
+<!-- 迭代七入口：任务调度 / 迭代六入口：扰动评测 / 排行榜 / KPI 看板 -->
 <div class="card" style="margin-top:24px">
 <h2>高级评测入口</h2>
 <div style="display:flex;gap:10px;flex-wrap:wrap">
+  <a href="/tasks.html" style="color:#58a6ff;text-decoration:none;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 16px;font-size:14px">🗂️ 任务调度 <span class="hint">排队 / 优先级 / 取消 / benchmark 批次</span></a>
   <a href="/perturb.html" style="color:#58a6ff;text-decoration:none;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 16px;font-size:14px">⚔️ 对抗扰动评测 <span class="hint">鲁棒性衰减曲线 / 偏见公平性对照</span></a>
   <a href="/leaderboard.html" style="color:#58a6ff;text-decoration:none;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 16px;font-size:14px">🏆 N 模型排行榜 <span class="hint">分维度排名 / 胜率矩阵 / CI 标注</span></a>
   <a href="/dashboard.html" style="color:#58a6ff;text-decoration:none;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 16px;font-size:14px">📊 KPI 看板 <span class="hint">耗时 / Token 趋势 / CPU 利用率</span></a>
@@ -623,7 +624,9 @@ async function connectEvents(jobId, progText, btn){
     evtSource.onmessage = (e) => {
       const evt = JSON.parse(e.data);
       const round = evt.round ? `[${evt.round}] ` : '';
-      if(evt.state==='executing') progText.textContent = `${round}模型调用中 ${evt.progress||''}`;
+      if(evt.state==='queued'){
+        progText.textContent = `排队中（位置 ${evt.position ?? '?'}），等待调度...`;
+      }else if(evt.state==='executing') progText.textContent = `${round}模型调用中 ${evt.progress||''}`;
       else if(evt.state==='reviewing'){
         progText.textContent = evt.judge_failed
           ? 'AI 评审失败，已降级为人工评审，跳转评审页...'

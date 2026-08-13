@@ -233,13 +233,19 @@ async def _execute_model(
     stability_repeat: dict[str, int] | None,
     progress_cb=None,
     embedding_cfg: dict[str, Any] | None = None,
+    skip_ids: set[str] | None = None,
+    persist_cb: Callable[[str, str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """串行跑完该模型的全部题目。config 含 url/key/name/temperature/max_tokens/top_p。
 
     embedding_cfg：embedding provider 配置（None=不采集语义向量；失败自动降级）。
+    skip_ids（迭代七断点续跑）：跳过执行这些题（不产生 entry，由调用方合并
+    磁盘增量答案）；persist_cb：每题完成后回调 (side_label, task_id, entry)，
+    供增量落盘（幂等，含失败/重试后条目）。
     """
     url = config["url"].rstrip("/")
     model_name = config["name"]
+    skip_ids = skip_ids or set()
 
     answers: list[dict[str, Any]] = []
     total = len(tasks)
@@ -250,6 +256,10 @@ async def _execute_model(
             embedder = await _make_embedder(resolve_provider(embedding_cfg), client)
         for i, task in enumerate(tasks):
             tid = task["id"]
+            if tid in skip_ids:
+                if progress_cb:
+                    await progress_cb(model_label, i + 1, total)
+                continue
             is_repeat_task = stability_repeat is not None and tid in stability_repeat
             repeat_n = stability_repeat.get(tid, 1) if is_repeat_task else 1
 
@@ -262,10 +272,15 @@ async def _execute_model(
                 ans2["repeat_index"] = 2
                 answers.append(ans1)
                 answers.append(ans2)
+                if persist_cb:
+                    persist_cb(model_label, tid, ans1)
+                    persist_cb(model_label, tid, ans2)
             else:
                 ans = await execute_task(client, task, config, is_repeat_task=False,
                                          embedder=embedder)
                 answers.append(ans)
+                if persist_cb:
+                    persist_cb(model_label, tid, ans)
 
             if progress_cb:
                 await progress_cb(model_label, i + 1, total)
@@ -284,18 +299,23 @@ async def execute_all(
     config_b: dict[str, Any],
     progress_cb=None,
     embedding_cfg: dict[str, Any] | None = None,
+    skip_ids: set[str] | None = None,
+    persist_cb: Callable[[str, str, dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """并发跑完两个模型的全部题目。config_a/b 含 url/key/name/temperature/max_tokens/top_p。
 
     embedding_cfg：语义向量采集配置（None=不采集）；prompt 策略由 config 内
     prompt_strategy 字段控制（executor 不单独入参）。
+    skip_ids/persist_cb（迭代七断点续跑）：透传 _execute_model。
     """
     tasks = task_set["tasks"]
     stability_repeat = task_set.get("meta", {}).get("eval_flags", {}).get("stability_repeat")
 
     results = await asyncio.gather(
-        _execute_model("A", config_a, tasks, stability_repeat, progress_cb, embedding_cfg),
-        _execute_model("B", config_b, tasks, stability_repeat, progress_cb, embedding_cfg),
+        _execute_model("A", config_a, tasks, stability_repeat, progress_cb, embedding_cfg,
+                       skip_ids, persist_cb),
+        _execute_model("B", config_b, tasks, stability_repeat, progress_cb, embedding_cfg,
+                       skip_ids, persist_cb),
         return_exceptions=True,
     )
     if isinstance(results[0], Exception):

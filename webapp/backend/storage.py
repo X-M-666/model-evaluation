@@ -268,6 +268,9 @@ def _job_state(d: Path) -> str:
         return "judging"
     if "tasks.json" in files:
         return "executing"
+    if "config.json" in files:
+        # 迭代七：排队中任务仅落盘 config（tasks.json 延后到调度派发）
+        return "queued"
     return "pending"
 
 
@@ -911,3 +914,118 @@ def list_leaderboards() -> list[dict]:
             "n_jobs": len(data.get("jobs", [])),
         })
     return result
+
+
+# ---- benchmark 批次（迭代七）----
+
+# 系统生成 batch_id 的唯一合法格式（main 生成：batch_ + create_job_id）
+BATCH_ID_RE = re.compile(r"^batch_\d{8}_\d{6}_[0-9a-f]{6}$")
+
+# 批次记录（运行数据，同 badcases 约定）
+BATCHES_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".eval" / "batches"
+
+
+def is_valid_batch_id(batch_id: str) -> bool:
+    return isinstance(batch_id, str) and bool(BATCH_ID_RE.fullmatch(batch_id))
+
+
+def _ensure_batches_dir():
+    BATCHES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_batch(batch_id: str, data: dict) -> Path:
+    """保存批次记录。data 含 spec/模型摘要/jobs 状态，不含 Key 明文。"""
+    if not is_valid_batch_id(batch_id):
+        raise ValueError(f"非法 batch_id: {batch_id!r}")
+    _ensure_batches_dir()
+    p = BATCHES_DIR / f"{batch_id}.json"
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_batch(batch_id: str) -> dict | None:
+    if not is_valid_batch_id(batch_id):
+        return None
+    p = BATCHES_DIR / f"{batch_id}.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def list_batches() -> list[dict]:
+    """列出全部批次摘要（job 终态计数随详情读取，此处给出静态字段）。"""
+    _ensure_batches_dir()
+    result = []
+    for p in sorted(BATCHES_DIR.glob("batch_*.json")):
+        data = load_batch(p.stem)
+        if data is None:
+            continue
+        jobs = data.get("jobs", []) if isinstance(data.get("jobs"), list) else []
+        result.append({
+            "batch_id": p.stem,
+            "name": data.get("name", ""),
+            "state": data.get("state", "unknown"),
+            "created_at": data.get("created_at", ""),
+            "dataset": data.get("dataset", ""),
+            "n_jobs": len(jobs),
+            "models": data.get("models", []),
+            "leaderboard_id": data.get("leaderboard_id"),
+        })
+    return result
+
+
+# ---- 断点续跑：逐题增量答案（迭代七）----
+
+ANSWERS_INC_NAME = "answers-inc.json"
+
+
+def save_answers_inc(job_id: str, key: str, entry: dict) -> Path:
+    """逐题增量落盘（幂等合并）：<job>/answers-inc.json {key: entry}。
+
+    供断点续跑使用：key 为 f"{side}:{task_id}"（双模型任务两侧分别记录，
+    避免同题互相覆盖）；崩溃/重启后按成功题集合跳过执行。
+    """
+    d = _job_dir(job_id)
+    p = d / ANSWERS_INC_NAME
+    data: dict = {}
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {}
+    data[key] = entry
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_answers_inc(job_id: str) -> dict:
+    """读取增量答案 {key: entry}（key=f"{side}:{task_id}"）；缺失/损坏返回空 dict。"""
+    try:
+        d = _job_path(job_id)
+    except ValueError:
+        return {}
+    p = d / ANSWERS_INC_NAME
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def partial_answers_count(job_id: str) -> int:
+    """磁盘增量答案涉及的题目数（按 task_id 去重；resume 判定 >0 即部分完成）。"""
+    inc = load_answers_inc(job_id)
+    tids = set()
+    for key in inc:
+        side, sep, tid = key.rpartition(":")
+        if sep:
+            tids.add(tid)
+        else:
+            tids.add(key)
+    return len(tids)
