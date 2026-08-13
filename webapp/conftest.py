@@ -91,11 +91,18 @@ def _isolate_storage(tmp_path_factory):
     """
     from backend import main as main_module
     from backend import storage
+    from backend import models_registry
 
     orig_base = storage.BASE_DIR
     orig_datasets = storage.DATASETS_DIR
+    orig_stats = storage.STATS_DIR
+    orig_models = models_registry.MODELS_DIR
     storage.BASE_DIR = tmp_path_factory.mktemp("history")
     storage.DATASETS_DIR = tmp_path_factory.mktemp("datasets")
+    storage.STATS_DIR = tmp_path_factory.mktemp("stats")
+    storage.SATURATION_FILE = storage.STATS_DIR / "saturation.json"
+    models_registry.MODELS_DIR = tmp_path_factory.mktemp("models")
+    models_registry.clear_memory_keys()
     for jid in list(main_module._jobs):
         main_module._jobs.pop(jid)
     for jid in list(main_module._tasks):
@@ -105,3 +112,6 @@ def _isolate_storage(tmp_path_factory):
 
     storage.BASE_DIR = orig_base
     storage.DATASETS_DIR = orig_datasets
+    storage.STATS_DIR = orig_stats
+    storage.SATURATION_FILE = orig_stats / "saturation.json"
+    models_registry.MODELS_DIR = orig_models

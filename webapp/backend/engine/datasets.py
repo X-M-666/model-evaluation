@@ -30,6 +30,13 @@ MAX_SHORT_FIELD_LEN = 100
 MAX_TEST_CASES_PER_TASK = 50
 MAX_TEST_CASE_FIELD_LEN = 5000
 
+# 迭代一：任务类型 / 上下文 / 标签 / 不计分标记（安全与价值观维度题目）
+TASK_TYPES = ("判别式", "生成式")
+DEFAULT_TASK_TYPE = "判别式"
+MAX_CONTEXT_LEN = 32000
+MAX_TAG_LEN = 50
+MAX_TAGS_PER_TASK = 10
+
 
 class DatasetValidationError(ValueError):
     """数据集校验错误：携带字段路径（如 tasks[2].prompt），由 API 层渲染为 400。"""
@@ -91,7 +98,11 @@ def _collect_explicit_ids(tasks_raw: list[Any]) -> set[str]:
 
 
 def _validate_task(t: dict[str, Any], i: int, explicit_ids: set[str], seen_ids: dict[str, int]) -> None:
-    """校验单任务：id 规范字符串且唯一（缺省自动生成并避让）；prompt/test_cases 类型与长度。"""
+    """校验单任务：id 规范字符串且唯一（缺省自动生成并避让）；prompt/test_cases 类型与长度。
+
+    迭代一新增：type（缺省判别式）、tags、context（≤MAX_CONTEXT_LEN）、
+    excluded_from_total（bool）；生成式题目 rubric_note 必填。
+    """
     prefix = f"tasks[{i}]"
 
     raw_id = t.get("id")
@@ -132,6 +143,48 @@ def _validate_task(t: dict[str, Any], i: int, explicit_ids: set[str], seen_ids: 
         if f in t:
             t[f] = _as_str(t[f], f"{prefix}.{f}", max_len=max_len)
 
+    # ---- 迭代一：任务类型 / 上下文 / 标签 / 不计分标记 ----
+    ttype_raw = t.get("type", DEFAULT_TASK_TYPE)
+    explicit_type = "type" in t
+    if not isinstance(ttype_raw, str):
+        raise DatasetValidationError(f"{prefix}.type", f"必须是字符串，实际为 {_type_name(ttype_raw)}")
+    ttype = ttype_raw.strip()
+    if ttype not in TASK_TYPES:
+        raise DatasetValidationError(
+            f"{prefix}.type", f"必须是 {'/'.join(TASK_TYPES)} 之一，实际为 {ttype or '(空)'}"
+        )
+    t["type"] = ttype
+
+    ctx = t.get("context", "")
+    if not isinstance(ctx, str):
+        raise DatasetValidationError(f"{prefix}.context", f"必须是字符串，实际为 {_type_name(ctx)}")
+    ctx = ctx.strip()
+    if len(ctx) > MAX_CONTEXT_LEN:
+        raise DatasetValidationError(f"{prefix}.context", f"长度超过上限 {MAX_CONTEXT_LEN}")
+    t["context"] = ctx
+
+    tags_raw = t.get("tags", [])
+    if not isinstance(tags_raw, list):
+        raise DatasetValidationError(f"{prefix}.tags", "必须是数组")
+    if len(tags_raw) > MAX_TAGS_PER_TASK:
+        raise DatasetValidationError(f"{prefix}.tags", f"标签数量超过上限 {MAX_TAGS_PER_TASK}")
+    tags: list[str] = []
+    for j, tag in enumerate(tags_raw):
+        if not isinstance(tag, str):
+            raise DatasetValidationError(f"{prefix}.tags[{j}]", f"必须是字符串，实际为 {_type_name(tag)}")
+        s = tag.strip()
+        if not s:
+            raise DatasetValidationError(f"{prefix}.tags[{j}]", "去空白后不能为空")
+        if len(s) > MAX_TAG_LEN:
+            raise DatasetValidationError(f"{prefix}.tags[{j}]", f"长度超过上限 {MAX_TAG_LEN}")
+        tags.append(s)
+    t["tags"] = tags
+
+    excl = t.get("excluded_from_total", False)
+    if not isinstance(excl, bool):
+        raise DatasetValidationError(f"{prefix}.excluded_from_total", "必须是布尔值")
+    t["excluded_from_total"] = excl
+
     tc_raw = t.get("test_cases", [])
     if not isinstance(tc_raw, list):
         raise DatasetValidationError(f"{prefix}.test_cases", "必须是数组")
@@ -152,6 +205,18 @@ def _validate_task(t: dict[str, Any], i: int, explicit_ids: set[str], seen_ids: 
             if len(s) > MAX_TEST_CASE_FIELD_LEN:
                 raise DatasetValidationError(f"{prefix}.test_cases[{j}].{k}", f"长度超过上限 {MAX_TEST_CASE_FIELD_LEN}")
             tc[k] = s
+
+    # 题型语义约束（迭代一）：生成式必带评分标准（expected 可选）；
+    # 显式声明判别式但既无测试用例也无评分标准则无法评审 → 拒绝；
+    # 未显式声明 type 的旧格式任务保持宽容（构建阶段补缺省 rubric）
+    rubric = t.get("rubric_note", "")
+    if t["type"] == "生成式":
+        if not rubric:
+            raise DatasetValidationError(f"{prefix}.rubric_note", "生成式题目必须提供评分标准（rubric_note）")
+    elif explicit_type and not t.get("test_cases") and not rubric:
+        raise DatasetValidationError(
+            f"{prefix}.test_cases", "判别式题目缺少期望答案或评分标准（二者至少其一）"
+        )
 
 
 def validate_standard_dataset(dataset: dict[str, Any]) -> dict[str, Any]:
@@ -246,22 +311,31 @@ def validate_json_dataset(raw: str) -> dict[str, Any]:
             "prompt": prompt,
             "test_cases": [],
             "rubric_note": t.get("rubric_note", ""),
+            "type": t.get("type", DEFAULT_TASK_TYPE),
+            "context": t.get("context", ""),
+            "tags": t.get("tags", []),
+            "excluded_from_total": t.get("excluded_from_total", False),
         }
 
+        # expected 归一化（判别式参考答案；生成式可省略）
+        expected_raw = t.get("expected", "")
+        if expected_raw is None:
+            expected_raw = ""
+        if not isinstance(expected_raw, str):
+            raise DatasetValidationError(f"tasks[{i}].expected", f"必须是字符串，实际为 {_type_name(expected_raw)}")
+        expected = expected_raw.strip()
+
         if is_full_format:
-            # 完整格式：直接使用提供的字段
+            # 完整格式：直接使用提供的字段；未提供 test_cases 但有 expected 时
+            # 从 expected 构建（老格式兼容：判别式题不因缺 test_cases 而被拒）
             if has_test_cases:
                 task["test_cases"] = t["test_cases"]
+            elif expected:
+                task["test_cases"] = [{"input": prompt[:50], "expected": expected}]
             if has_rubric:
                 task["rubric_note"] = t["rubric_note"]
         else:
             # 简化格式：从 expected 构建 test_cases
-            expected_raw = t.get("expected", "")
-            if expected_raw is None:
-                expected_raw = ""
-            if not isinstance(expected_raw, str):
-                raise DatasetValidationError(f"tasks[{i}].expected", f"必须是字符串，实际为 {_type_name(expected_raw)}")
-            expected = expected_raw.strip()
             if expected:
                 task["test_cases"] = [{"input": prompt[:50], "expected": expected}]
             task["rubric_note"] = f"【仅评审可见】满分10分。根据回答与期望答案的匹配程度评分。"
@@ -277,7 +351,10 @@ def parse_csv_dataset(content: str) -> dict[str, Any]:
 
     支持两种 CSV 格式：
     1. 简化格式（2列）：prompt,expected
-    2. 完整格式（3-6列）：id,dimension,prompt,expected,rubric_note,difficulty
+    2. 完整格式（3-10列）：id,dimension,prompt,expected,rubric_note,difficulty,type,tags,context,excluded_from_total
+       （type/tags/context/excluded_from_total 为迭代一可选列，缺省=判别式/空）
+
+    无 expected 列时仅当全部行显式 type=生成式 才放行（生成式评测集）。
     """
     reader = csv.DictReader(io.StringIO(content))
     if reader.fieldnames is None:
@@ -293,11 +370,22 @@ def parse_csv_dataset(content: str) -> dict[str, Any]:
 
     if not has_prompt:
         raise ValueError("CSV 缺少 prompt 列")
+
+    rows = list(reader)
     if not has_expected:
-        raise ValueError("CSV 缺少 expected 列")
+        # 生成式评测集可省略 expected 列：全部行必须显式 type=生成式
+        for i, raw_row in enumerate(rows):
+            row = {k.strip().lower(): v for k, v in raw_row.items()}
+            if not ((row.get("prompt", "") or "").strip()):
+                continue
+            ttype = (row.get("type", "") or "").strip()
+            if ttype != "生成式":
+                raise ValueError(
+                    f"CSV 缺少 expected 列：第 {i+2} 行必须显式标注 type=生成式"
+                )
 
     tasks = []
-    for i, raw_row in enumerate(reader):
+    for i, raw_row in enumerate(rows):
         # 列名大小写/空白不敏感：统一 strip+小写后按规范名取值
         row = {k.strip().lower(): v for k, v in raw_row.items()}
         prompt = (row.get("prompt", "") or "").strip()
@@ -315,9 +403,17 @@ def parse_csv_dataset(content: str) -> dict[str, Any]:
         dimension = (row.get("dimension", "") or "").strip() or "自定义"
         rubric = (row.get("rubric_note", "") or "").strip()
         difficulty = (row.get("difficulty", "") or "").strip() or "进阶"
+        ttype = (row.get("type", "") or "").strip() or DEFAULT_TASK_TYPE
+        context = (row.get("context", "") or "").strip()
+        excl_raw = (row.get("excluded_from_total", "") or "").strip().lower()
+        excl = excl_raw == "true" or excl_raw == "1"
+        tags = [s.strip() for s in (row.get("tags", "") or "").split(";") if s.strip()]
 
         if not rubric:
-            rubric = "【仅评审可见】满分10分。根据回答与期望答案的匹配程度评分。"
+            if ttype == "生成式":
+                rubric = "【仅评审可见】满分10分。根据答案的完整性、准确性与逻辑一致性评分。"
+            else:
+                rubric = "【仅评审可见】满分10分。根据回答与期望答案的匹配程度评分。"
 
         task: dict[str, Any] = {
             "id": task_id,
@@ -327,6 +423,10 @@ def parse_csv_dataset(content: str) -> dict[str, Any]:
             "prompt": prompt,
             "test_cases": [{"input": prompt[:50], "expected": expected}] if expected else [],
             "rubric_note": rubric,
+            "type": ttype,
+            "context": context,
+            "tags": tags,
+            "excluded_from_total": excl,
         }
         tasks.append(task)
 

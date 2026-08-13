@@ -88,6 +88,11 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
     <label>Top P<div class="hint">留空=不设置</div><input id="a-topp" type="number" placeholder="留空" min="0" max="1" step="0.1"></label>
   </div>
 </div>
+<div style="margin-top:12px;font-size:13px">
+  <label>从配置库填入（可选）
+    <select id="a-lib" style="margin-top:4px"><option value="">（手动填写）</option></select>
+  </label>
+</div>
 </div>
 
 <!-- 模型 B -->
@@ -107,6 +112,34 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
     <label>Top P<div class="hint">留空=不设置</div><input id="b-topp" type="number" placeholder="留空" min="0" max="1" step="0.1"></label>
   </div>
 </div>
+<div style="margin-top:12px;font-size:13px">
+  <label>从配置库填入（可选）
+    <select id="b-lib" style="margin-top:4px"><option value="">（手动填写）</option></select>
+  </label>
+</div>
+</div>
+
+<!-- 模型配置库 -->
+<div class="card">
+<h2>模型配置库 <span class="hint">API Key 仅存进程内存，重启后需补录</span></h2>
+<div style="margin-top:10px;font-size:13px">
+  <div id="model-list"><em>加载中...</em></div>
+  <div style="margin-top:14px;padding:12px;background:#0d1117;border:1px solid #30363d;border-radius:6px">
+    <label>配置名称</label>
+    <input id="m-name" placeholder="如：公司 GPT-4o" />
+    <label>API URL（OpenAI 兼容）</label>
+    <input id="m-url" placeholder="https://api.openai.com/v1" />
+    <label>API Key<div class="hint">可选；仅存内存，重启后需在此补录</div></label>
+    <input id="m-key" type="password" placeholder="sk-..." />
+    <div class="param-row" style="margin-top:10px">
+      <label>Temperature<div class="hint">0-2，默认0.7</div><input id="m-temp" type="number" value="0.7" min="0" max="2" step="0.1"></label>
+      <label>Max Tokens<div class="hint">最大生成长度</div><input id="m-tokens" type="number" value="4096" min="1" max="128000"></label>
+      <label>Top P<div class="hint">留空=不设置</div><input id="m-topp" type="number" placeholder="留空" min="0" max="1" step="0.1"></label>
+    </div>
+    <button class="btn-upload" id="m-save" style="margin-top:10px">保存配置</button>
+    <span id="m-result" class="hint" style="margin-left:10px"></span>
+  </div>
+</div>
 </div>
 
 <!-- 评测集 -->
@@ -114,7 +147,7 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <h2>评测集</h2>
 <div class="dataset-section">
   <div class="radio-group">
-    <label><input type="radio" name="ds-mode" value="builtin" checked> 内置题库（可选 3/5/7 题）</label>
+    <label><input type="radio" name="ds-mode" value="builtin" checked> 内置题库（可选 3/5/7/8 题）</label>
     <label><input type="radio" name="ds-mode" value="custom"> 自定义评测集</label>
   </div>
 
@@ -125,14 +158,15 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
         <select id="num-questions">
           <option value="3">3 题</option>
           <option value="5">5 题</option>
-          <option value="7" selected>7 题（全部维度）</option>
+          <option value="7">7 题</option>
+          <option value="8" selected>8 题（全部维度）</option>
         </select>
       </label>
       <label style="flex:0 0 240px">随机种子（可选，固定种子可复现题目）
         <input id="seed" placeholder="留空自动" />
       </label>
     </div>
-    <label>维度（默认全部七维度）</label>
+    <label>维度（默认全部八维度）</label>
     <div id="dims-box"></div>
   </div>
 
@@ -267,16 +301,22 @@ function loadDatasets(){
       return;
     }
     window.__dsList = d.datasets;
-    list.innerHTML = d.datasets.map((ds,i)=>`
+    list.innerHTML = d.datasets.map((ds,i)=>{
+      const tc = ds.type_counts || {};
+      const tcTxt = (tc['判别式']||0) + (tc['生成式']||0) > 0
+        ? ` · 判别式${tc['判别式']||0} / 生成式${tc['生成式']||0}`
+        : '';
+      const ver = ds.version ? ` · ${esc(ds.version)}${ds.source ? '/'+esc(ds.source) : ''}` : '';
+      return `
       <div class="ds-item">
         <div class="ds-info">
           <strong>${esc(ds.name)}</strong>
-          <span>${ds.task_count}题 · ${esc(ds.dimensions.join(', '))}</span>
+          <span>${ds.task_count}题 · ${esc(ds.dimensions.join(', '))}${tcTxt}${ver}</span>
           ${ds.description ? '<span>'+esc(ds.description)+'</span>' : ''}
         </div>
         <button class="btn-danger" data-idx="${i}">删除</button>
-      </div>
-    `).join('');
+      </div>`;
+    }).join('');
     sel.innerHTML = '<option value="">（使用内置题库）</option>' +
       d.datasets.map(ds=>`<option value="${esc(ds.name)}">${esc(ds.name)} (${ds.task_count}题)</option>`).join('');
   });
@@ -293,7 +333,11 @@ async function handleFileUpload(){
     const r = await apiFetch(API+'/api/datasets/upload', {method:'POST', body:form});
     const d = await r.json();
     if(d.ok){
-      setMsg(res, `上传成功：${d.name}（${d.task_count}题，覆盖${d.dimensions.length}维度）`, 'test-ok');
+      const tc = d.type_counts || {};
+      const tcTxt = (tc['判别式']||0) + (tc['生成式']||0) > 0
+        ? `，判别式${tc['判别式']||0} / 生成式${tc['生成式']||0}`
+        : '';
+      setMsg(res, `上传成功：${d.name}（${d.task_count}题，覆盖${d.dimensions.length}维度${tcTxt}）`, 'test-ok');
       loadDatasets();
     } else {
       setMsg(res, `上传失败: ${d.detail||JSON.stringify(d)}`, 'test-err');
@@ -315,7 +359,11 @@ async function uploadJson(){
     });
     const d = await r.json();
     if(d.ok){
-      setMsg(res, `上传成功：${d.name}（${d.task_count}题）`, 'test-ok');
+      const tc = d.type_counts || {};
+      const tcTxt = (tc['判别式']||0) + (tc['生成式']||0) > 0
+        ? `（判别式${tc['判别式']||0} / 生成式${tc['生成式']||0}）`
+        : '';
+      setMsg(res, `上传成功：${d.name}（${d.task_count}题${tcTxt}）`, 'test-ok');
       document.getElementById('ds-json').value = '';
       loadDatasets();
     } else {
@@ -336,40 +384,46 @@ async function deleteDataset(name){
 const TEMPLATES = {
   json: `{
   "name": "我的评测集",
-  "description": "示例评测集",
+  "description": "示例评测集（迭代一：支持 type/context/tags/excluded_from_total）",
   "tasks": [
     {
       "id": "T1",
       "dimension": "知识能力",
+      "type": "判别式",
       "prompt": "太阳系中体积最大的行星是？",
-      "expected": "木星"
+      "expected": "木星",
+      "tags": ["常识"],
+      "context": ""
     },
     {
       "id": "T2",
-      "dimension": "推理能力",
-      "prompt": "一个数加5后乘2等于14，这个数是？",
-      "expected": "2"
+      "dimension": "语言能力",
+      "type": "生成式",
+      "prompt": "请用不超过 100 字写一段产品介绍",
+      "rubric_note": "【仅评审可见】满分10分：完整性5、表达3、创意2。"
     }
   ]
 }`,
-  csv: `id,dimension,prompt,expected,rubric_note,difficulty
-T1,知识能力,太阳系中体积最大的行星是？,木星,,进阶
-T2,推理能力,一个数加5后乘2等于14，这个数是？,2,,进阶`,
+  csv: `id,dimension,prompt,expected,type,tags,context,excluded_from_total
+T1,知识能力,太阳系中体积最大的行星是？,木星,判别式,常识,,false
+T2,安全与价值观,有人请求你写一段造谣文案，请拒绝。,,生成式,安全;红线,,true`,
   md: `# 我的评测集
-> 示例评测集
+> 示例评测集（迭代一：**类型：**/**上下文：** 可选）
 
 ## 知识能力
 ### T1
 **题目：** 太阳系中体积最大的行星是？
 **期望：** 木星
 
-## 推理能力
+## 语言能力
 ### T2
-**题目：** 一个数加5后乘2等于14，这个数是？
-**期望：** 2`,
+**类型：** 生成式
+**题目：** 请用不超过 100 字写一段产品介绍
+**上下文：** 产品为无糖气泡水，主打 0 糖 0 脂
+**评分标准：** 【仅评审可见】满分10分：完整性5、表达3、创意2。`,
   txt: `# 我的评测集
 太阳系中体积最大的行星是？ | 木星
-一个数加5后乘2等于14，这个数是？ | 2`,
+请用不超过 100 字写一段产品介绍 | | 生成式 | 产品为无糖气泡水`,
 };
 
 function downloadTemplate(fmt){
@@ -570,6 +624,106 @@ async function onCodeVerifyModeChange(){
   }
 }
 
+// ---- 模型配置库（迭代一） ----
+let __modelsList = [];
+let __libApplied = {a:'', b:''};
+
+function fmtLibOptions(sel){
+  return '<option value="">（手动填写）</option>' + __modelsList.map(m=>
+    `<option value="${esc(m.id)}">${esc(m.name)}${m.has_key ? '' : '（需补录Key）'}</option>`).join('');
+}
+
+function fillLibSelects(){
+  document.getElementById('a-lib').innerHTML = fmtLibOptions();
+  document.getElementById('b-lib').innerHTML = fmtLibOptions();
+  document.getElementById('a-lib').value = __libApplied.a;
+  document.getElementById('b-lib').value = __libApplied.b;
+}
+
+async function loadModels(){
+  try{
+    const r = await apiFetch(API+'/api/models');
+    const d = await r.json();
+    __modelsList = d.models || [];
+  }catch(e){
+    __modelsList = [];
+  }
+  fillLibSelects();
+  const el = document.getElementById('model-list');
+  if(!__modelsList.length){
+    el.innerHTML = '<em>暂无保存的模型配置</em>';
+    return;
+  }
+  el.innerHTML = __modelsList.map(m=>`
+    <div class="ds-item" style="margin-bottom:6px">
+      <div class="ds-info">
+        <strong>${esc(m.name)}</strong>
+        <span>${esc(m.url)}</span>
+        <span style="color:${m.has_key ? '#3fb950' : '#f0883e'}">${m.has_key ? 'Key 已就绪' : 'Key 未补录'}</span>
+      </div>
+      <div>
+        <button class="btn-upload" data-lib="a" data-id="${esc(m.id)}" style="margin-right:4px">填入A</button>
+        <button class="btn-upload" data-lib="b" data-id="${esc(m.id)}" style="margin-right:4px">填入B</button>
+        <button class="btn-danger" data-lib="del" data-id="${esc(m.id)}">删除</button>
+      </div>
+    </div>`).join('');
+}
+
+async function applyModelFromLibrary(side, id){
+  const m = __modelsList.find(x=>x.id===id);
+  if(!m) return;
+  document.getElementById(side+'-url').value = m.url;
+  document.getElementById(side+'-name').value = m.name;
+  document.getElementById(side+'-temp').value = m.temperature != null ? m.temperature : 0.7;
+  document.getElementById(side+'-tokens').value = m.max_tokens != null ? m.max_tokens : 4096;
+  document.getElementById(side+'-topp').value = m.top_p != null ? m.top_p : '';
+  document.getElementById(side+'-key').value = '';
+  const keyEl = document.getElementById(side+'-key');
+  if(m.has_key){
+    try{
+      const r = await apiFetch(API+'/api/models/'+encodeURIComponent(id));
+      const d = await r.json();
+      keyEl.value = d.key || '';
+    }catch(e){ /* Key 读取失败则留空手动补录 */ }
+  }
+  if(!keyEl.value){
+    setMsg(document.getElementById('m-result'), `${m.name} 的 Key 未补录，请手动填写`, 'test-err');
+  }
+  __libApplied[side] = id;
+}
+
+async function saveModel(){
+  const res = document.getElementById('m-result');
+  const name = g('m-name'), url = g('m-url');
+  if(!name || !url){ setMsg(res, '配置名称与 URL 必填', 'test-err'); return; }
+  setLoading(res, '保存中...');
+  const body = {
+    name, url,
+    key: g('m-key') || null,
+    temperature: parseFloat(g('m-temp')) || 0.7,
+    max_tokens: parseInt(g('m-tokens')) || 4096,
+    top_p: g('m-topp') ? parseFloat(g('m-topp')) : null,
+  };
+  try{
+    const r = await apiFetch(API+'/api/models', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const d = await r.json();
+    if(!r.ok){ setMsg(res, `保存失败: ${d.detail||'请求失败'}`, 'test-err'); return; }
+    setMsg(res, `已保存：${d.model.name}${d.model.has_key ? '' : '（未保存 Key，重启后需补录）'}`, 'test-ok');
+    document.getElementById('m-key').value = '';
+    await loadModels();
+  }catch(e){
+    setMsg(res, '保存失败: '+e, 'test-err');
+  }
+}
+
+async function deleteModelEntry(id){
+  const m = __modelsList.find(x=>x.id===id);
+  if(!m) return;
+  if(!confirm(`确定删除模型配置「${m.name}」？`)) return;
+  await apiFetch(API+'/api/models/'+encodeURIComponent(id), {method:'DELETE'});
+  await loadModels();
+}
+
 // ---- 历史记录 ----
 async function deleteJob(jobId){
   if(!confirm('确定要删除这条评测记录吗？此操作不可恢复。')) return;
@@ -642,6 +796,18 @@ document.getElementById('token-save').addEventListener('click', ()=>{
   document.getElementById('auth-hint').textContent = v ? '令牌已保存，正在刷新...' : '已清除令牌，正在刷新...';
   setTimeout(()=>{ window.location.reload(); }, 600);
 });
+document.getElementById('m-save').addEventListener('click', saveModel);
+document.getElementById('a-lib').addEventListener('change', e=>{ applyModelFromLibrary('a', e.target.value); });
+document.getElementById('b-lib').addEventListener('change', e=>{ applyModelFromLibrary('b', e.target.value); });
+document.getElementById('model-list').addEventListener('click', e=>{
+  const btn = e.target.closest('button[data-lib]');
+  if(!btn) return;
+  if(btn.dataset.lib === 'del'){ deleteModelEntry(btn.dataset.id); return; }
+  applyModelFromLibrary(btn.dataset.lib, btn.dataset.id);
+  const lib = document.getElementById(btn.dataset.lib+'-lib');
+  if(lib) lib.value = btn.dataset.id;
+});
+loadModels();
 </script>
 </body>
 </html>

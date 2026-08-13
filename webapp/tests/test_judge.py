@@ -229,3 +229,48 @@ def test_run_judge_revealed_uses_file_labels(monkeypatch):
     assert revealed["answer_x"] in ("answers-a.json", "answers-b.json")
     assert revealed["answer_y"] in ("answers-a.json", "answers-b.json")
     assert revealed["answer_x"] != revealed["answer_y"]
+
+def test_run_judge_excluded_tasks_not_in_totals(monkeypatch):
+    import re as _re
+
+    async def mock_call(client, judge_cfg, prompt, *args, **kwargs):
+        tid = _re.search(r'"id":"([^"]+)"', prompt).group(1)
+        return VALID_V.replace('"id":"T1"', f'"id":"{tid}"')
+    monkeypatch.setattr(judge_module, "_call_judge_model", mock_call)
+
+    task_set = {"tasks": [
+        {**TASK, "id": "T1"},
+        {**TASK, "id": "T2", "excluded_from_total": True},
+    ]}
+    answers_x = {"model": "模型A", "answers": [
+        {"id": "T1", "raw_answer": "a", "code_verify": {}},
+        {"id": "T2", "raw_answer": "a", "code_verify": {}},
+    ]}
+    answers_y = {"model": "模型B", "answers": [
+        {"id": "T1", "raw_answer": "b", "code_verify": {}},
+        {"id": "T2", "raw_answer": "b", "code_verify": {}},
+    ]}
+
+    result = asyncio.run(run_judge(task_set, answers_x, answers_y, JUDGE_CFG))
+    assert result["meta"]["excluded_ids"] == ["T2"]
+    assert result["meta"]["excluded_dimensions"] == [TASK["dimension"]]
+    # 排除题不参与 totals/per_dimension；全部 8 分都来自 T1
+    assert result["totals"] == {"answer_x": 8, "answer_y": 6}
+    assert result["per_dimension"][TASK["dimension"]] == {"x": 8, "y": 6}
+    # 排除题仍逐题评分供展示
+    by_id = {s["id"]: s for s in result["scores"]}
+    assert "T2" in by_id and by_id["T2"]["answer_x"] == 8
+
+
+def test_run_judge_all_excluded_totals_zero(monkeypatch):
+    async def mock_call(client, judge_cfg, prompt, *args, **kwargs):
+        return VALID_V
+    monkeypatch.setattr(judge_module, "_call_judge_model", mock_call)
+
+    task_set = {"tasks": [{**TASK, "id": "T1", "excluded_from_total": True}]}
+    answers_x = {"model": "模型A", "answers": [{"id": "T1", "raw_answer": "a", "code_verify": {}}]}
+    answers_y = {"model": "模型B", "answers": [{"id": "T1", "raw_answer": "b", "code_verify": {}}]}
+
+    result = asyncio.run(run_judge(task_set, answers_x, answers_y, JUDGE_CFG))
+    assert result["totals"] == {"answer_x": 0, "answer_y": 0}
+    assert result["winner_model"] == "tie"

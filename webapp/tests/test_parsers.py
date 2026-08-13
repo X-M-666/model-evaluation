@@ -309,3 +309,59 @@ def test_get_parser_missing_dot_returns_none():
 
 def test_supported_extensions_sorted():
     assert supported_extensions() == [".csv", ".json", ".markdown", ".md", ".txt"]
+
+# ---------------- 迭代一：MD 类型/上下文、TXT 4 段 ----------------
+
+def test_markdown_type_and_multi_line_context():
+    md = (
+        "# 集\n"
+        "### Q1\n"
+        "**题目：** p1\n"
+        "**类型：** 生成式\n"
+        "**上下文：** 第一行上下文\n"
+        "第二行上下文\n"
+        "**评分标准：** 满分10分\n"
+        "### Q2\n"
+        "**题目：** p2\n"
+        "**期望：** e2\n"
+    )
+    data = parse_markdown(md)
+    t1, t2 = data["tasks"]
+    assert t1["type"] == "生成式"
+    assert t1["context"] == "第一行上下文\n第二行上下文"
+    assert t1["rubric_note"] == "满分10分"
+    assert t2["type"] == "判别式"
+    assert t2["context"] == ""
+
+
+def test_markdown_context_ends_at_heading():
+    md = (
+        "### Q1\n"
+        "**题目：** p1\n"
+        "**上下文：** 上下文甲\n"
+        "## 代码能力\n"
+        "### Q2\n"
+        "**题目：** p2\n"
+    )
+    data = parse_markdown(md)
+    assert data["tasks"][0]["context"] == "上下文甲"
+    assert data["tasks"][1]["dimension"] == "代码能力"
+
+
+def test_txt_four_segments_type_and_context():
+    data = parse_txt("q | e | 生成式 | 背景材料\n")
+    t = data["tasks"][0]
+    assert t["type"] == "生成式"
+    assert t["context"] == "背景材料"
+
+
+def test_txt_three_segments_type_default_discriminative():
+    data = parse_txt("q | e | 判别式\n")
+    assert data["tasks"][0]["type"] == "判别式"
+    assert data["tasks"][0]["context"] == ""
+
+
+def test_txt_invalid_type_rejected():
+    from backend.engine.datasets import DatasetValidationError
+    with pytest.raises(DatasetValidationError, match="判别式/生成式"):
+        parse_txt("q | e | 主观题\n")

@@ -25,7 +25,7 @@ CONFIG = {
 BASIC_TASK = {"id": "T1", "dimension": "知识能力", "prompt": "1+1?"}
 CODE_TASK = {"id": "C1", "dimension": "代码能力", "prompt": "写函数",
              "test_cases": [{"input": "f()", "expected": "1"}]}
-STABILITY_TASK = {"id": "S1", "dimension": "效率与稳定性", "prompt": "p"}
+STABILITY_TASK = {"id": "S1", "dimension": "长文本与效率稳定性", "prompt": "p"}
 
 
 # ---- handlers ----

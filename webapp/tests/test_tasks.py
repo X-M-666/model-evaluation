@@ -2,9 +2,10 @@
 """内置题库与任务集生成器单元测试（补强方案 #9：tasks.py 覆盖率盲区）。
 
 保护不变量：
-- 七大维度完整、每维度 T/TB 双题、字段齐全、rubric 仅供评审可见
+- 八大维度完整、每维度至少一题、字段齐全、rubric 仅供评审可见
 - 代码题 5 组用例且 input 为函数调用形式（sandbox 打印包裹执行分支）
-- 效率题 5 组用例且 input 为 stdin 文本形式（绝不误判为函数调用）
+- 效率/稳定性程序题 5 组用例且 input 为 stdin 文本形式（绝不误判为函数调用）
+- 安全与价值观维度题目全部 excluded_from_total=True（不计分仅展示）
 - generate_tasks 抽样/复现/维度过滤/编号语义
 - build_task_set 稳定性 repeat 标记与 meta 语义
 - build_task_set_from_dataset 字段补全、编号与稳定性检测
@@ -19,6 +20,8 @@ from backend.engine.datasets import DatasetValidationError
 from backend.engine.tasks import (
     DIMENSIONS,
     QUESTION_POOL,
+    SAFETY_DIMENSION,
+    STABILITY_DIMENSION,
     build_task_set,
     build_task_set_from_dataset,
     generate_tasks,
@@ -27,10 +30,11 @@ from backend.engine.tasks import (
 # 与 sandbox.verify_code_task 的函数型判定正则保持一致
 _FUNC_CALL_RE = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\(")
 
-CODE_DIMS = {"代码能力", "效率与稳定性"}
+CODE_DIMS = {"代码能力", STABILITY_DIMENSION}
 REQUIRED_FIELDS = {
     "id", "dimension", "benchmark", "difficulty", "prompt",
     "test_cases", "rubric_note",
+    "type", "context", "tags", "excluded_from_total",
 }
 
 
@@ -43,18 +47,19 @@ def _all_pool_questions():
 # ---- 题库池完整性 ----
 
 def test_dimensions_complete_and_pool_aligned():
-    assert len(DIMENSIONS) == 7
+    assert len(DIMENSIONS) == 8
     assert set(DIMENSIONS) == set(QUESTION_POOL.keys())
 
 
-def test_each_dimension_has_t_and_tb_pair():
+def test_each_dimension_has_at_least_one_question():
     seen = set()
     for dim in DIMENSIONS:
         ids = sorted(q["id"] for q in QUESTION_POOL[dim])
-        assert len(ids) == 2, f"{dim} 应恰好 T/TB 两题: {ids}"
+        assert ids, f"{dim} 不应为空"
+        assert len(set(ids)) == len(ids), f"{dim} 存在重复题号"
         seen.update(ids)
-    assert len(seen) == 14
-    assert all(re.fullmatch(r"T[1-7]B?", i) for i in seen)
+    assert len(seen) == len({q["id"] for _, q in _all_pool_questions()})
+    assert all(re.fullmatch(r"T\d+[A-Z]?", i) for i in seen)
 
 
 def test_pool_question_required_fields():
@@ -74,13 +79,33 @@ def test_code_questions_have_five_function_call_cases():
 
 
 def test_efficiency_questions_have_five_stdin_cases():
+    five_case_ids = []
     for dim, q in _all_pool_questions():
-        if dim != "效率与稳定性":
+        if dim != STABILITY_DIMENSION:
             continue
-        assert len(q["test_cases"]) == 5, f"{q['id']} 应为 5 组用例"
         for tc in q["test_cases"]:
             # 程序型：输入作为 stdin 原样传入，绝不能被误判为函数调用
             assert not _FUNC_CALL_RE.match(tc["input"]), f"{q['id']} 程序型用例不应是函数调用: {tc['input']!r}"
+        if len(q["test_cases"]) == 5:
+            five_case_ids.append(q["id"])
+    # 两道纯程序题（T7/T7B）必须恰好 5 组用例（与 mock/executor total=5 对齐）
+    assert sorted(five_case_ids) == ["T7", "T7B"]
+
+
+def test_safety_questions_all_excluded_from_total():
+    for dim, q in _all_pool_questions():
+        if dim != SAFETY_DIMENSION:
+            continue
+        assert q.get("excluded_from_total") is True, f"{q['id']} 应标记不计分"
+        assert q.get("type") == "生成式", f"{q['id']} 应为生成式"
+        assert q.get("rubric_note", "").startswith("【仅评审可见】"), f"{q['id']} rubric 缺失"
+
+
+def test_generative_pool_questions_have_rubric():
+    for _, q in _all_pool_questions():
+        if q.get("type") != "生成式":
+            continue
+        assert q.get("rubric_note", "").startswith("【仅评审可见】"), f"{q['id']} 生成式缺评分标准"
 
 
 def test_non_code_questions_cases_well_formed():
@@ -102,10 +127,10 @@ def test_pool_ids_unique_globally():
 
 def test_generate_default_all_dimensions():
     tasks = generate_tasks(seed=42)
-    assert len(tasks) == 7
+    assert len(tasks) == 8
     assert [t["dimension"] for t in tasks] == DIMENSIONS
-    assert [t["id"] for t in tasks] == [f"T{i+1}" for i in range(7)]
-    assert len({t["dimension"] for t in tasks}) == 7
+    assert [t["id"] for t in tasks] == [f"T{i+1}" for i in range(8)]
+    assert len({t["dimension"] for t in tasks}) == 8
 
 
 def test_generate_seed_reproducible():
@@ -131,7 +156,7 @@ def test_generate_num_questions_sampled():
 
 def test_generate_num_questions_clamped():
     tasks = generate_tasks(seed=7, num_questions=99)
-    assert len(tasks) == 7
+    assert len(tasks) == 8
 
 
 def test_generate_num_questions_zero_returns_empty():
@@ -148,13 +173,15 @@ def test_generate_ids_renumbered():
 def test_build_task_set_meta():
     ts = build_task_set(seed=5, num_questions=7)
     assert ts["meta"]["total"] == len(ts["tasks"]) == 7
-    assert ts["meta"]["scope"] == "七大能力维度"
+    assert ts["meta"]["scope"] == "八大能力维度"
     assert ts["meta"]["num_questions"] == 7
     assert ts["meta"]["created_by"] == "webapp"
+    assert ts["meta"]["dataset_version"] == "v1"
+    assert ts["meta"]["dataset_source"] == "builtin"
 
 
 def test_build_task_set_stability_flag_when_efficiency_selected():
-    ts = build_task_set(dims=["效率与稳定性"], seed=5)
+    ts = build_task_set(dims=[STABILITY_DIMENSION], seed=5)
     assert ts["meta"]["eval_flags"] == {"stability_repeat": {"T1": 2}}
 
 
@@ -192,6 +219,10 @@ def test_dataset_missing_fields_filled():
     assert t["difficulty"] == "进阶"
     assert t["test_cases"] == []
     assert t["rubric_note"]
+    assert t["type"] == "判别式"
+    assert t["context"] == ""
+    assert t["tags"] == []
+    assert t["excluded_from_total"] is False
     assert ts["meta"]["total"] == 1
     assert ts["meta"]["scope"] == "自定义评测集"
     assert ts["meta"]["dataset_name"] == "测试集"
@@ -222,11 +253,23 @@ def test_dataset_ids_numbered_for_missing_only():
 
 def test_dataset_stability_flag_detected():
     tasks = [
-        {"id": "S1", "dimension": "效率与稳定性", "prompt": "p"},
+        {"id": "S1", "dimension": STABILITY_DIMENSION, "prompt": "p"},
         {"id": "S2", "dimension": "知识能力", "prompt": "p"},
     ]
     ts = build_task_set_from_dataset(_raw_dataset(tasks))
     assert ts["meta"]["eval_flags"] == {"stability_repeat": {"S1": 2}}
+
+
+def test_dataset_meta_version_source_passthrough():
+    ts = build_task_set_from_dataset(_raw_dataset([{"prompt": "p"}]))
+    assert ts["meta"]["dataset_version"] == "v1"
+    assert ts["meta"]["dataset_source"] == "upload"
+
+
+def test_dataset_excluded_flag_kept():
+    tasks = [{"prompt": "p", "excluded_from_total": True, "type": "生成式", "rubric_note": "【仅评审可见】r"}]
+    ts = build_task_set_from_dataset(_raw_dataset(tasks))
+    assert ts["tasks"][0]["excluded_from_total"] is True
 
 
 def test_dataset_multiple_dimensions_total():

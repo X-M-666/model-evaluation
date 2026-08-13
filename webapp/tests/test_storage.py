@@ -301,3 +301,56 @@ def test_read_apis_never_create_directory():
     jid = _jid("read-only")
     assert storage.get_job_files(jid) is None
     assert not (storage.BASE_DIR / jid).exists()
+
+# ---------------- 迭代一：数据集元信息 / 跨 job 汇总 ----------------
+
+def test_dataset_version_source_roundtrip():
+    data = {"name": "V", "tasks": [{"prompt": "p"}], "version": "v2", "source": "csv"}
+    storage.save_dataset("V", data)
+    loaded = storage.load_dataset("V")
+    assert loaded["version"] == "v2"
+    assert loaded["source"] == "csv"
+    assert loaded["created_at"]
+    raw = json.loads((storage.DATASETS_DIR / "V.json").read_text(encoding="utf-8"))
+    assert raw["version"] == "v2" and raw["source"] == "csv"
+
+
+def test_dataset_legacy_file_gets_default_version():
+    (storage.DATASETS_DIR / "老.json").write_text(
+        json.dumps({"name": "老", "tasks": [{"prompt": "p"}]}, ensure_ascii=False),
+        encoding="utf-8")
+    loaded = storage.load_dataset("老")
+    assert loaded["version"] == "v1"
+    assert loaded["source"] == "upload"
+
+
+def test_dataset_list_type_counts():
+    storage.save_dataset("TC", {"name": "TC", "tasks": [
+        {"prompt": "p1", "type": "判别式"},
+        {"prompt": "p2", "type": "生成式"},
+        {"prompt": "p3"},
+    ]})
+    s = {x["name"]: x for x in storage.list_datasets()}["TC"]
+    assert s["version"] == "v1"
+    assert s["source"] == "upload"
+    assert s["type_counts"] == {"判别式": 2, "生成式": 1}
+
+
+def test_saturation_update_idempotent_by_job():
+    assert storage.update_saturation(_jid("sat"), [{"id": "T1", "winner": "answer_x"}]) is True
+    assert storage.update_saturation(_jid("sat"), [{"id": "T1", "winner": "answer_x"}]) is False
+    data = storage.get_saturation()
+    assert len(data["jobs"]) == 1
+    assert data["jobs"][0]["job_id"] == _jid("sat")
+    assert data["jobs"][0]["entries"][0]["winner"] == "answer_x"
+    assert "updated_at" in data["jobs"][0]
+
+
+def test_saturation_invalid_job_id_rejected():
+    assert storage.update_saturation("../bad", []) is False
+
+
+def test_saturation_corrupt_recovers_empty():
+    storage.SATURATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    storage.SATURATION_FILE.write_text("{broken", encoding="utf-8")
+    assert storage.get_saturation() == {"jobs": []}

@@ -213,3 +213,52 @@ def test_single_round_unchanged():
     assert verdict["meta"]["repeat_n"] == 1
     assert verdict["winner_model"] == MODEL_A
     assert verdict["totals"] == {"answer_x": 16.0, "answer_y": 4.0}
+
+# ---------------- 迭代一：不计分题（excluded_from_total） ----------------
+
+EXCLUDED_TASK_SET = {
+    "tasks": [
+        {"id": "t1", "dimension": "知识"},
+        {"id": "t2", "dimension": "安全与价值观", "excluded_from_total": True},
+    ]
+}
+
+
+def test_round_verdict_excluded_not_in_totals():
+    scores = [
+        {"id": "t1", "answer_x": 8.0, "answer_y": 6.0, "note": ""},
+        {"id": "t2", "answer_x": 9.0, "answer_y": 1.0, "note": ""},
+    ]
+    v = build_round_verdict(EXCLUDED_TASK_SET, scores, {"answer_x": "a", "answer_y": "b"},
+                            MODEL_A, MODEL_B, 0)
+    assert v["totals"] == {"answer_x": 8.0, "answer_y": 6.0}
+    assert v["per_dimension"] == {"知识": {"x": 8.0, "y": 6.0}}
+    assert "安全与价值观" not in v["per_dimension"]
+    assert v["meta"]["excluded_ids"] == ["t2"]
+    assert v["meta"]["excluded_dimensions"] == ["安全与价值观"]
+    # 不计分题仍逐题记录供展示
+    assert {s["id"] for s in v["scores"]} == {"t1", "t2"}
+
+
+def test_final_verdict_excluded_aggregated():
+    round_verdicts = [
+        build_round_verdict(EXCLUDED_TASK_SET, [
+            {"id": "t1", "answer_x": 8.0, "answer_y": 6.0, "note": ""},
+            {"id": "t2", "answer_x": 9.0, "answer_y": 1.0, "note": ""},
+        ], {"answer_x": "a", "answer_y": "b"}, MODEL_A, MODEL_B, 0),
+        build_round_verdict(EXCLUDED_TASK_SET, [
+            {"id": "t1", "answer_x": 6.0, "answer_y": 8.0, "note": ""},
+            {"id": "t2", "answer_x": 1.0, "answer_y": 9.0, "note": ""},
+        ], {"answer_x": "b", "answer_y": "a"}, MODEL_B, MODEL_A, 1),
+    ]
+    verdict = build_final_verdict(round_verdicts, 2)
+    # 末轮 X=B：answer_x 投影为 B 的总分（6.0），answer_y 投影为 A 的总分（8.0）
+    assert verdict["totals"] == {"answer_x": 6.0, "answer_y": 8.0}
+    assert verdict["winner_model"] == MODEL_A
+    assert verdict["conclusion"]
+    assert verdict["meta"]["excluded_ids"] == ["t2"]
+    assert verdict["meta"]["excluded_dimensions"] == ["安全与价值观"]
+    # 全部题目（含不计分）都保留逐题行
+    assert {s["id"] for s in verdict["scores"]} == {"t1", "t2"}
+    t2 = {s["id"]: s for s in verdict["scores"]}["t2"]
+    assert t2["model_a"] == 9.0 and t2["model_b"] == 1.0

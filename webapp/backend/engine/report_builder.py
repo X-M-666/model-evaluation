@@ -6,6 +6,8 @@ from __future__ import annotations
 import statistics
 from typing import Any
 
+from backend.engine.tasks import STABILITY_DIMENSION
+
 EPS = 0.001
 
 
@@ -293,9 +295,15 @@ def _build_summary(
     totals = verdict.get("totals", {})
     total_x = round(totals.get("answer_x", 0), 2)
     total_y = round(totals.get("answer_y", 0), 2)
-    win_x = sum(1 for s in verdict.get("scores", []) if s.get("winner") == "answer_x")
-    win_y = sum(1 for s in verdict.get("scores", []) if s.get("winner") == "answer_y")
-    ties = sum(1 for s in verdict.get("scores", []) if s.get("winner") == "tie")
+
+    # 不计分题（excluded_from_total，如安全与价值观维度）：展示但不算战绩/平均分
+    scoring_ids = {
+        t["id"] for t in tasks if not t.get("excluded_from_total")
+    }
+    scoring_scores = [s for s in verdict.get("scores", []) if s.get("id") in scoring_ids]
+    win_x = sum(1 for s in scoring_scores if s.get("winner") == "answer_x")
+    win_y = sum(1 for s in scoring_scores if s.get("winner") == "answer_y")
+    ties = sum(1 for s in scoring_scores if s.get("winner") == "tie")
     if total_x > total_y:
         winner = "answer_x"
     elif total_y > total_x:
@@ -304,8 +312,10 @@ def _build_summary(
         winner = "tie"
 
     dims = list({r["dimension"] for r in rows})
-    avg_x = round(total_x / len(rows), 2) if rows else 0
-    avg_y = round(total_y / len(rows), 2) if rows else 0
+    n_scoring = len(scoring_scores)
+    avg_x = round(total_x / n_scoring, 2) if n_scoring else 0
+    avg_y = round(total_y / n_scoring, 2) if n_scoring else 0
+    excluded_dims = sorted({t["dimension"] for t in tasks if t.get("excluded_from_total")})
 
     return {
         "total_questions": len(rows),
@@ -315,13 +325,15 @@ def _build_summary(
         "y_model": verdict.get("revealed", {}).get("answer_y", ""),
         "total_x": total_x,
         "total_y": total_y,
-        "max_score": round(len(rows) * 10, 2),
+        "max_score": round(n_scoring * 10, 2),
         "avg_x": avg_x,
         "avg_y": avg_y,
         "win_x": win_x,
         "win_y": win_y,
         "ties": ties,
         "winner": winner,
+        "excluded_dimensions": excluded_dims,
+        "scoring_count": n_scoring,
         "winner_model": verdict.get("winner_model", "tie"),
         "score_ratio": round(total_x / total_y, 3) if total_y else None,
     }
@@ -450,8 +462,14 @@ def _build_analysis(
     paras.append(
         f"逐题战绩：{wname if summary['winner']!='tie' else '答案X'} 胜 {summary['win_x']} 题、"
         f"{lname if summary['winner']!='tie' else '答案Y'} 胜 {summary['win_y']} 题、平局 {summary['ties']} 题，"
-        f"共 {summary['total_questions']} 题。"
+        f"共 {summary.get('scoring_count', summary['total_questions'])} 题（计分）。"
     )
+    excluded_dims = summary.get("excluded_dimensions", [])
+    if excluded_dims:
+        paras.append(
+            f"不计分维度（{'、'.join(excluded_dims)}）：相关题目仍逐题打分供参考，"
+            f"但不计入总分、平均分与胜负判定。"
+        )
     if summary["avg_x"] > summary["avg_y"]:
         paras.append(f"平均分 {_fmt(summary['avg_x'])} vs {_fmt(summary['avg_y'])}（每题满分 10 分），{wname} 每题平均高出 {_fmt(summary['avg_x'] - summary['avg_y'])} 分。")
     elif summary["avg_y"] > summary["avg_x"]:
@@ -600,7 +618,7 @@ def _build_analysis(
         if len(_repeat_runs(r, "runs_x")) > 1 or len(_repeat_runs(r, "runs_y")) > 1
     ]
     if same_rows:
-        paras.append("效率与稳定性维度题目内置两次运行（temperature 0.7 → 0.0）校验输出一致性：")
+        paras.append(f"{STABILITY_DIMENSION}维度题目内置两次运行（temperature 0.7 → 0.0）校验输出一致性：")
         for r in same_rows:
             rx = _repeat_runs(r, "runs_x")
             ry = _repeat_runs(r, "runs_y")

@@ -43,10 +43,14 @@ SERVER: uvicorn.Server | None = None
 def _server_and_browser(tmp_path_factory):
     """同进程起 uvicorn（端口随机）+ 存储隔离到临时目录 + 浏览器实例。"""
     global BASE, SERVER
+    from backend import models_registry
     orig_base = storage.BASE_DIR
     orig_ds = storage.DATASETS_DIR
+    orig_models = models_registry.MODELS_DIR
     storage.BASE_DIR = tmp_path_factory.mktemp("history")
     storage.DATASETS_DIR = tmp_path_factory.mktemp("datasets")
+    models_registry.MODELS_DIR = tmp_path_factory.mktemp("models")
+    models_registry.clear_memory_keys()
     for jid in list(_jobs):
         _jobs.pop(jid)
 
@@ -67,6 +71,7 @@ def _server_and_browser(tmp_path_factory):
     thread.join(timeout=10)
     storage.BASE_DIR = orig_base
     storage.DATASETS_DIR = orig_ds
+    models_registry.MODELS_DIR = orig_models
 
 
 @pytest.fixture(autouse=True)
@@ -104,8 +109,8 @@ def test_payload_dataset_renders_without_execution(_page):
     assert _page.locator('.ds-item img, .ds-item svg, .ds-item script').count() == 0
     # 维度文本应原样展示（含引号载荷），只是纯文本
     assert "XSS_QUOTE" in _page.locator(".ds-item").first.text_content()
-    # 功能不回归：dims 复选框正常渲染（内置七维度）
-    assert _page.locator("#dims-box input[type=checkbox]").count() == 7
+    # 功能不回归：dims 复选框正常渲染（迭代一：八大维度）
+    assert _page.locator("#dims-box input[type=checkbox]").count() == 8
 
 
 def test_dataset_delete_via_delegation_under_csp(_page):
@@ -192,3 +197,66 @@ def test_review_page_full_flow_renders_and_submits(_page):
     _page.locator("#submitBtn").click()
     _page.wait_for_url("**/report.html?job=*", timeout=15000)
     assert "report.html" in _page.url
+
+
+# ---------------- 迭代一：模型配置库 e2e ----------------
+
+def _register_model(page, name: str, url: str, key: str | None = None) -> str:
+    body = {"name": name, "url": url, "key": key}
+    r = page.request.post(f"{BASE}/api/models", data=json.dumps(body), headers={"Content-Type": "application/json"})
+    assert r.ok, r.text
+    return r.json()["model"]["id"]
+
+
+def test_models_library_renders_and_fills_a(_page):
+    _register_model(_page, "库模型A", "https://8.8.8.8/v1", key="sk-lib-a")
+    _page.goto(f"{BASE}/")
+    _page.wait_for_selector("#model-list .ds-item")
+    row = _page.locator("#model-list .ds-item").first
+    expect(row).to_contain_text("库模型A")
+    expect(row).to_contain_text("Key 已就绪")
+    _page.locator('#model-list button[data-lib="a"]').click()
+    expect(_page.locator("#a-url")).to_have_value("https://8.8.8.8/v1")
+    expect(_page.locator("#a-name")).to_have_value("库模型A")
+    expect(_page.locator("#a-key")).to_have_value("sk-lib-a")
+
+
+def test_models_library_without_key_hints_manual_entry(_page):
+    _register_model(_page, "无Key模型", "https://8.8.8.8/v1")
+    _page.goto(f"{BASE}/")
+    _page.wait_for_selector("#model-list .ds-item")
+    row = _page.locator("#model-list .ds-item", has_text="无Key模型")
+    expect(row).to_contain_text("Key 未补录")
+    row.locator('button[data-lib="b"]').click()
+    expect(_page.locator("#b-url")).to_have_value("https://8.8.8.8/v1")
+    expect(_page.locator("#b-key")).to_have_value("")
+    expect(_page.locator("#m-result")).to_contain_text("未补录")
+
+
+def test_models_library_delete_removes_row(_page):
+    _register_model(_page, "待删模型", "https://8.8.8.8/v1")
+    _page.goto(f"{BASE}/")
+    _page.wait_for_selector("#model-list .ds-item")
+    row = _page.locator("#model-list .ds-item", has_text="待删模型")
+    _page.on("dialog", lambda d: d.accept())
+    row.locator('button[data-lib="del"]').click()
+    expect(row).to_have_count(0)
+    expect(_page.locator("#model-list .ds-item", has_text="待删模型")).to_have_count(0)
+
+
+def test_dataset_list_shows_type_badges(_page):
+    payload = json.dumps({
+        "name": "题型集",
+        "tasks": [
+            {"id": "A", "prompt": "p1", "expected": "e1", "type": "判别式"},
+            {"id": "B", "prompt": "p2", "rubric_note": "r", "type": "生成式"},
+        ],
+    }, ensure_ascii=False)
+    r = _page.request.post(f"{BASE}/api/datasets/upload-json",
+                           data=json.dumps({"content": payload}),
+                           headers={"Content-Type": "application/json"})
+    assert r.ok, r.text
+    _page.goto(f"{BASE}/")
+    _page.check('input[name="ds-mode"][value="custom"]')
+    _page.wait_for_selector("#dataset-list .ds-item")
+    expect(_page.locator("#dataset-list .ds-item").first).to_contain_text("判别式1 / 生成式1")

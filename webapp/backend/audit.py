@@ -65,6 +65,16 @@ def dataset_deleted(name: str, actor: str = "local") -> None:
     _append({"event": "dataset_deleted", "target": name, "actor": actor})
 
 
+def model_registered(model_id: str, actor: str = "local") -> None:
+    """模型配置库新增配置（迭代一；Key 不落盘，仅存内存）。"""
+    _append({"event": "model_registered", "target": model_id, "actor": actor})
+
+
+def model_deleted(model_id: str, actor: str = "local") -> None:
+    """模型配置库删除配置。"""
+    _append({"event": "model_deleted", "target": model_id, "actor": actor})
+
+
 def auth_failed(path: str, actor: str = "unknown") -> None:
     _append({"event": "auth_failed", "path": path, "actor": actor})
 

@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 from backend.ssrf import build_upstream_client
+from backend.engine.tasks import CODE_DIMENSION, STABILITY_DIMENSION
 
 MAX_RETRIES = 1
 RETRY_BASE_DELAY = 3.0
@@ -105,8 +106,8 @@ async def execute_task(
     """执行单个任务。config 含 url/key/name/temperature/max_tokens/top_p/code_verify_mode。"""
     tid = task["id"]
     prompt = task["prompt"]
-    is_code_task = task["dimension"] == "代码能力"
-    is_stability_task = task["dimension"] == "效率与稳定性"
+    is_code_task = task["dimension"] == CODE_DIMENSION
+    is_stability_task = task["dimension"] == STABILITY_DIMENSION
 
     temperature = config.get("temperature", 0.7)
     max_tokens = config.get("max_tokens", 4096)

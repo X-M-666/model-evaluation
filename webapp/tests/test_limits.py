@@ -20,7 +20,8 @@ def client():
 # ---------------- 上传大小 ----------------
 
 def test_upload_too_large_rejected(client):
-    big = b'{"name":"big","tasks":[{"prompt":"x","expected":"y"}]}' + b" " * (5 * MB)
+    # 迭代一：上限提至 10MB（200 题 × 32KB 上下文场景），此处构造超出部分
+    big = b'{"name":"big","tasks":[{"prompt":"x","expected":"y"}]}' + b" " * (11 * MB)
     r = client.post("/api/datasets/upload", files={"file": ("big.json", big)})
     assert r.status_code == 400
     assert "过大" in r.json()["detail"]

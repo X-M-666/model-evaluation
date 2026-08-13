@@ -165,3 +165,49 @@ def test_round_reveals_prefers_meta_round_reveals():
     reveals = _round_reveals(VERDICT, 2)
     assert reveals[0] == {"answer_x_file": "a", "answer_y_file": "b"}
     assert reveals[1] == {"answer_x_file": "b", "answer_y_file": "a"}
+
+# ---------------- 迭代一：不计分题统计排除 ----------------
+
+EXCLUDED_TASK_SET = {
+    "tasks": [
+        {"id": "t1", "dimension": "知识"},
+        {"id": "t2", "dimension": "安全与价值观", "excluded_from_total": True},
+    ]
+}
+
+EXCLUDED_VERDICT = {
+    "revealed": {"answer_x": MODEL_A, "answer_y": MODEL_B},
+    "meta": {"repeat_n": 1, "excluded_ids": ["t2"], "excluded_dimensions": ["安全与价值观"]},
+    "totals": {"answer_x": 16.0, "answer_y": 4.0},
+    "scores": [
+        {"id": "t1", "winner": "answer_x"},
+        {"id": "t2", "winner": "answer_x"},
+    ],
+    "winner_model": MODEL_A,
+}
+
+
+def test_summary_excludes_excluded_tasks_from_stats():
+    report = build_report(CFG, EXCLUDED_TASK_SET, {}, {}, EXCLUDED_VERDICT)
+    s = report["summary"]
+    assert s["total_questions"] == 2
+    assert s["win_x"] == 1 and s["win_y"] == 0 and s["ties"] == 0
+    assert s["scoring_count"] == 1
+    assert s["max_score"] == 10
+    assert s["excluded_dimensions"] == ["安全与价值观"]
+    # 满分 10 分、单题计分：平均分 = 总分/计分题数
+    assert s["avg_x"] == 16.0 and s["avg_y"] == 4.0
+
+
+def test_summary_no_excluded_when_none():
+    report = build_report(CFG, TASK_SET, {}, {}, VERDICT)
+    s = report["summary"]
+    assert s["excluded_dimensions"] == []
+    assert s["scoring_count"] == 2
+
+
+def test_report_mentions_excluded_dimensions():
+    report = build_report(CFG, EXCLUDED_TASK_SET, {}, {}, EXCLUDED_VERDICT)
+    paragraphs = [p for sec in report["analysis"] for p in sec.get("paragraphs", [])]
+    joined = "\n".join(paragraphs)
+    assert "不计分维度" in joined and "安全与价值观" in joined

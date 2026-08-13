@@ -109,8 +109,15 @@ def build_round_verdict(
     y_model: str,
     round_idx: int,
 ) -> dict[str, Any]:
-    """把一轮的人工打分转成完整 verdict（revealed 含模型身份，评审结束才揭示）。"""
+    """把一轮的人工打分转成完整 verdict（revealed 含模型身份，评审结束才揭示）。
+
+    不计分题（excluded_from_total）仍逐题记录分数供展示，但不计入
+    totals / per_dimension / 胜负判定（安全与价值观维度）。
+    """
     score_by_id = {s["id"]: s for s in round_scores}
+    excluded_ids = {
+        t["id"] for t in task_set["tasks"] if t.get("excluded_from_total")
+    }
     scores: list[dict[str, Any]] = []
     dim_totals: dict[str, dict[str, float]] = {}
 
@@ -130,10 +137,11 @@ def build_round_verdict(
         else:
             winner = "tie"
         dim = t.get("dimension", "自定义")
-        if dim not in dim_totals:
-            dim_totals[dim] = {"x": 0.0, "y": 0.0}
-        dim_totals[dim]["x"] += x
-        dim_totals[dim]["y"] += y
+        if sid not in excluded_ids:
+            if dim not in dim_totals:
+                dim_totals[dim] = {"x": 0.0, "y": 0.0}
+            dim_totals[dim]["x"] += x
+            dim_totals[dim]["y"] += y
         scores.append({
             "id": sid, "dimension": dim,
             "answer_x": round(x, 2), "answer_y": round(y, 2),
@@ -153,12 +161,17 @@ def build_round_verdict(
     else:
         winner_model = "tie"
 
+    excluded_dims = sorted({t.get("dimension", "") for t in task_set["tasks"]
+                            if t.get("excluded_from_total")})
+
     return {
         "meta": {
             "total": len(scores),
             "valid": sum(1 for s in scores if not s["_invalid"]),
             "invalid": sum(1 for s in scores if s["_invalid"]),
             "tie_arbitrated": 0,
+            "excluded_ids": sorted(excluded_ids),
+            "excluded_dimensions": excluded_dims,
         },
         "scores": scores,
         "per_dimension": dim_totals,
@@ -247,6 +260,10 @@ def build_final_verdict(
         for r in _stable_scores(v):
             stable_map.setdefault(r["id"], []).append(r)
 
+    # 不计分题（安全与价值观维度）：仍保留平均分展示，但不计入总分/胜负
+    excluded_ids = set(round_verdicts[0].get("meta", {}).get("excluded_ids", []))
+    excluded_dims = sorted(set(round_verdicts[0].get("meta", {}).get("excluded_dimensions", [])))
+
     avg_scores: list[dict[str, Any]] = []
     dim_totals: dict[str, dict[str, float]] = {}
     for tid, round_scores in stable_map.items():
@@ -255,10 +272,11 @@ def build_final_verdict(
         a_mean = statistics.mean(a_vals)
         b_mean = statistics.mean(b_vals)
         dim = round_scores[0]["dimension"]
-        if dim not in dim_totals:
-            dim_totals[dim] = {"a": 0.0, "b": 0.0}
-        dim_totals[dim]["a"] += a_mean
-        dim_totals[dim]["b"] += b_mean
+        if tid not in excluded_ids:
+            if dim not in dim_totals:
+                dim_totals[dim] = {"a": 0.0, "b": 0.0}
+            dim_totals[dim]["a"] += a_mean
+            dim_totals[dim]["b"] += b_mean
         avg_scores.append({
             "id": tid,
             "dimension": dim,
@@ -315,6 +333,8 @@ def build_final_verdict(
             "invalid": 0,
             "tie_arbitrated": 0,
             "repeat_n": repeat_n,
+            "excluded_ids": sorted(excluded_ids),
+            "excluded_dimensions": excluded_dims,
             "round_reveals": [
                 {
                     "answer_x_file": rv.get("revealed", {}).get("answer_x_file", "a"),

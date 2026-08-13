@@ -54,6 +54,9 @@ def parse_markdown(raw: str) -> dict[str, Any]:
     - `**题目：** ...` → prompt
     - `**期望：** ...` → 期望答案（写入 test_cases[0].expected）
     - `**评分标准：** ...` → rubric_note（可选）
+    - `**类型：** 判别式|生成式` → 任务类型（可选，缺省判别式）
+    - `**上下文：**` → context（迭代一，可选；支持多行块：直到下一个
+      `**标签：**`、`#`/`##`/`###` 标题或文件尾，块内禁止空行）
     - 题目块内普通段落 → prompt 追加行
     """
     lines = raw.splitlines()
@@ -65,6 +68,9 @@ def parse_markdown(raw: str) -> dict[str, Any]:
     cur_prompt: list[str] = []
     cur_expected: list[str] = []
     cur_rubric: list[str] = []
+    cur_type: str = "判别式"
+    cur_context: list[str] = []
+    in_context_block = False
     auto_no = 0
     md_taken: set[str] = set()
 
@@ -76,7 +82,7 @@ def parse_markdown(raw: str) -> dict[str, Any]:
             md_explicit.add(s[3:].strip())
 
     def _flush():
-        nonlocal cur_id, cur_prompt, cur_expected, cur_rubric
+        nonlocal cur_id, cur_prompt, cur_expected, cur_rubric, cur_type, cur_context, in_context_block
         if cur_id is None:
             return
         prompt = "\n".join(s for s in cur_prompt if s.strip()).strip()
@@ -91,9 +97,19 @@ def parse_markdown(raw: str) -> dict[str, Any]:
                 "test_cases": [{"input": prompt[:50], "expected": expected}] if expected else [],
                 "rubric_note": "\n".join(s for s in cur_rubric if s.strip()).strip()
                 or "【仅评审可见】满分10分。根据回答与期望答案的匹配程度评分。",
+                "type": cur_type,
+                "context": "\n".join(s for s in cur_context if s.strip()).strip(),
             })
         cur_id = None
         cur_prompt, cur_expected, cur_rubric = [], [], []
+        cur_type = "判别式"
+        cur_context = []
+        in_context_block = False
+
+    def _flush_labels():
+        """开始新标签（题目/期望/评分标准/类型/上下文）时退出上下文多行块。"""
+        nonlocal in_context_block
+        in_context_block = False
 
     for line in lines:
         stripped = line.strip()
@@ -118,11 +134,31 @@ def parse_markdown(raw: str) -> dict[str, Any]:
             if not tasks and not cur_id:
                 description = (description + " " + stripped[1:].strip()).strip()
         elif stripped.startswith("**题目：") or stripped.startswith("**题目:"):
+            _flush_labels()
             cur_prompt = [_strip_md_label(stripped)]
         elif stripped.startswith("**期望：") or stripped.startswith("**期望:"):
+            _flush_labels()
             cur_expected = [_strip_md_label(stripped)]
         elif stripped.startswith("**评分标准：") or stripped.startswith("**评分标准:"):
+            _flush_labels()
             cur_rubric = [_strip_md_label(stripped)]
+        elif stripped.startswith("**类型：") or stripped.startswith("**类型:"):
+            _flush_labels()
+            cur_type = _strip_md_label(stripped) or "判别式"
+        elif stripped.startswith("**上下文：") or stripped.startswith("**上下文:"):
+            _flush_labels()
+            in_context_block = True
+            first = _strip_md_label(stripped)
+            if first:
+                cur_context.append(first)
+        elif stripped.startswith("**") or stripped.startswith("#"):
+            # 其他未知标签/标题：退出上下文块
+            in_context_block = False
+            if cur_id is not None:
+                cur_prompt.append(stripped)
+        elif in_context_block and cur_id is not None:
+            # 上下文多行块：直到下一个标签或标题
+            cur_context.append(stripped)
         elif cur_id is not None:
             cur_prompt.append(stripped)
     _flush()
@@ -142,8 +178,10 @@ def parse_txt(raw: str) -> dict[str, Any]:
     格式约定：
     - 首行 `# 标题`（可选）→ 数据集名称
     - `# 维度名`（可选，可多处出现）→ 当前维度
-    - 其余每行一条：`题目` 与 `期望` 之间用 `|` 或 TAB 分隔
-      （无分隔符的行视为上一题的 prompt 续行）
+    - 其余每行一条：`题目` `期望` `类型` `上下文` 之间用 `|` 或 TAB 分隔
+      （2~4 段均可：`题目|期望`、`题目|期望|类型`、`题目|期望|类型|上下文`；
+      类型缺省=判别式；上下文段内禁止 `|`；
+      无分隔符的行视为上一题的 prompt 续行）
     """
     lines = raw.splitlines()
     name = ""
@@ -168,6 +206,8 @@ def parse_txt(raw: str) -> dict[str, Any]:
                 "prompt": prompt,
                 "test_cases": [{"input": prompt[:50], "expected": expected}] if expected else [],
                 "rubric_note": "【仅评审可见】满分10分。根据回答与期望答案的匹配程度评分。",
+                "type": cur["type"],
+                "context": cur["context"],
             })
         cur = None
 
@@ -182,16 +222,20 @@ def parse_txt(raw: str) -> dict[str, Any]:
             _flush()
             cur_dim = stripped.lstrip("#").strip() or "自定义"
             continue
-        parts = re.split(r"\s*\|\s*|\t", stripped, maxsplit=1)
-        if len(parts) == 2:
+        parts = re.split(r"\s*\|\s*|\t", stripped, maxsplit=3)
+        if len(parts) >= 2:
             _flush()
             auto_no += 1
+            ttype = parts[2].strip() if len(parts) >= 3 else "判别式"
+            context = parts[3].strip() if len(parts) >= 4 else ""
             cur = {"id": f"T{auto_no}", "dimension": cur_dim,
-                   "prompt": parts[0].strip(), "expected": parts[1].strip()}
+                   "prompt": parts[0].strip(), "expected": parts[1].strip(),
+                   "type": ttype or "判别式", "context": context}
         else:
             if cur is None:
                 auto_no += 1
-                cur = {"id": f"T{auto_no}", "dimension": cur_dim, "prompt": "", "expected": ""}
+                cur = {"id": f"T{auto_no}", "dimension": cur_dim, "prompt": "",
+                       "expected": "", "type": "判别式", "context": ""}
             cur["prompt"] += " " + stripped
     _flush()
 

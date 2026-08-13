@@ -44,14 +44,19 @@ from backend.storage import (
     save_review, load_review, save_round_verdicts,
     get_job_status, list_jobs, get_job_files,
     save_dataset, load_dataset, list_datasets, delete_dataset,
+    update_saturation, get_saturation,
     is_valid_job_id,
 )
-from backend.schemas import StartRequest, StartResponse, ReviewSubmission
+from backend.schemas import StartRequest, StartResponse, ReviewSubmission, ModelRegisterRequest
 from backend.security import redact_sensitive, sanitize_config
+from backend.models_registry import (
+    delete_model, get_key, get_model, list_models, register, ModelRegistryError,
+)
 
 # 资源限制（issue #8）：并发执行任务上限 / 上传大小（数据集题数上限在 datasets.py 校验层统一生效）
 MAX_ACTIVE_JOBS = 2
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+# 迭代一：context 字段 32KB×200 题的理论上界 6.4MB，上限提升至 10MB
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_JSON_BYTES = 2 * 1024 * 1024
 
 # 任务生命周期（issue #14 / R2-005）：运行中评测的删除必须先取消后台任务
@@ -248,11 +253,16 @@ async def upload_dataset(file: UploadFile = File(...)):
 
     tasks = data.get("tasks", [])
     dims = list({t.get("dimension", "自定义") for t in tasks})
+    type_counts: dict[str, int] = {}
+    for t in tasks:
+        ttype = t.get("type", "判别式")
+        type_counts[ttype] = type_counts.get(ttype, 0) + 1
     return {
         "ok": True,
         "name": name,
         "task_count": len(tasks),
         "dimensions": dims,
+        "type_counts": type_counts,
         "description": data.get("description", ""),
     }
 
@@ -284,11 +294,16 @@ async def upload_dataset_json(request: Request):
 
     tasks = data.get("tasks", [])
     dims = list({t.get("dimension", "自定义") for t in tasks})
+    type_counts: dict[str, int] = {}
+    for t in tasks:
+        ttype = t.get("type", "判别式")
+        type_counts[ttype] = type_counts.get(ttype, 0) + 1
     return {
         "ok": True,
         "name": name,
         "task_count": len(tasks),
         "dimensions": dims,
+        "type_counts": type_counts,
         "description": data.get("description", ""),
     }
 
@@ -305,6 +320,54 @@ async def remove_dataset(name: str):
         raise HTTPException(404, "dataset not found")
     audit.dataset_deleted(name)
     return {"ok": True}
+
+
+# ---- 模型配置库（迭代一） ----
+
+@app.post("/api/models")
+async def models_create(req: ModelRegisterRequest):
+    """注册模型配置。API Key 仅存进程内存，落盘文件只保留 key_masked（***）。"""
+    try:
+        info = register(
+            name=req.name, url=req.url, key=req.key or "",
+            temperature=req.temperature, max_tokens=req.max_tokens, top_p=req.top_p,
+        )
+    except ModelRegistryError as e:
+        raise HTTPException(400, f"模型注册失败: {e}")
+    audit.model_registered(info["id"])
+    return {"ok": True, "model": info}
+
+
+@app.get("/api/models")
+async def models_list():
+    return {"models": list_models()}
+
+
+@app.get("/api/models/{model_id}")
+async def models_get(model_id: str):
+    info = get_model(model_id)
+    if info is None:
+        raise HTTPException(404, "model not found")
+    # 单条读取：附带进程内存中的 Key（本地前端「填入」流程使用；
+    # 列表接口 /api/models 仍不返回 Key）
+    return {**info, "key": get_key(model_id)}
+
+
+@app.delete("/api/models/{model_id}")
+async def models_delete(model_id: str):
+    ok = delete_model(model_id)
+    if not ok:
+        raise HTTPException(404, "model not found")
+    audit.model_deleted(model_id)
+    return {"ok": True}
+
+
+# ---- 跨 job 历史汇总（迭代一：接口就绪，数据由后续迭代真实接入） ----
+
+@app.get("/api/stats/saturation")
+async def stats_saturation():
+    """读取跨 job 逐题结果汇总表（.eval/stats/saturation.json，幂等追加）。"""
+    return redact_sensitive(get_saturation())
 
 
 # ---- 连通性测试 ----

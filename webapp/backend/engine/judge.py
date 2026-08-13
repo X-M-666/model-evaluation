@@ -198,9 +198,14 @@ async def run_judge(
         if v.get("winner") == "tie" and v.get("arbiter_note")
     )
 
-    # 按维度汇总
+    # 按维度汇总（排除不计分题：excluded_from_total 的任务打分仅作展示，
+    # 不参与 totals / 胜负 / per_dimension 聚合；判题仍逐题执行）
+    scoring_verdicts = [
+        v for v in verdicts
+        if not _task_flag(task_set, v.get("id"), "excluded_from_total")
+    ]
     dim_totals: dict[str, dict[str, float]] = {}
-    for v in valid:
+    for v in scoring_verdicts:
         dim = v.get("dimension", "")
         if dim not in dim_totals:
             dim_totals[dim] = {"x": 0, "y": 0}
@@ -210,12 +215,21 @@ async def run_judge(
     total_x = sum(d["x"] for d in dim_totals.values())
     total_y = sum(d["y"] for d in dim_totals.values())
 
+    excluded_ids = [
+        v["id"] for v in verdicts
+        if _task_flag(task_set, v.get("id"), "excluded_from_total")
+    ]
+    excluded_dims = sorted({v.get("dimension", "") for v in verdicts
+                            if _task_flag(task_set, v.get("id"), "excluded_from_total")})
+
     return {
         "meta": {
             "total": len(verdicts),
             "valid": len(valid),
             "invalid": invalid_count,
             "tie_arbitrated": tie_arbitrated,
+            "excluded_ids": excluded_ids,
+            "excluded_dimensions": excluded_dims,
         },
         "scores": verdicts,
         "per_dimension": dim_totals,
@@ -226,6 +240,16 @@ async def run_judge(
             answers_y["model"] if total_y > total_x else "tie"
         ),
     }
+
+
+def _task_flag(task_set: dict[str, Any], task_id: Any, key: str) -> bool:
+    """按任务 id 从任务集取布尔标记（excluded_from_total 等），缺失一律 False。"""
+    if not task_id:
+        return False
+    for t in task_set.get("tasks", []):
+        if t.get("id") == task_id:
+            return bool(t.get(key, False))
+    return False
 
 
 def _build_conclusion(

@@ -255,6 +255,49 @@ def get_job_files(job_id: str) -> dict[str, Any] | None:
 
 DATASETS_DIR = Path(__file__).resolve().parent.parent / "data" / "datasets"
 
+# 跨 job 历史汇总（迭代一：接口与幂等写入，真实接入在后续迭代）
+STATS_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".eval" / "stats"
+SATURATION_FILE = STATS_DIR / "saturation.json"
+
+
+def update_saturation(job_id: str, entries: list[dict]) -> bool:
+    """向跨 job 汇总表追加一轮评测的逐题结果（按 job_id 幂等：重复调用跳过）。
+
+    entries 为 [{id, dimension, type, answer_x, answer_y, winner}]。
+    返回 True=首次写入成功；False=已存在（幂等跳过）或写入失败。
+    """
+    if not is_valid_job_id(job_id):
+        return False
+    try:
+        STATS_DIR.mkdir(parents=True, exist_ok=True)
+        data = get_saturation()
+        for job in data.get("jobs", []):
+            if job.get("job_id") == job_id:
+                return False
+        data.setdefault("jobs", []).append({
+            "job_id": job_id,
+            "entries": entries,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        SATURATION_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def get_saturation() -> dict:
+    """读取跨 job 汇总表；文件缺失或损坏时静默返回空结构（不抛异常）。"""
+    if not SATURATION_FILE.exists():
+        return {"jobs": []}
+    try:
+        data = json.loads(SATURATION_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+            return {"jobs": []}
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {"jobs": []}
+
+
 # Windows 文件名非法字符（含路径分隔、控制字符），全部替换为下划线
 _INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -270,23 +313,45 @@ def _ensure_datasets_dir():
 
 
 def save_dataset(name: str, data: dict) -> Path:
-    """保存评测集到 data/datasets/{safe_name}.json（永久保存）。"""
+    """保存评测集到 data/datasets/{safe_name}.json（永久保存）。
+
+    迭代一：附加版本与来源元信息（version/source/created_at），
+    老文件读取时缺省补 version="v1"（零破坏）。
+    """
     _ensure_datasets_dir()
     p = DATASETS_DIR / f"{_safe_dataset_name(name)}.json"
+    meta = {
+        "version": data.get("version", "v1"),
+        "source": data.get("source", "upload"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    data = {**meta, **data}
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return p
 
 
 def load_dataset(name: str) -> dict | None:
-    """读取评测集。"""
+    """读取评测集（老文件缺 version/source 时补缺省，保持零破坏）。"""
     p = DATASETS_DIR / f"{_safe_dataset_name(name)}.json"
     if not p.exists():
         return None
-    return json.loads(p.read_text(encoding="utf-8"))
+    data = json.loads(p.read_text(encoding="utf-8"))
+    data.setdefault("version", "v1")
+    data.setdefault("source", "upload")
+    return data
+
+
+def _type_counts(tasks: list[dict]) -> dict[str, int]:
+    """统计评测集任务类型分布（判别式/生成式）。"""
+    counts: dict[str, int] = {}
+    for t in tasks:
+        ttype = t.get("type", "判别式")
+        counts[ttype] = counts.get(ttype, 0) + 1
+    return counts
 
 
 def list_datasets() -> list[dict[str, Any]]:
-    """列出所有已上传的评测集摘要。"""
+    """列出所有已上传的评测集摘要（含版本与类型分布）。"""
     _ensure_datasets_dir()
     result = []
     for p in sorted(DATASETS_DIR.glob("*.json"), reverse=True):
@@ -299,6 +364,9 @@ def list_datasets() -> list[dict[str, Any]]:
                 "description": data.get("description", ""),
                 "task_count": len(tasks),
                 "dimensions": dims,
+                "version": data.get("version", "v1"),
+                "source": data.get("source", "upload"),
+                "type_counts": _type_counts(tasks),
                 "created_at": data.get("created_at", ""),
             })
         except Exception:

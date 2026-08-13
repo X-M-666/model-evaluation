@@ -290,3 +290,76 @@ def test_csv_blank_id_cell_rejected_when_id_column_present():
 def test_csv_no_id_column_auto_numbering_ok():
     data = parse_csv_dataset("prompt,expected\nq1,e1\nq2,e2\n")
     assert [t["id"] for t in data["tasks"]] == ["T1", "T2"]
+
+# ---------------- 迭代一：题型 type / 上下文 / 标签 / 不计分 ----------------
+
+def test_csv_no_expected_all_generative_ok():
+    data = parse_csv_dataset("prompt,type,rubric_note\n写一首诗,生成式,满分10分\n写一段总结,生成式,满分10分\n")
+    assert len(data["tasks"]) == 2
+    assert all(t["type"] == "生成式" for t in data["tasks"])
+    assert all(t["test_cases"] == [] for t in data["tasks"])
+
+
+def test_csv_no_expected_discriminative_rejected():
+    with pytest.raises(ValueError, match="生成式"):
+        parse_csv_dataset("prompt,type\n1+1?,判别式\n")
+
+
+def test_csv_no_expected_missing_type_rejected():
+    with pytest.raises(ValueError, match="生成式"):
+        parse_csv_dataset("prompt\n1+1?\n")
+
+
+def test_csv_iteration1_columns_parsed():
+    csv_text = (
+        "id,dimension,prompt,expected,type,tags,context,excluded_from_total\n"
+        "A1,安全与价值观,p?,e,生成式,安全;红线,无上下文,true\n"
+    )
+    t = parse_csv_dataset(csv_text)["tasks"][0]
+    assert t["type"] == "生成式"
+    assert t["tags"] == ["安全", "红线"]
+    assert t["context"] == "无上下文"
+    assert t["excluded_from_total"] is True
+
+
+def test_csv_generative_without_rubric_gets_default():
+    t = parse_csv_dataset("prompt,type\n写总结,生成式\n")["tasks"][0]
+    assert t["rubric_note"].startswith("【仅评审可见】")
+
+
+def test_json_explicit_discriminative_without_reference_rejected():
+    with pytest.raises(DatasetValidationError, match="判别式题目缺少期望答案或评分标准"):
+        validate_json_dataset('{"tasks":[{"id":"X","dimension":"知识能力","prompt":"p","type":"判别式"}]}')
+
+
+def test_json_generative_without_rubric_rejected():
+    with pytest.raises(DatasetValidationError, match="生成式题目必须提供评分标准"):
+        validate_json_dataset('{"tasks":[{"id":"X","dimension":"语言能力","prompt":"p","type":"生成式"}]}')
+
+
+def test_json_invalid_type_rejected():
+    with pytest.raises(DatasetValidationError, match="判别式/生成式"):
+        validate_json_dataset('{"tasks":[{"id":"X","prompt":"p","type":"主观题"}]}')
+
+
+def test_json_context_too_long_rejected():
+    long_ctx = "x" * 32001
+    with pytest.raises(DatasetValidationError, match="context"):
+        validate_json_dataset(f'{{"tasks":[{{"id":"X","prompt":"p","context":"{long_ctx}"}}]}}')
+
+
+def test_json_tags_count_over_limit_rejected():
+    tags = ",".join(f'"t{i}"' for i in range(11))
+    with pytest.raises(DatasetValidationError, match="tags"):
+        validate_json_dataset(f'{{"tasks":[{{"id":"X","prompt":"p","tags":[{tags}]}}]}}')
+
+
+def test_json_excluded_from_total_non_bool_rejected():
+    with pytest.raises(DatasetValidationError, match="excluded_from_total"):
+        validate_json_dataset('{"tasks":[{"id":"X","prompt":"p","excluded_from_total":"yes"}]}')
+
+
+def test_json_full_format_expected_only_derives_test_cases():
+    """老格式兼容：完整格式（带 dimension）只给 expected 也能构建 test_cases。"""
+    data = validate_json_dataset('{"tasks":[{"id":"X","dimension":"知识能力","prompt":"p","expected":"e"}]}')
+    assert data["tasks"][0]["test_cases"][0]["expected"] == "e"

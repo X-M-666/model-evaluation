@@ -22,7 +22,7 @@ class StartRequest(BaseModel):
     seed: int | None = Field(None, description="随机种子")
     dataset_name: str | None = Field(None, description="自定义评测集名称，None=用内置题库")
     repeat_n: int = Field(1, ge=1, le=20, description="重复评测次数，取平均")
-    num_questions: int | None = Field(None, ge=1, le=7, description="内置题库题目数量（仅内置题库模式生效，3/5/7，None=全维度）")
+    num_questions: int | None = Field(None, ge=1, le=8, description="内置题库题目数量（仅内置题库模式生效，3/5/7/8，None=全维度）")
     code_verify_mode: str = Field(
         "off", pattern=r"^(off|native-sandbox)$",
         description="代码验真模式：off=仅展示与语法检查（默认，不执行）；native-sandbox=Windows 原生隔离（AppContainer+Job Object）",
@@ -69,4 +69,17 @@ class DatasetInfo(BaseModel):
     description: str
     task_count: int
     dimensions: list[str]
+    version: str = "v1"
+    source: str = "upload"
+    type_counts: dict[str, int] = {}
     created_at: str
+
+
+class ModelRegisterRequest(BaseModel):
+    """模型配置库注册请求（迭代一）。Key 仅存进程内存，不落盘。"""
+    name: str = Field(..., min_length=1, max_length=200, description="模型配置名称（唯一）")
+    url: str = Field(..., max_length=500, description="API base URL，如 https://api.example.com/v1")
+    key: str | None = Field(None, description="API Key（可选；仅存内存，重启需补录）")
+    temperature: float = Field(0.7, ge=0, le=2)
+    max_tokens: int = Field(4096, ge=1, le=128000)
+    top_p: float | None = Field(None, ge=0, le=1)
