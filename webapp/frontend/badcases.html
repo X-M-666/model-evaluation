@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>Bad Case 库</title>
+<link rel="stylesheet" href="/static/common.css">
 <style>
 body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,'Segoe UI',sans-serif;margin:0}
 .wrap{max-width:960px;margin:0 auto;padding:24px}
@@ -38,7 +39,7 @@ a{color:#58a6ff}
 .loading{text-align:center;padding:60px;color:#8b949e}
 .empty{text-align:center;padding:40px;color:#8b949e}
 </style>
-<script src="/echarts.min.js"></script>
+<script src="/static/echarts.min.js"></script>
 </head>
 <body>
 <div class="wrap">
@@ -68,17 +69,12 @@ a{color:#58a6ff}
 <div id="list"><div class="loading">加载中...</div></div>
 </div>
 </div>
+<script src="/static/common.js"></script>
 <script>
-const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function getToken(){ return localStorage.getItem('duel_token') || ''; }
-async function apiFetch(url, opts={}){
-  const headers = Object.assign({}, opts.headers);
-  const token = getToken();
-  if(token) headers['Authorization'] = 'Bearer ' + token;
-  const r = await fetch(url, Object.assign({}, opts, {headers}));
-  if(r.status === 401) throw new Error('未授权：请在首页顶部设置访问令牌');
-  return r;
-}
+CD.renderTopNav('badcase');
+const esc = s => CD.esc(s);
+function getToken(){ return CD.getToken(); }
+async function apiFetch(url, opts={}){ return CD.apiFetch(url, opts); }
 const CAT_COLORS = {事实错误:'#f0883e', 语义错误:'#58a6ff', 推理错误:'#8957e5', 安全偏见输出:'#f85149', 执行错误:'#3fb950', 未归类:'#8b949e'};
 const SRC_LABELS = {low_score:'低分', dual_fail:'双败', disagreement:'评审分歧', edge_safety:'安全边缘', edge_grounding:'RAG 不忠实', edge_code:'代码未全过'};
 let JOBS = {};
@@ -182,13 +178,19 @@ document.getElementById('applyBtn').addEventListener('click', load);
 document.getElementById('exportBtn').addEventListener('click', async ()=>{
   const job = document.getElementById('f-job').value.trim();
   const url = '/api/badcases/export' + (job ? '?job_id=' + encodeURIComponent(job) : '');
-  const r = await apiFetch(url);
-  const blob = await r.blob();
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = job ? `badcases-${job}.json` : 'badcases-all.json';
-  a.click();
-  URL.revokeObjectURL(a.href);
+  try{
+    const r = await apiFetch(url);
+    if(!r.ok){
+      const d = await r.json().catch(()=>({}));
+      throw new Error(d.detail || ('HTTP '+r.status));
+    }
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = job ? `badcases-${job}.json` : 'badcases-all.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }catch(e){ CD.toast('导出失败：' + e.message, 'err'); }
 });
 async function init(){
   const catsR = await apiFetch('/api/badcases/stats');
@@ -204,7 +206,7 @@ async function init(){
   await load();
 }
 let CATS = [];
-init().catch(e=>{ document.getElementById('list').innerHTML = '<div class="loading">加载失败: '+esc(e.message||e)+'</div>'; });
+init().catch(e=>{ CD.renderError(document.getElementById('list'), '加载失败: '+(e.message||e), init); });
 </script>
 </body>
 </html>

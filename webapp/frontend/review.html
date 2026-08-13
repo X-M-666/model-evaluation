@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>人工双盲评审 - 模型对决</title>
+<link rel="stylesheet" href="/static/common.css">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
@@ -50,7 +51,6 @@ h3{font-size:15px;color:#c9d1d9;margin-bottom:8px}
 .badge.dim{background:#1f6feb;color:#fff}
 .badge.lv{background:#30363d;color:#8b949e}
 .badge.err{background:#da3633;color:#fff}
-.draft-note{font-size:12px;color:#3fb950;margin-top:8px}
 </style>
 </head>
 <body>
@@ -78,23 +78,16 @@ h3{font-size:15px;color:#c9d1d9;margin-bottom:8px}
 </div>
 </div>
 
+<script src="/static/common.js"></script>
 <script>
+CD.renderTopNav();
 const params = new URLSearchParams(window.location.search);
 const jobId = params.get('job');
 let DATA = null;
 const DRAFT_KEY = 'review-draft-' + jobId;
 
-function getToken(){ return localStorage.getItem('duel_token') || ''; }
-async function apiFetch(url, opts={}){
-  const headers = Object.assign({}, opts.headers);
-  const token = getToken();
-  if(token) headers['Authorization'] = 'Bearer ' + token;
-  const r = await fetch(url, Object.assign({}, opts, {headers}));
-  if(r.status === 401){
-    throw new Error('未授权：请在首页顶部设置访问令牌');
-  }
-  return r;
-}
+function getToken(){ return CD.getToken(); }
+async function apiFetch(url, opts={}){ return CD.apiFetch(url, opts); }
 
 if(!jobId){
   document.getElementById('content').innerHTML='<div class="loading">缺少 job 参数，<a href="/">返回首页</a></div>';
@@ -109,7 +102,7 @@ async function loadReview(){
     DATA = await r.json();
     render();
   }catch(e){
-    document.getElementById('content').innerHTML=`<div class="loading">加载失败: ${esc(e.message||e)}，<a href="/">返回首页</a></div>`;
+    CD.renderError(document.getElementById('content'), '加载失败: '+(e.message||e), loadReview);
   }
 }
 
@@ -268,7 +261,7 @@ async function submitReview(){
     if(isNaN(x) || isNaN(y) || x < 0 || x > 10 || y < 0 || y > 10){ valid = false; return; }
     scores.push({id: item.id, round: ri+1, answer_x: x, answer_y: y, note});
   });
-  if(!valid){ alert('存在无效分数（应为 0-10），请检查红色标记的输入框'); return; }
+  if(!valid){ CD.toast('存在无效分数（应为 0-10），请检查红色标记的输入框', 'warn'); return; }
 
   const isHybrid = !!DATA.hybrid;
   const endpoint = isHybrid ? `/api/eval/${jobId}/hybrid-review` : `/api/eval/${jobId}/review`;
@@ -289,12 +282,12 @@ async function submitReview(){
     localStorage.removeItem(DRAFT_KEY);
     setTimeout(()=>window.location='/report.html?job='+jobId, 500);
   }catch(e){
-    alert('提交失败: ' + e.message);
+    CD.toast('提交失败: ' + e.message, 'err');
     btn.disabled = false; btn.textContent = '重新提交';
   }
 }
 
-function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+function esc(s){ return CD.esc(s); }
 
 document.getElementById('submitBtn').addEventListener('click', submitReview);
 </script>

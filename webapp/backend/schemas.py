@@ -227,3 +227,14 @@ class BenchmarkRequest(BaseModel):
 class PriorityRequest(BaseModel):
     """任务优先级调整请求（迭代七，仅排队中可改）。"""
     priority: int = Field(0, ge=-10, le=10, description="新优先级（-10..10）")
+
+
+class RerunRequest(BaseModel):
+    """批次重跑请求（迭代八）：其余配置从 batch 文件恢复，仅可覆盖评审与优先级。
+
+    模型 Key 一律从配置库进程内存重新取；原批次使用评审模型时（Key 不落盘），
+    重跑必须重新提供 review（judge），否则 400。
+    """
+    name: str | None = Field(None, max_length=200, description="新批次名称（可选）")
+    priority: int = Field(0, ge=-10, le=10, description="新批次优先级")
+    review: ReviewConfig | None = Field(None, description="评审配置（覆盖原批次；原批次有 judge 时必填）")

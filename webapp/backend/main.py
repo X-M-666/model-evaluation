@@ -70,6 +70,7 @@ from backend.storage import (
 )
 from backend.gold import ensure_demo_gold, compute_meta_eval
 from backend.engine.rag_demo import ensure_demo_rag_dataset
+from backend.engine.longtext import ensure_longtext_bench
 from backend.engine.badcase import (
     BAD_CASE_CATEGORIES, UNCATEGORIZED, mine_bad_cases, attribute_badcase,
 )
@@ -86,6 +87,7 @@ from backend.schemas import (
     StartRequest, StartResponse, ReviewSubmission, ModelRegisterRequest,
     GoldSetRequest, GenerateRequest, ReviewDecisionRequest,
     PerturbRequest, LeaderboardRequest, BenchmarkRequest, PriorityRequest,
+    RerunRequest,
 )
 from backend.security import redact_sensitive, sanitize_config
 from backend.models_registry import (
@@ -147,6 +149,7 @@ async def _shutdown_cancel_all():
 async def lifespan(_app: FastAPI):
     ensure_demo_gold()  # 迭代三：gold 目录为空时载入 demo 金标（source="demo"）
     ensure_demo_rag_dataset()  # 迭代四：内置 RAG 演示集（带 context 参考文档）
+    ensure_longtext_bench()  # 迭代八：内置长文本基准集（2K/8K/32K，材料在 context）
     _settle_queued_on_restart()  # 迭代七：重启后排队任务沉降 error（v1 内存队列）
     yield
     await _shutdown_cancel_all()
@@ -171,6 +174,30 @@ app.middleware("http")(security_middleware)
 
 _jobs: dict[str, dict] = {}
 _tasks: dict[str, asyncio.Task] = {}
+
+# 迭代八：任务视图 SSE 广播器（每连接独立队列，收到 ping 后前端全量刷新）。
+# 存 (loop, queue) 对：广播可能来自任意线程（测试/回调），唤醒统一走
+# loop.call_soon_threadsafe，避免跨线程直接操作 asyncio.Queue。
+_TASKS_EVENT_SUBS: set[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = set()
+
+
+def _put_task_view(q: asyncio.Queue, event: dict) -> None:
+    try:
+        q.put_nowait(event)
+    except asyncio.QueueFull:
+        pass
+
+
+def _notify_tasks_view() -> None:
+    """向全部任务视图 SSE 订阅者广播 task_view ping（线程安全，满队列静默丢弃）。"""
+    event = {"type": "task_view", "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    for loop, q in list(_TASKS_EVENT_SUBS):
+        if not hasattr(loop, "call_soon_threadsafe"):
+            continue
+        try:
+            loop.call_soon_threadsafe(_put_task_view, q, event)
+        except RuntimeError:
+            continue
 
 # 迭代七：任务调度器（迭代 0 契约落地）——优先级队列 + 并发配额，
 # 替代硬编码 MAX_ACTIVE_JOBS=2 与 429 拒绝；配额可由环境变量弹性调整
@@ -200,12 +227,15 @@ async def _dispatch_pending() -> None:
             task = asyncio.create_task(_run_eval(job_id))
         _tasks[job_id] = task
         task.add_done_callback(lambda t, jid=job_id: _task_done(jid, t))
+    if _SCHEDULER.queue_view() or _SCHEDULER.running():
+        _notify_tasks_view()
 
 
 def _scheduler_release(job_id: str) -> None:
     """释放配额并补派发（幂等；reviewing/终态/取消路径统一调用）。"""
     if _SCHEDULER.release(job_id):
         asyncio.create_task(_dispatch_pending())
+    _notify_tasks_view()
 
 
 async def _read_body_limited(request: Request, limit: int) -> bytes:
@@ -859,6 +889,7 @@ async def tasks_set_priority(job_id: str, req: PriorityRequest):
         raise HTTPException(409, "任务不在调度队列中")
     j["priority"] = req.priority
     audit.priority_changed(job_id, str(req.priority))
+    _notify_tasks_view()
     position = next((x["position"] for x in _SCHEDULER.queue_view()
                      if x["job_id"] == job_id), None)
     return {"ok": True, "job_id": job_id, "priority": req.priority, "position": position}
@@ -922,7 +953,7 @@ def _on_batch_job_done(batch_id: str, job_id: str) -> None:
     模型标注 N/A 排除；不足 2 个完成模型 → 无排行榜 + note。
     """
     batch = load_batch(batch_id)
-    if batch is None or batch.get("state") in ("done", "partial"):
+    if batch is None or batch.get("state") in ("done", "partial", "cancelled"):
         return
     states: dict[str, str] = {}
     for jid in batch.get("jobs", []):
@@ -975,7 +1006,7 @@ async def _run_batch_job(job_id: str):
     if j is not None and j.get("state") == "queued":
         j["state"] = "executing"
         save_task_set(job_id, j["task_set"])
-        save_env_snapshot(job_id)
+        save_env_snapshot(job_id, j["config"])
         await _push_event(job_id, {"state": "executing", "progress": "0/0"})
     try:
         j = _jobs.get(job_id)
@@ -1202,6 +1233,7 @@ async def create_benchmark(req: BenchmarkRequest):
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "dataset": req.dataset_name,
         "models": [m["name"] for m in models],
+        "model_ids": [m["id"] for m in models],   # 迭代八：批次重跑恢复源（Key 不落盘，id 非敏感）
         "rounds": req.rounds,
         "jobs": job_ids,
         "leaderboard_id": None,
@@ -1261,6 +1293,98 @@ async def benchmark_detail(batch_id: str):
         "terminal": n_terminal,
         "jobs": jobs,
     }
+
+
+@app.post("/api/benchmark/{batch_id}/cancel")
+async def benchmark_cancel(batch_id: str):
+    """批次整体取消（迭代八）：排队中 job 出队+删目录，运行中走 cancelling；
+    全部终态后批次置 cancelled。已终态批次 409，不存在 404。"""
+    from backend.storage import delete_job
+
+    if not is_valid_batch_id(batch_id):
+        raise HTTPException(404, "batch not found")
+    batch = load_batch(batch_id)
+    if batch is None:
+        raise HTTPException(404, "batch not found")
+    if batch.get("state") in ("done", "partial", "cancelled"):
+        raise HTTPException(409, f"批次已终态（state={batch.get('state')}），无法取消")
+
+    for jid in batch.get("jobs", []):
+        task = _tasks.get(jid)
+        j_entry = _jobs.get(jid)
+        if task is None and j_entry is not None and j_entry.get("state") == "queued":
+            # 排队中：出队 + 删目录 + 审计（无 task.cancel，与 delete_history 同语义）
+            _SCHEDULER.cancel_queued(jid)
+            _jobs.pop(jid, None)
+            delete_job(jid)
+            audit.eval_cancelled(jid)
+        elif task is not None and not task.done():
+            await _request_cancel(jid)
+            task.cancel()
+            await asyncio.wait({task}, timeout=CANCEL_GRACE_SECONDS)
+            audit.eval_cancelled(jid)
+            _tasks.pop(jid, None)
+            _jobs.pop(jid, None)
+
+    batch["state"] = "cancelled"
+    batch["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    save_batch(batch_id, batch)
+    audit.benchmark_cancelled(batch_id, len(batch.get("jobs", [])))
+    _notify_tasks_view()
+    await _dispatch_pending()
+    return {"ok": True, "batch_id": batch_id, "state": "cancelled"}
+
+
+@app.post("/api/benchmark/{batch_id}/rerun")
+async def benchmark_rerun(batch_id: str, body: RerunRequest):
+    """批次重跑（迭代八）：复用原批次配置重建新批次。
+
+    恢复源为 batch 文件（model_ids/rounds/dataset/name）+ job config.json
+    （prompt_strategy/code_verify_mode/budget/embedding）。模型 Key 从配置库
+    进程内存重新取（未补录 400）；原批次使用评审模型时 Key 不落盘，必须重新
+    提供评审配置。运行中批次 409，旧批次（无 model_ids 字段）400。
+    """
+    if not is_valid_batch_id(batch_id):
+        raise HTTPException(404, "batch not found")
+    batch = load_batch(batch_id)
+    if batch is None:
+        raise HTTPException(404, "batch not found")
+    if batch.get("state") == "running":
+        raise HTTPException(409, "批次运行中，无法重跑（先取消）")
+
+    model_ids = [str(m) for m in (batch.get("model_ids") or [])]
+    if len(model_ids) < 2:
+        raise HTTPException(
+            400, "批次文件缺少 model_ids（迭代七创建的历史批次无法重跑）")
+
+    common_cfg = {}
+    for jid in batch.get("jobs", []):
+        st = get_job_status(jid)
+        cfg = (st or {}).get("config") or {}
+        if cfg:
+            common_cfg = cfg
+            break
+
+    orig_judge = common_cfg.get("judge")
+    if orig_judge and body.review is None:
+        raise HTTPException(
+            400, "原批次使用评审模型（Key 不落盘无法复用），重跑需重新提供评审配置 review.judge")
+
+    req = BenchmarkRequest(
+        dataset_name=str(batch.get("dataset")),
+        model_ids=model_ids,
+        rounds=int(batch.get("rounds", 1) or 1),
+        priority=body.priority,
+        name=body.name or batch.get("name") or None,
+        review=body.review,
+        prompt_strategy=common_cfg.get("prompt_strategy", "cot"),
+        code_verify_mode=common_cfg.get("code_verify_mode", "off"),
+        budget=common_cfg.get("budget"),
+        embedding=common_cfg.get("embedding"),
+    )
+    res = await create_benchmark(req)
+    audit.benchmark_rerun(batch_id, res["batch_id"])
+    return {**res, "from_batch": batch_id}
 
 
 @app.get("/api/generate")
@@ -1686,7 +1810,7 @@ async def _run_eval(job_id: str):
     if j is not None and j.get("state") == "queued":
         j["state"] = "executing"
         save_task_set(job_id, j["task_set"])
-        save_env_snapshot(job_id)  # 迭代四：环境快照（OS/Python/依赖版本，无密钥）
+        save_env_snapshot(job_id, j["config"])  # 迭代八：评测参数入快照（seed/温度/评审指纹等）
         await _push_event(job_id, {"state": "executing", "progress": "0/0"})
     try:
         await _run_eval_impl(job_id)
@@ -2727,6 +2851,44 @@ async def eval_events(job_id: str):
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
+@app.post("/api/tasks/events/ticket")
+async def tasks_events_ticket():
+    """任务视图 SSE 短时单次 ticket（迭代八，scope="tasks"）。
+
+    认证由中间件以 Authorization header 兜底；ticket 仅限 /api/tasks/events
+    路由，使用一次后立即失效（复用 sse_ticket 机制，安全不变量不变）。
+    """
+    ticket = sse_ticket.issue("tasks")
+    return {"ticket": ticket, "ttl_seconds": sse_ticket.TTL_SECONDS}
+
+
+@app.get("/api/tasks/events")
+async def tasks_events():
+    """任务视图 SSE 广播流（迭代八）：订阅 task_view ping，收到后前端全量刷新。
+
+    每连接独立队列、流结束时退订；30s 心跳；事件仅提示刷新（前端全量拉取）。
+    """
+    queue: asyncio.Queue = asyncio.Queue(maxsize=16)
+    loop = asyncio.get_running_loop()
+    _TASKS_EVENT_SUBS.add((loop, queue))
+
+    async def stream():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                except asyncio.TimeoutError:
+                    yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+                    continue
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _TASKS_EVENT_SUBS.discard((loop, queue))   # 流结束才退订（路由返回时保留）
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
 def _rounds_view(
     rounds_answers: list[dict],
     reveal: dict | None,
@@ -2900,6 +3062,7 @@ async def delete_history(job_id: str):
         if not ok:
             raise HTTPException(404, "job not found")
         audit.eval_cancelled(job_id)
+        _notify_tasks_view()
         return {"ok": True}
     if task is not None:
         if not task.done():

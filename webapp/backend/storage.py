@@ -93,10 +93,78 @@ def collect_env_snapshot() -> dict[str, Any]:
     }
 
 
-def save_env_snapshot(job_id: str) -> Path:
-    """写环境快照 <job>/env.json（迭代四：评测可复现性元数据，无密钥）。"""
+def judge_fingerprint(judge_cfg: dict | None) -> str | None:
+    """评审配置指纹（迭代八）：剔除 key 后稳定序列化取 SHA-256 前 12 位。
+
+    用于环境快照的评审可复现性标注；无评审配置返回 None。确定性：sorted 键。
+    """
+    if not isinstance(judge_cfg, dict):
+        return None
+    safe = {k: v for k, v in judge_cfg.items() if k not in ("key", "api_key")}
+    if not safe:
+        return None
+    blob = json.dumps(safe, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def build_env_snapshot(config: dict | None = None) -> dict[str, Any]:
+    """采集运行环境 + 评测参数快照（迭代八扩展，全部新字段可选，向后兼容）。
+
+    platform/cwd/packages 为迭代四既有字段；eval 段为迭代八新增评测参数
+    （seed/温度/模型名/重复/提示策略/评审配置指纹/数据集版本等），
+    数据源为 job 的 config（已含 review/prompt_strategy/seed，Key 已脱敏）。
+    旧快照缺 eval 段时前端按 N/A 空态展示，零破坏。
+    """
+    snap = collect_env_snapshot()
+    if not isinstance(config, dict):
+        return snap
+    model_a = config.get("model_a") or {}
+    model_b = config.get("model_b") or {}
+    review = config.get("review") or {}
+    judge_cfg = review.get("judge") if isinstance(review, dict) else None
+    ds_name = config.get("dataset_name")
+    ds_version = "n/a"
+    if ds_name:
+        try:
+            ds = load_dataset(str(ds_name))
+            if isinstance(ds, dict):
+                ds_version = ds.get("version", "n/a")
+        except Exception:
+            ds_version = "n/a"
+    snap["eval"] = {
+        "seed": config.get("seed"),
+        "repeat_n": config.get("repeat_n", 1),
+        "prompt_strategy": config.get("prompt_strategy", "cot"),
+        "code_verify_mode": config.get("code_verify_mode", "off"),
+        "dataset_name": ds_name,
+        "dataset_version": ds_version,
+        "model_names": {
+            "a": model_a.get("name", "?"),
+            "b": model_b.get("name") if model_b else None,
+        },
+        "temperature": {
+            "a": model_a.get("temperature", 0.7),
+            "b": model_b.get("temperature") if model_b else None,
+        },
+        "max_tokens": {
+            "a": model_a.get("max_tokens", 4096),
+            "b": model_b.get("max_tokens") if model_b else None,
+        },
+        "review_mode": review.get("mode", "pure_human") if isinstance(review, dict) else "pure_human",
+        "review_k_top_human": review.get("k_top_human") if isinstance(review, dict) else None,
+        "review_fail_open": bool(review.get("fail_open")) if isinstance(review, dict) else None,
+        "judge_config_fingerprint": judge_fingerprint(judge_cfg),
+    }
+    return snap
+
+
+def save_env_snapshot(job_id: str, config: dict | None = None) -> Path:
+    """写环境快照 <job>/env.json（迭代四：评测可复现性元数据，无密钥）。
+
+    迭代八：可选传 job config，补齐评测参数段（seed/温度/评审指纹等）。
+    """
     p = _job_dir(job_id) / "env.json"
-    p.write_text(json.dumps(collect_env_snapshot(), ensure_ascii=False, indent=2),
+    p.write_text(json.dumps(build_env_snapshot(config), ensure_ascii=False, indent=2),
                  encoding="utf-8")
     return p
 

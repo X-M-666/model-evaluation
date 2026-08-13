@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>KPI 看板</title>
+<link rel="stylesheet" href="/static/common.css">
 <style>
 body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,'Segoe UI',sans-serif;margin:0}
 .wrap{max-width:1080px;margin:0 auto;padding:24px}
@@ -28,7 +29,7 @@ a{color:#58a6ff}
 <h1>📊 KPI 看板</h1>
 <p class="sub" id="subInfo">评测耗时 / Token 消耗趋势 + 硬件利用率（CPU 增量采样，GPU 无硬件 N/A）</p>
 
-<div class="cards" id="kpiCards"></div>
+<div class="cards" id="kpiCards"><div class="loading">加载中...</div></div>
 
 <div class="card"><h2>评测耗时趋势（完成时间）</h2><div id="chartDur" class="chart"></div></div>
 <div class="card"><h2>Token 消耗趋势</h2><div id="chartTok" class="chart"></div></div>
@@ -54,17 +55,12 @@ a{color:#58a6ff}
 </div>
 </div>
 
+<script src="/static/common.js"></script>
 <script>
-const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function getToken(){ return localStorage.getItem('duel_token') || ''; }
-async function apiFetch(url, opts={}){
-  const headers = Object.assign({}, opts.headers);
-  const token = getToken();
-  if(token) headers['Authorization'] = 'Bearer ' + token;
-  const r = await fetch(url, Object.assign({}, opts, {headers}));
-  if(r.status === 401) throw new Error('未授权：请在首页顶部设置访问令牌');
-  return r;
-}
+CD.renderTopNav('dash');
+const esc = s => CD.esc(s);
+function getToken(){ return CD.getToken(); }
+async function apiFetch(url, opts={}){ return CD.apiFetch(url, opts); }
 let TIMER = null;
 let LAST = null;
 
@@ -127,9 +123,9 @@ function renderJobs(trend){
 }
 async function init(){
   await load();
-  TIMER = setInterval(load, 5000);  // CPU 增量采样需多次采样，5s 轮询刷新
+  TIMER = CD.poll(load, 5000);  // CPU 增量采样需多次采样，5s 轮询刷新
 }
-init().catch(e=>{ document.getElementById('jobTable').innerHTML = '<div class="loading">加载失败: '+esc(e.message)+'</div>'; });
+init().catch(e=>{ CD.renderError(document.getElementById('jobTable'), '加载失败: '+(e.message||e), init); });
 window.addEventListener('beforeunload', ()=>{ if(TIMER) clearInterval(TIMER); });
 </script>
 </body>

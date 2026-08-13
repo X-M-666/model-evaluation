@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>出题批次审核</title>
+<link rel="stylesheet" href="/static/common.css">
 <style>
 body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,'Segoe UI',sans-serif;margin:0}
 .wrap{max-width:900px;margin:0 auto;padding:24px}
@@ -44,19 +45,14 @@ a{color:#58a6ff}
 <div id="banner"></div>
 <div id="content"><div class="loading">加载中...</div></div>
 </div>
+<script src="/static/common.js"></script>
 <script>
+CD.renderTopNav('gen');   // 顶栏先于缺参/错误分支注入（D10）
 const params = new URLSearchParams(window.location.search);
 const genId = params.get('gen');
-const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function getToken(){ return localStorage.getItem('duel_token') || ''; }
-async function apiFetch(url, opts={}){
-  const headers = Object.assign({}, opts.headers);
-  const token = getToken();
-  if(token) headers['Authorization'] = 'Bearer ' + token;
-  const r = await fetch(url, Object.assign({}, opts, {headers}));
-  if(r.status === 401) throw new Error('未授权：请在首页顶部设置访问令牌');
-  return r;
-}
+const esc = s => CD.esc(s);
+function getToken(){ return CD.getToken(); }
+async function apiFetch(url, opts={}){ return CD.apiFetch(url, opts); }
 function stateBanner(d){
   const map = {
     generating:['生成中...','#58a6ff'],
@@ -138,7 +134,7 @@ async function load(){
       });
     });
   }catch(e){
-    box.innerHTML = `<div class="loading">加载失败: ${esc(e.message||e)}，<a href="/">返回首页</a></div>`;
+    CD.renderError(box, '加载失败: '+(e.message||e), load);
   }
 }
 if(!genId){

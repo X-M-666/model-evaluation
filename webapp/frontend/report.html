@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>评测报告 - 模型对决</title>
+<link rel="stylesheet" href="/static/common.css">
 <script src="/static/echarts.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -95,6 +96,11 @@ td{color:#c9d1d9}
 
 <div class="card" id="metaEvalCard" style="display:none"></div>
 <div class="card" id="consistencyCard" style="display:none"></div>
+<div class="card" id="envCard" style="display:none">
+<h2>🔬 评测环境快照</h2>
+<p class="hint" style="margin-bottom:8px">评测可复现性元数据（OS / Python / 依赖版本 / 评测参数，无任何密钥）</p>
+<div id="envBody"></div>
+</div>
 
 <div class="card">
 <h2>逐题评分明细</h2>
@@ -110,27 +116,45 @@ td{color:#c9d1d9}
 </div>
 </div>
 
+<script src="/static/common.js"></script>
 <script>
+CD.renderTopNav();
 const params = new URLSearchParams(window.location.search);
 const jobId = params.get('job');
 const C = {x:'#58a6ff', y:'#f0883e'};
 
-function getToken(){ return localStorage.getItem('duel_token') || ''; }
-async function apiFetch(url, opts={}){
-  const headers = Object.assign({}, opts.headers);
-  const token = getToken();
-  if(token) headers['Authorization'] = 'Bearer ' + token;
-  const r = await fetch(url, Object.assign({}, opts, {headers}));
-  if(r.status === 401){
-    throw new Error('未授权：请在首页顶部设置访问令牌');
-  }
-  return r;
-}
+function getToken(){ return CD.getToken(); }
+async function apiFetch(url, opts={}){ return CD.apiFetch(url, opts); }
 
 if(!jobId){
   document.querySelector('.wrap').innerHTML='<div class="loading">缺少 job 参数，<a href="/">返回首页</a></div>';
 }else{
   loadReport();
+}
+
+function pageError(msg, retryFn){
+  const box = document.createElement('div');
+  box.className = 'loading';
+  const span = document.createElement('span');
+  span.textContent = msg;
+  box.appendChild(span);
+  const br = document.createElement('br');
+  box.appendChild(br);
+  const back = document.createElement('a');
+  back.href = '/';
+  back.textContent = '返回首页';
+  box.appendChild(back);
+  if(typeof retryFn === 'function'){
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-secondary';
+    btn.style.margin = '8px 0 0 10px';
+    btn.style.padding = '6px 14px';
+    btn.textContent = '重试';
+    btn.addEventListener('click', retryFn);
+    box.appendChild(btn);
+  }
+  document.querySelector('.wrap').innerHTML = '';
+  document.querySelector('.wrap').appendChild(box);
 }
 
 async function loadReport(){
@@ -148,11 +172,11 @@ async function loadReport(){
         return;
       }
       if(s.state!=='completed'){
-        document.querySelector('.wrap').innerHTML=`<div class="loading">评测进行中（${esc(s.state)}），请稍后刷新</div>`;
+        pageError('评测进行中（' + s.state + '），稍后自动重试', ()=>setTimeout(loadReport, 3000));
         return;
       }
     }catch(_){}
-    document.querySelector('.wrap').innerHTML=`<div class="loading">加载失败: ${esc(e)}，<a href="/">返回首页</a></div>`;
+    pageError('加载失败: ' + e.message, loadReport);
   }
 }
 
@@ -205,6 +229,7 @@ function renderReport(data){
     renderMetaEval(rep);
     renderConsistency(rep);
     renderGrounding(rep);
+    renderEnv(rep);
     renderBadcases();
   }else{
     document.getElementById('statCard').style.display='none';
@@ -312,18 +337,22 @@ async function exportZip(){
   const token = getToken();
   const headers = {};
   if(token) headers['Authorization'] = 'Bearer ' + token;
-  const r = await fetch(`/api/eval/${jobId}/export`, {headers});
-  if(!r.ok){
-    const t = await r.text().catch(()=> '');
-    alert('导出失败：' + (t || r.status));
-    return;
+  try{
+    const r = await fetch(`/api/eval/${jobId}/export`, {headers});
+    if(!r.ok){
+      const t = await r.text().catch(()=> '');
+      throw new Error(t || ('HTTP '+r.status));
+    }
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `eval-${jobId}.zip`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    CD.toast('评测包已导出', 'ok');
+  }catch(e){
+    CD.toast('导出失败：' + e.message, 'err');
   }
-  const blob = await r.blob();
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `eval-${jobId}.zip`;
-  a.click();
-  URL.revokeObjectURL(a.href);
 }
 document.addEventListener('DOMContentLoaded', () => {
   const b = document.getElementById('exportBtn');
@@ -512,6 +541,55 @@ function renderAnalysis(sections){
   `).join('');
 }
 
+// ---- 环境快照（迭代八）：运行环境 + 评测参数（新字段缺省 N/A，零破坏） ----
+function renderEnv(rep){
+  const el = document.getElementById('envCard');
+  const ev = rep?.env_snapshot;
+  if(!ev){
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = 'block';
+  const pl = ev.platform || {};
+  const pkg = ev.packages || {};
+  const e = ev.eval || {};
+  const na = '<span style="color:#8b949e">N/A</span>';
+  const val = (v, fmt) => v == null || v === '' ? na : (fmt ? fmt(v) : esc(String(v)));
+  const models = e.model_names || {};
+  const temps = e.temperature || {};
+  const toks = e.max_tokens || {};
+  const rows = [
+    ['操作系统', val(pl.system + ' ' + (pl.release||''))],
+    ['机器 / 处理器', val(pl.machine) + ' / ' + val(pl.processor)],
+    ['Python', val(pl.python_version) + '（' + val(pl.python_impl) + '）'],
+    ['工作目录', val(ev.cwd)],
+    ['依赖版本', ['fastapi','uvicorn','httpx','pydantic','numpy','pandas']
+      .map(k=>`${k} ${pkg[k] != null ? pkg[k] : 'N/A'}`).join(' · ')],
+    ['随机种子', val(e.seed)],
+    ['模型（A / B）', val(models.a) + ' / ' + val(models.b)],
+    ['温度（A / B）', val(temps.a) + ' / ' + val(temps.b)],
+    ['max_tokens（A / B）', val(toks.a) + ' / ' + val(toks.b)],
+    ['重复次数', val(e.repeat_n)],
+    ['提示策略', val(e.prompt_strategy)],
+    ['代码验真', val(e.code_verify_mode)],
+    ['评测集 / 版本', val(e.dataset_name) + ' / ' + val(e.dataset_version)],
+    ['评审模式', val(e.review_mode)],
+    ['人工复核 K / 降级兜底', val(e.review_k_top_human) + ' / ' + (e.review_fail_open == null ? na : esc(e.review_fail_open ? '开启' : '关闭'))],
+    ['评审配置指纹', val(e.judge_config_fingerprint, v=>`<code style="color:#58a6ff">${esc(v)}</code>`)],
+  ];
+  const kv = rows.map(([k,v])=>`<tr><td style="padding:4px 12px 4px 0;color:#8b949e;white-space:nowrap">${esc(k)}</td><td style="padding:4px 0">${v}</td></tr>`).join('');
+  document.getElementById('envBody').innerHTML =
+    `<table style="width:100%;font-size:13px;border-collapse:collapse">${kv}</table>
+     <button id="envCopyBtn" class="btn btn-secondary" style="padding:6px 14px;font-size:12px;margin-top:10px">复制 JSON</button>`;
+  const copy = document.getElementById('envCopyBtn');
+  copy.addEventListener('click', ()=>{
+    try{
+      navigator.clipboard.writeText(JSON.stringify(ev, null, 2));
+      CD.toast('环境快照已复制', 'ok');
+    }catch(err){ CD.toast('复制失败：' + err.message, 'err'); }
+  });
+}
+
 function renderAnswers(data){
   const rounds = data.rounds;
   const box = document.getElementById('ansRounds');
@@ -583,7 +661,7 @@ function renderScoreTable(v, roundScores){
 }
 
 function fmt(n){ return Math.round(n*100)/100; }
-function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+function esc(s){ return CD.esc(s); }
 
 async function exportJson(){
   try{
@@ -596,7 +674,7 @@ async function exportJson(){
     a.click();
     URL.revokeObjectURL(a.href);
   }catch(e){
-    alert('导出失败: '+e);
+    CD.toast('导出失败: '+e.message, 'err');
   }
 }
 

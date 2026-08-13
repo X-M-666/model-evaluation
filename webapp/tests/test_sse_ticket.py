@@ -52,6 +52,19 @@ def test_consume_job_mismatch():
     assert sse_ticket.consume(t, "job-1") is True
 
 
+def test_tasks_scope_ticket_single_use():
+    """迭代八：任务视图 ticket（scope="tasks"）单次消费 + 作用域不匹配不消耗。"""
+    t = sse_ticket.issue("tasks")
+    assert sse_ticket.consume(t, "tasks") is True
+    assert sse_ticket.consume(t, "tasks") is False     # 消费即焚
+    t2 = sse_ticket.issue("tasks")
+    assert sse_ticket.consume(t2, "20260101_000000_abc123") is False   # 作用域不匹配
+    assert sse_ticket.consume(t2, "tasks") is True     # 正确作用域仍可用
+    # eval 路径 ticket 不可用于 tasks（跨作用域拒绝）
+    t3 = sse_ticket.issue("20260101_000000_abc123")
+    assert sse_ticket.consume(t3, "tasks") is False
+
+
 def test_consume_expired():
     t = sse_ticket.issue("job-1")
     sse_ticket._tickets[t]["exp"] = time.monotonic() - 1

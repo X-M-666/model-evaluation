@@ -8,7 +8,8 @@
   恒定时间比较）；跳过 Host 校验（局域网 IP 访问合法）；启用写请求限流。
 - SSE 进度流（/events）：EventSource 无法携带自定义 header，改用短时单次
   ticket（POST /api/eval/{job_id}/events/ticket 签发，见 sse_ticket.py），
-  长期 Token 不再出现在任何 URL 中。
+  长期 Token 不再出现在任何 URL 中。迭代八：任务视图流（/api/tasks/events）
+  同机制，ticket 作用域固定为 "tasks"。
 
 Origin 校验仅作用于写方法（POST/PUT/DELETE/PATCH）：Origin 存在则必须与请求
 Host 同源；无 Origin 时 Referer 必须同源；两者皆无（curl/TestClient）放行，
@@ -36,6 +37,8 @@ _HOST_PORT_RE = re.compile(r"^(\[[^]]*\]|[^\[\]:]+)(?::\d{1,5})?$")
 
 # 从 /api/eval/{job_id}/events 提取 job_id（ticket 作用域校验用）
 _EVENTS_JOB_RE = re.compile(r"^/api/eval/([^/]+)/events$")
+# 迭代八：任务视图 SSE 路径（ticket 作用域固定为 "tasks"）
+_TASKS_EVENTS_RE = re.compile(r"^/api/tasks/events$")
 
 WRITE_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
 
@@ -93,9 +96,14 @@ def _rate_limit(ip: str) -> bool:
 
 
 def _job_id_from_events_path(path: str) -> str:
-    """从 /api/eval/{job_id}/events 提取 job_id，格式不符返回空串。"""
+    """从事件路径提取 ticket 作用域串：/api/eval/{job_id}/events → job_id；
+    /api/tasks/events → "tasks"；格式不符返回空串（consume 必然失败）。"""
     m = _EVENTS_JOB_RE.match(path)
-    return m.group(1) if m else ""
+    if m:
+        return m.group(1)
+    if _TASKS_EVENTS_RE.match(path):
+        return "tasks"
+    return ""
 
 
 def _strip_query_param(qs: bytes, name: bytes) -> bytes:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 
+import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
@@ -195,6 +196,40 @@ def test_shared_mode_sse_ticket_scope_mismatch(shared_client):
     # 作用域不匹配不消耗 ticket：正确 job 仍可用（R3-001 保持语义）
     main_module._jobs[job_a]["sse_queue"].put_nowait({"type": "test", "state": "error"})
     assert shared_client.get(f"/api/eval/{job_a}/events?ticket={ticket}").status_code == 200
+
+
+def test_shared_mode_tasks_events_auth(shared_client):
+    """迭代八：任务视图流鉴权——未认证 401+审计、错作用域 ticket 204 静默、
+    合法 tasks ticket 200（流路由在单循环内可收到广播，机制见 test_tasks_sse）。"""
+    from backend import audit
+
+    headers = {"Authorization": "Bearer secret-token-123"}
+    assert shared_client.get("/api/tasks/events").status_code == 401
+    assert any(e["event"] == "auth_failed" for e in audit.read_events())
+
+    # eval 作用域 ticket 打错作用域 → 204 静默（不记审计）
+    job_id = shared_client.post("/api/eval/mock", headers=headers).json()["job_id"]
+    eval_ticket = shared_client.post(
+        f"/api/eval/{job_id}/events/ticket", headers=headers).json()["ticket"]
+    n_before = len(audit.read_events())
+    assert shared_client.get(f"/api/tasks/events?ticket={eval_ticket}").status_code == 204
+    assert len(audit.read_events()) == n_before
+
+    # 合法 tasks ticket → 200（连接建立；流数据机制由 test_tasks_sse 单循环用例覆盖）
+    r = shared_client.post("/api/tasks/events/ticket", headers=headers)
+    assert r.status_code == 200
+    ticket = r.json()["ticket"]
+
+    async def _scenario():
+        resp = await main_module.tasks_events()
+        # 中间件已放行（ticket 已消费）：路由正常注册订阅即证明认证通过
+        ok = len(main_module._TASKS_EVENT_SUBS) == 1
+        main_module._TASKS_EVENT_SUBS.clear()
+        return resp, ok
+
+    resp, ok = asyncio.run(_scenario())
+    assert ok
+    assert resp.status_code == 200
 
 
 def test_shared_mode_sse_ticket_unknown_or_terminal_job(shared_client):

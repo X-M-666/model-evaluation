@@ -34,7 +34,9 @@ jobs:
         run: python -m scripts.sandbox_selfcheck
       - name: Run tests with coverage (Linux/macOS: common tests only)
         if: runner.os != 'Windows'
-        run: python -m pytest tests -q --cov=backend --cov-report=term-missing -m "not native"
+        run: python -m pytest tests -q --cov=backend --cov-report=term-missing -m "not native and not perf"
       - name: Run tests with coverage (Windows: full suite incl. native sandbox)
         if: runner.os == 'Windows'
-        run: python -m pytest tests -q --cov=backend --cov-report=term-missing
+        run: python -m pytest tests -q --cov=backend --cov-report=term-missing -m "not perf"
+      - name: Performance benchmarks (perf marker, optional gate)
+        run: python -m pytest tests/test_perf.py -q --tb=short -p no:cacheprovider

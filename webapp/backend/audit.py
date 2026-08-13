@@ -158,6 +158,18 @@ def benchmark_done(batch_id: str, partial: bool, actor: str = "local") -> None:
              "path": "partial" if partial else "done", "actor": actor})
 
 
+def benchmark_cancelled(batch_id: str, count: int, actor: str = "local") -> None:
+    """benchmark 批次整体取消（迭代八，count=批次任务数）。"""
+    _append({"event": "benchmark_cancelled", "target": batch_id,
+             "count": count, "actor": actor})
+
+
+def benchmark_rerun(batch_id: str, new_batch_id: str, actor: str = "local") -> None:
+    """benchmark 批次重跑（迭代八，new_batch_id=重建的新批次）。"""
+    _append({"event": "benchmark_rerun", "target": batch_id,
+             "path": new_batch_id, "actor": actor})
+
+
 def read_events() -> list[dict[str, Any]]:
     """读取全部审计事件（测试与运维排查用）。"""
     p = _log_path()

@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>任务调度</title>
+<link rel="stylesheet" href="/static/common.css">
 <style>
 body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,'Segoe UI',sans-serif;margin:0}
 .wrap{max-width:1080px;margin:0 auto;padding:24px}
@@ -42,12 +43,12 @@ a{color:#58a6ff}
 
 <div class="card">
 <h2>排队中 <span class="badge q" id="qCount">0</span></h2>
-<div id="queuedList"><div class="empty">暂无排队任务</div></div>
+<div id="queuedList"><div class="loading">加载中...</div></div>
 </div>
 
 <div class="card">
 <h2>运行中 <span class="badge run" id="rCount">0</span></h2>
-<div id="runningList"><div class="empty">暂无运行中任务</div></div>
+<div id="runningList"><div class="loading">加载中...</div></div>
 </div>
 
 <div class="card">
@@ -70,21 +71,16 @@ a{color:#58a6ff}
 <button class="btn-ok" id="bm-create" style="margin-top:14px">创建 benchmark 批次</button>
 <span class="hint" id="bm-msg"></span>
 <h2 style="margin-top:18px">已有批次</h2>
-<div id="batchList"><div class="empty">暂无批次</div></div>
+<div id="batchList"><div class="loading">加载中...</div></div>
 </div>
 </div>
 
+<script src="/static/common.js"></script>
 <script>
-const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function getToken(){ return localStorage.getItem('duel_token') || ''; }
-async function apiFetch(url, opts={}){
-  const headers = Object.assign({}, opts.headers);
-  const token = getToken();
-  if(token) headers['Authorization'] = 'Bearer ' + token;
-  const r = await fetch(url, Object.assign({}, opts, {headers}));
-  if(r.status === 401) throw new Error('未授权：请在首页顶部设置访问令牌');
-  return r;
-}
+CD.renderTopNav('tasks');
+const esc = s => CD.esc(s);
+function getToken(){ return CD.getToken(); }
+async function apiFetch(url, opts={}){ return CD.apiFetch(url, opts); }
 const STATE_BADGE = {queued:'<span class="badge q">排队</span>', executing:'<span class="badge run">执行中</span>',
   judging:'<span class="badge run">评审中</span>', reviewing:'<span class="badge">人工评审</span>',
   completed:'<span class="badge ok">完成</span>', error:'<span class="badge err">失败</span>',
@@ -128,7 +124,7 @@ async function load(){
 }
 function renderBatches(batches){
   document.getElementById('batchList').innerHTML = batches.length ? `
-    <table><thead><tr><th>批次</th><th>模型</th><th>状态</th><th>排行榜</th></tr></thead>
+    <table><thead><tr><th>批次</th><th>模型</th><th>状态</th><th>排行榜</th><th>操作</th></tr></thead>
     <tbody>${batches.map(b=>`
       <tr><td><strong>${esc(b.name||b.batch_id)}</strong>
           <div class="hint">${esc(b.created_at||'')} · ${esc(b.dataset||'')} · ${b.n_jobs} jobs</div></td>
@@ -136,7 +132,10 @@ function renderBatches(batches){
         <td>${STATE_BADGE[b.state]||esc(b.state)}</td>
         <td>${b.leaderboard_id
           ? `<a href="/leaderboard.html?id=${esc(b.leaderboard_id)}" target="_blank">查看排行榜 →</a>`
-          : '<span class="hint">未生成</span>'}</td></tr>`).join('')}
+          : '<span class="hint">未生成</span>'}</td>
+        <td>${b.state==='running' || b.state==='queued'
+          ? `<button class="btn-danger" data-act="bcancel" data-bid="${esc(b.batch_id)}">取消批次</button>`
+          : `<button class="btn" data-act="brerun" data-bid="${esc(b.batch_id)}" style="padding:4px 12px;font-size:12px">重跑</button>`}</td></tr>`).join('')}
     </tbody></table>` : '<div class="empty">暂无批次</div>';
 }
 async function actCancel(jid){
@@ -145,7 +144,7 @@ async function actCancel(jid){
     const r = await apiFetch('/api/history/' + jid, {method:'DELETE'});
     if(!r.ok) throw new Error((await r.json()).detail || 'HTTP '+r.status);
     load();
-  }catch(e){ alert('取消失败：' + e.message); }
+  }catch(e){ CD.toast('取消失败：' + e.message, 'err'); }
 }
 async function actPrio(jid, input){
   try{
@@ -154,7 +153,26 @@ async function actPrio(jid, input){
       body: JSON.stringify({priority: parseInt(input.value) || 0})});
     if(!r.ok) throw new Error((await r.json()).detail || 'HTTP '+r.status);
     load();
-  }catch(e){ alert('调整失败：' + e.message); }
+  }catch(e){ CD.toast('调整失败：' + e.message, 'err'); }
+}
+async function actBatchCancel(bid){
+  if(!confirm('确认取消整个批次 '+bid+'？（排队中任务直接移除，运行中任务终止）')) return;
+  try{
+    const r = await apiFetch('/api/benchmark/' + encodeURIComponent(bid) + '/cancel', {method:'POST'});
+    if(!r.ok) throw new Error((await r.json()).detail || 'HTTP '+r.status);
+    CD.toast('批次已取消：' + bid, 'ok');
+    load();
+  }catch(e){ CD.toast('批次取消失败：' + e.message, 'err'); }
+}
+async function actBatchRerun(bid){
+  if(!confirm('确认重跑批次 '+bid+'？（按原配置重建新批次）')) return;
+  try{
+    const r = await apiFetch('/api/benchmark/' + encodeURIComponent(bid) + '/rerun', {method:'POST'});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || 'HTTP '+r.status);
+    CD.toast('已重跑：新批次 ' + d.batch_id, 'ok');
+    load();
+  }catch(e){ CD.toast('批次重跑失败：' + e.message, 'err'); }
 }
 async function loadDatasets(){
   const r = await apiFetch('/api/datasets');
@@ -193,6 +211,7 @@ async function createBatch(){
     const d = await r.json();
     if(!r.ok) throw new Error(d.detail || ('HTTP '+r.status));
     msg.textContent = '已创建批次：' + d.batch_id + '（' + d.jobs.length + ' 个执行单元）';
+    CD.toast('批次已创建：' + d.batch_id + '，进度见下方批次列表', 'ok');
     load();
   }catch(e){ msg.textContent = '失败：' + e.message; }
 }
@@ -209,15 +228,52 @@ document.getElementById('runningList').addEventListener('click', e=>{
   const btn = e.target.closest('button[data-act="cancel"]');
   if(btn) actCancel(btn.dataset.jid);
 });
+document.getElementById('batchList').addEventListener('click', e=>{
+  const btn = e.target.closest('button[data-act]');
+  if(!btn) return;
+  if(btn.dataset.act === 'bcancel') actBatchCancel(btn.dataset.bid);
+  if(btn.dataset.act === 'brerun') actBatchRerun(btn.dataset.bid);
+});
 document.getElementById('bm-create').addEventListener('click', createBatch);
+
+// ---- 迭代八：SSE 实时刷新（ticket 短时单次 + task_view ping 触发全量刷新） ----
+let sseRetries = 0;
+let sseSource = null;
+const SSE_RETRY_MAX = 5;
+
+function connectTaskSSE(){
+  if(sseSource){ try{ sseSource.close(); }catch(e){} }
+  apiFetch('/api/tasks/events/ticket', {method:'POST'}).then(r=>{
+    if(!r.ok) throw new Error('无法获取 SSE ticket');
+    return r.json();
+  }).then(d=>{
+    sseSource = new EventSource('/api/tasks/events?ticket=' + encodeURIComponent(d.ticket));
+    sseSource.onopen = ()=>{ sseRetries = 0; };
+    sseSource.onmessage = (e)=>{
+      try{
+        const evt = JSON.parse(e.data);
+        if(evt.type === 'task_view') load();
+      }catch(_){}
+    };
+    sseSource.onerror = ()=>{
+      if(sseSource) sseSource.close();
+      sseRetries++;
+      if(sseRetries >= SSE_RETRY_MAX) return;   // 轮询兜底继续工作
+      setTimeout(connectTaskSSE, Math.min(16000, 1000 * Math.pow(2, sseRetries - 1)));
+    };
+  }).catch(()=>{ /* 轮询兜底 */ });
+}
+
 async function init(){
   await loadDatasets();
   await loadModels();
   await load();
-  TIMER = setInterval(load, 3000);  // 轮询兜底（队列进度）
+  connectTaskSSE();
+  // 轮询兜底（队列进度；SSE 断开时仍可刷新）
+  TIMER = CD.poll(load, 3000);
 }
-init().catch(e=>{ document.getElementById('queuedList').innerHTML = '<div class="loading">加载失败: '+esc(e.message)+'</div>'; });
-window.addEventListener('beforeunload', ()=>{ if(TIMER) clearInterval(TIMER); });
+init().catch(e=>{ CD.renderError(document.getElementById('queuedList'), '加载失败: '+(e.message||e), init); });
+window.addEventListener('beforeunload', ()=>{ if(TIMER) clearInterval(TIMER); if(sseSource) sseSource.close(); });
 </script>
 </body>
 </html>

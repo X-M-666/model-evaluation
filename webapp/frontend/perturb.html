@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>对抗扰动评测</title>
+<link rel="stylesheet" href="/static/common.css">
 <style>
 body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,'Segoe UI',sans-serif;margin:0}
 .wrap{max-width:1080px;margin:0 auto;padding:24px}
@@ -78,7 +79,7 @@ a{color:#58a6ff}
 
 <div class="card">
 <h2>历史扰动评测</h2>
-<div id="histList"><div class="empty">暂无记录</div></div>
+<div id="histList"><div class="loading">加载中...</div></div>
 </div>
 
 <div class="card" id="resultCard" style="display:none">
@@ -94,17 +95,12 @@ a{color:#58a6ff}
 </div>
 </div>
 
+<script src="/static/common.js"></script>
 <script>
-const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function getToken(){ return localStorage.getItem('duel_token') || ''; }
-async function apiFetch(url, opts={}){
-  const headers = Object.assign({}, opts.headers);
-  const token = getToken();
-  if(token) headers['Authorization'] = 'Bearer ' + token;
-  const r = await fetch(url, Object.assign({}, opts, {headers}));
-  if(r.status === 401) throw new Error('未授权：请在首页顶部设置访问令牌');
-  return r;
-}
+CD.renderTopNav('perturb');
+const esc = s => CD.esc(s);
+function getToken(){ return CD.getToken(); }
+async function apiFetch(url, opts={}){ return CD.apiFetch(url, opts); }
 const MODES = [
   {key:'改写', label:'改写（同义词替换）'},
   {key:'噪声注入', label:'噪声注入（10%/20%/30%）'},
@@ -131,16 +127,20 @@ function modelPayload(prefix){
   };
 }
 async function loadLib(){
-  const r = await apiFetch('/api/models');
-  const list = ((await r.json()).models) || [];
-  document.getElementById('libSel').innerHTML = '<option value="">（手动填写下方字段）</option>' +
-    list.map(m=>`<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('');
+  try{
+    const r = await apiFetch('/api/models');
+    const list = ((await r.json()).models) || [];
+    document.getElementById('libSel').innerHTML = '<option value="">（手动填写下方字段）</option>' +
+      list.map(m=>`<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('');
+  }catch(e){ CD.toast('模型配置库加载失败：'+e.message, 'err'); }
 }
 async function loadDatasets(){
-  const r = await apiFetch('/api/datasets');
-  const list = ((await r.json()).datasets) || [];
-  document.getElementById('dsSel').innerHTML = list.map(d=>
-    `<option value="${esc(d.name)}">${esc(d.name)}（${d.task_count} 题）</option>`).join('');
+  try{
+    const r = await apiFetch('/api/datasets');
+    const list = ((await r.json()).datasets) || [];
+    document.getElementById('dsSel').innerHTML = list.map(d=>
+      `<option value="${esc(d.name)}">${esc(d.name)}（${d.task_count} 题）</option>`).join('');
+  }catch(e){ CD.toast('评测集加载失败：'+e.message, 'err'); }
 }
 async function onLibPick(){
   const id = document.getElementById('libSel').value;
@@ -191,17 +191,20 @@ async function loadHist(){
 }
 async function openDetail(id){
   if(POLL) clearInterval(POLL);
-  const r = await apiFetch('/api/perturb/' + id);
-  const d = await r.json();
-  render(d);
-  if(d.state === 'running'){
-    POLL = setInterval(async ()=>{
-      const rr = await apiFetch('/api/perturb/' + id);
-      const dd = await rr.json();
-      render(dd);
-      if(dd.state !== 'running' && POLL){ clearInterval(POLL); POLL = null; }
-    }, 2000);
-  }
+  try{
+    const r = await apiFetch('/api/perturb/' + id);
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || ('HTTP '+r.status));
+    render(d);
+    if(d.state === 'running'){
+      POLL = CD.poll(async ()=>{
+        const rr = await apiFetch('/api/perturb/' + id);
+        const dd = await rr.json();
+        render(dd);
+        if(dd.state !== 'running' && POLL){ clearInterval(POLL); POLL = null; }
+      }, 2000);
+    }
+  }catch(e){ CD.toast('扰动记录加载失败：' + (e.message||e), 'err'); }
 }
 function render(d){
   CURRENT = d;
@@ -271,7 +274,7 @@ document.getElementById('histList').addEventListener('click', e=>{
 modeBox();
 loadLib().catch(()=>{});
 loadDatasets().catch(()=>{});
-loadHist().catch(e=>{ document.getElementById('histList').innerHTML = '<div class="loading">加载失败: '+esc(e.message)+'</div>'; });
+loadHist().catch(e=>{ CD.renderError(document.getElementById('histList'), '加载失败: '+e.message, loadHist); });
 const params = new URLSearchParams(window.location.search);
 if(params.get('id')) openDetail(params.get('id'));
 </script>

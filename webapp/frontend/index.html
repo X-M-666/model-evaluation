@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>模型对决评测平台</title>
+<link rel="stylesheet" href="/static/common.css">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
@@ -292,35 +293,22 @@ textarea{min-height:120px;font-family:monospace;font-size:13px;resize:vertical}
 <div id="historyList"><em>加载中...</em></div>
 </div>
 
-<!-- 迭代七入口：任务调度 / 迭代六入口：扰动评测 / 排行榜 / KPI 看板 -->
-<div class="card" style="margin-top:24px">
-<h2>高级评测入口</h2>
-<div style="display:flex;gap:10px;flex-wrap:wrap">
-  <a href="/tasks.html" style="color:#58a6ff;text-decoration:none;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 16px;font-size:14px">🗂️ 任务调度 <span class="hint">排队 / 优先级 / 取消 / benchmark 批次</span></a>
-  <a href="/perturb.html" style="color:#58a6ff;text-decoration:none;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 16px;font-size:14px">⚔️ 对抗扰动评测 <span class="hint">鲁棒性衰减曲线 / 偏见公平性对照</span></a>
-  <a href="/leaderboard.html" style="color:#58a6ff;text-decoration:none;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 16px;font-size:14px">🏆 N 模型排行榜 <span class="hint">分维度排名 / 胜率矩阵 / CI 标注</span></a>
-  <a href="/dashboard.html" style="color:#58a6ff;text-decoration:none;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 16px;font-size:14px">📊 KPI 看板 <span class="hint">耗时 / Token 趋势 / CPU 利用率</span></a>
-</div>
-</div>
+<!-- 迭代八：入口统一收敛到顶栏导航（renderTopNav），原「高级评测入口」卡片移除 -->
 </div>
 
+<script src="/static/common.js"></script>
 <script>
 const API = '';
 let dims = [];
 let selectedDataset = '';
+CD.renderTopNav('index');
+document.addEventListener('auth-401', ()=>{
+  document.getElementById('auth-hint').textContent = '未授权：请填写正确的访问令牌';
+});
 
-// ---- 访问令牌（共享部署模式；单机模式可为空） ----
-function getToken(){ return localStorage.getItem('duel_token') || ''; }
-async function apiFetch(url, opts={}){
-  const headers = Object.assign({}, opts.headers);
-  const token = getToken();
-  if(token) headers['Authorization'] = 'Bearer ' + token;
-  const r = await fetch(url, Object.assign({}, opts, {headers}));
-  if(r.status === 401){
-    document.getElementById('auth-hint').textContent = '未授权：请填写正确的访问令牌';
-  }
-  return r;
-}
+// ---- 访问令牌（共享部署模式；单机模式可为空）——公共层实现 ----
+function getToken(){ return CD.getToken(); }
+async function apiFetch(url, opts){ return CD.apiFetch(url, opts); }
 
 // ---- 初始化 ----
 apiFetch(API+'/api/dims').then(r=>r.json()).then(d=>{
@@ -333,6 +321,7 @@ apiFetch(API+'/api/dims').then(r=>r.json()).then(d=>{
   loadDatasets();
 }).catch(()=>{
   document.getElementById('dims-box').textContent = '';
+  CD.toast('维度列表加载失败，已使用内置题库继续', 'warn');
   loadHistory();
   loadDatasets();
 });
@@ -423,7 +412,7 @@ async function handleFileUpload(){
 
 async function uploadJson(){
   const content = document.getElementById('ds-json').value.trim();
-  if(!content){ alert('请先粘贴 JSON 内容'); return; }
+  if(!content){ CD.toast('请先粘贴 JSON 内容', 'warn'); return; }
   const res = document.getElementById('upload-result');
   setLoading(res, '解析中...');
   try{
@@ -678,13 +667,13 @@ async function startMock(){
     // 与真实评测一致：先进入人工双盲评审，提交后才显示结果
     window.location='/review.html?job='+d.job_id;
   }catch(e){
-    alert('生成失败: '+e);
+    CD.toast('生成失败: '+e.message, 'err');
     btn.disabled = false; btn.textContent = '测试结果案例';
   }
 }
 
 function g(id){ return document.getElementById(id).value.trim(); }
-function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+function esc(s){ return CD.esc(s); }
 
 // ---- 安全渲染：外部数据一律走 textContent ----
 function setMsg(el, text, cls){
@@ -746,6 +735,7 @@ async function loadModels(){
     __modelsList = d.models || [];
   }catch(e){
     __modelsList = [];
+    CD.toast('模型配置库加载失败：'+e.message, 'err');
   }
   fillLibSelects();
   const el = document.getElementById('model-list');
@@ -857,7 +847,9 @@ async function loadHistory(){
         </div>
       </div>`;
     }).join('');
-  }catch(e){}
+  }catch(e){
+    CD.renderError(document.getElementById('historyList'), '历史记录加载失败：'+e.message, loadHistory);
+  }
 }
 
 // ---- 事件绑定（CSP 禁用内联事件处理器，统一在此挂载） ----

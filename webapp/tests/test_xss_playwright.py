@@ -180,6 +180,71 @@ def test_pages_have_no_js_or_csp_errors(_page):
     assert not csp_violations, f"CSP 违规: {csp_violations}"
 
 
+# ---------------- 迭代八：9 页统一冒烟（公共层/顶栏/三态） ----------------
+
+def test_iter8_all_pages_render_with_topnav(_page):
+    """全部 9 个页面：无 JS/CSP 异常、统一顶栏存在、目标页高亮。"""
+    page_errors, csp_violations = [], []
+    _page.on("pageerror", lambda e: page_errors.append(str(e)))
+    _page.on("console", lambda m: csp_violations.append(m.text)
+             if "Content-Security-Policy" in m.text else None)
+
+    pages = [
+        ("/", None), ("/report.html", None), ("/review.html", None),
+        ("/tasks.html", "/tasks.html"), ("/leaderboard.html", "/leaderboard.html"),
+        ("/perturb.html", "/perturb.html"), ("/dashboard.html", "/dashboard.html"),
+        ("/badcases.html", "/badcases.html"), ("/gen_review.html", "/gen_review.html"),
+    ]
+    for path, active in pages:
+        _page.goto(f"{BASE}{path}")
+        _page.wait_for_timeout(350)
+        assert _page.locator(".topnav").count() == 1, f"{path} 缺顶栏"
+        _page.locator('.topnav a[href="/tasks.html"]').first.is_visible()
+        _page.locator('.topnav a[href="/leaderboard.html"]').first.is_visible()
+        if active:
+            assert _page.locator(f".topnav a[href=\"{active}\"].active").count() == 1, \
+                f"{path} 顶栏高亮缺失"
+
+    assert not page_errors, f"页面 JS 异常: {page_errors}"
+    assert not csp_violations, f"CSP 违规: {csp_violations}"
+
+
+def test_iter8_report_env_snapshot_card(_page):
+    """报告页「评测环境快照」卡片渲染（迭代八）：运行环境 + 评测参数 + 复制按钮。"""
+    data = prepare_mock_job(seed=2027)
+    job_id = data["job_id"]
+    scores = [
+        {"id": t["id"], "round": 1, "answer_x": 8, "answer_y": 7, "note": ""}
+        for t in data["task_set"]["tasks"]
+    ]
+    r = _page.request.post(
+        f"{BASE}/api/eval/{job_id}/review",
+        data=json.dumps({"scores": scores}),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.ok, r.text
+    page_errors = []
+    _page.on("pageerror", lambda e: page_errors.append(str(e)))
+    _page.goto(f"{BASE}/report.html?job={job_id}")
+    _page.wait_for_selector("#envCard", state="visible", timeout=10000)
+    body = _page.locator("#envBody").text_content()
+    assert "操作系统" in body and "Python" in body
+    assert "随机种子" in body and "评审模式" in body
+    assert _page.locator("#envCopyBtn").is_visible()
+    assert not page_errors, f"report.html JS 异常: {page_errors}"
+
+
+def test_iter8_badcases_echarts_renders(_page):
+    """badcases.html echarts 404 修复回归（迭代八）：饼图 canvas 正常渲染，无 JS 异常。"""
+    page_errors = []
+    _page.on("pageerror", lambda e: page_errors.append(str(e)))
+    _page.goto(f"{BASE}/badcases.html")
+    _page.wait_for_selector("#chartCat canvas", timeout=10000)
+    _page.wait_for_selector("#chartSrc canvas", timeout=10000)
+    assert _page.locator(".topnav").count() == 1
+    assert not page_errors, f"badcases.html JS 异常: {page_errors}"
+
+
 # ---------------- 迭代六：扰动 / 排行榜 / KPI 看板页面冒烟 ----------------
 
 def test_iter6_pages_render_without_js_errors(_page):
