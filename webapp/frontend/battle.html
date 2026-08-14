@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>文本对战</title>
+<link rel="stylesheet" href="/static/common.css">
+<style>
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,'Segoe UI',sans-serif;margin:0}
+.wrap{max-width:1180px;margin:0 auto;padding:24px}
+h1{font-size:22px;color:#f0f6fc;margin:0}
+.sub{color:#8b949e;font-size:13px;margin-top:6px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-top:16px}
+.hint{color:#8b949e;font-size:12px}
+label{display:block;font-size:13px;color:#8b949e;margin-bottom:4px;margin-top:12px}
+input,select{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:13px;box-sizing:border-box}
+input[type=number]{width:100px}
+button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px}
+.btn{background:#1f6feb;color:#fff}
+.btn:disabled{background:#21262d;color:#484f58;cursor:not-allowed}
+.btn-ok{background:#238636;color:#fff}
+.btn-danger{background:transparent;color:#f85149;border:1px solid #f85149}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.col{flex:1;min-width:220px}
+/* ---- 对战区 ---- */
+#battleArea{display:none}
+.question-bar{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:14px 16px;margin-top:16px}
+.question-bar .q-title{color:#f0883e;font-size:12px;margin-bottom:6px}
+.question-bar .q-text{color:#e6edf3;font-size:14px;line-height:1.7;white-space:pre-wrap}
+.duel-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
+.side-card{background:#161b22;border:1px solid #30363d;border-radius:8px;display:flex;flex-direction:column;min-height:340px}
+.side-card .side-head{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid #21262d}
+.side-name{font-size:14px;font-weight:600}
+.side-name.a{color:#58a6ff}.side-name.b{color:#f0883e}
+.side-body{padding:14px;font-size:14px;line-height:1.7;white-space:pre-wrap;flex:1;overflow-y:auto;max-height:460px;color:#e6edf3}
+.side-body .stream-cursor{display:inline-block;width:7px;height:15px;background:#58a6ff;vertical-align:-2px;animation:blink 1s step-end infinite}
+.side-body.err{color:#f85149}
+@keyframes blink{50%{opacity:0}}
+.side-status{font-size:12px;color:#8b949e;padding:6px 14px;border-top:1px solid #21262d;display:none}
+/* ---- 投票条 ---- */
+.vote-bar{display:flex;gap:8px;align-items:center;justify-content:center;margin-top:16px;flex-wrap:wrap}
+.vote-btn{padding:8px 16px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9;cursor:pointer;font-size:13px}
+.vote-btn:hover{border-color:#58a6ff}
+.vote-btn.sel{background:#1f6feb;color:#fff;border-color:#1f6feb}
+.nav-btn{background:#30363d;color:#c9d1d9}
+.nav-btn:disabled{opacity:.4;cursor:not-allowed}
+.progress-txt{color:#8b949e;font-size:13px}
+/* ---- 统计弹窗 ---- */
+.modal-mask{display:none;position:fixed;inset:0;background:rgba(1,4,9,.7);z-index:200;align-items:flex-start;justify-content:center;padding:60px 20px}
+.modal-mask.open{display:flex}
+.modal{background:#161b22;border:1px solid #30363d;border-radius:10px;max-width:760px;width:100%;max-height:82vh;display:flex;flex-direction:column}
+.modal-head{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid #21262d}
+.modal-head h2{font-size:16px;margin:0;color:#f0f6fc}
+.modal-body{padding:16px 20px;overflow-y:auto}
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+.stat-cell{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;text-align:center}
+.stat-cell .v{font-size:22px;font-weight:700;color:#58a6ff}
+.stat-cell .k{font-size:12px;color:#8b949e;margin-top:2px}
+.detail-row{display:flex;gap:10px;align-items:flex-start;padding:10px 0;border-bottom:1px solid #21262d;font-size:13px}
+.detail-row .no{color:#8b949e;min-width:26px}
+.detail-row .txt{flex:1;color:#c9d1d9}
+.detail-row .res{font-size:12px;white-space:nowrap}
+.res.A{color:#58a6ff}.res.B{color:#f0883e}.res.tie{color:#8b949e}.res.na{color:#484f58}
+/* 匿名模式徽标 */
+.anon-tag{font-size:11px;color:#8b949e}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>⚔️ 文本对战</h1>
+<p class="sub">双模型同题并排作答，人工 5 档投票（A更好 / A略好 / 平手 / B略好 / B更好）</p>
+
+<!-- 比武场设置 -->
+<div class="card">
+  <div class="row">
+    <div class="col">
+      <label>模型 A · API URL（OpenAI 兼容）<div class="hint">填 /v1 地址即可，自动拼接 chat/completions</div></label>
+      <input id="mA-url" placeholder="https://api.openai.com/v1">
+      <label>API Key<div class="hint">仅内存，不落盘</div></label>
+      <input id="mA-key" type="password" placeholder="sk-...">
+      <label>模型名称</label>
+      <input id="mA-name" placeholder="gpt-4o">
+    </div>
+    <div class="col">
+      <label>模型 B · API URL（OpenAI 兼容）<div class="hint">填 /v1 地址即可，自动拼接 chat/completions</div></label>
+      <input id="mB-url" placeholder="https://api.openai.com/v1">
+      <label>API Key<div class="hint">仅内存，不落盘</div></label>
+      <input id="mB-key" type="password" placeholder="sk-...">
+      <label>模型名称</label>
+      <input id="mB-name" placeholder="gpt-4o">
+    </div>
+    <div class="col" style="min-width:190px;max-width:240px">
+      <label>测试题总数</label>
+      <input id="battle-count" type="number" value="10" min="1" max="50">
+      <label>测试集来源</label>
+      <select id="battle-source">
+        <option value="random">随机（内置题库）</option>
+        <option value="custom">自定义评测集</option>
+      </select>
+      <div id="ds-wrap" style="display:none">
+        <label>选择评测集</label>
+        <select id="battle-ds"><option value="">（加载中...）</option></select>
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:14px">
+        <input type="checkbox" id="anon-mode" style="width:auto"> 盲评模式
+        <span class="hint">隐藏模型身份，左右随机，评完揭晓</span>
+      </label>
+    </div>
+  </div>
+  <div class="row" style="margin-top:14px">
+    <button class="btn" id="startBtn">开始对战</button>
+    <button class="btn-ok" id="restartBtn" style="display:none">重新对战</button>
+    <button class="nav-btn" id="statBtn" style="display:none">结果统计</button>
+    <button class="btn-danger" id="exitBtn" style="display:none;padding:8px 16px;border-radius:6px;cursor:pointer;background:transparent;color:#f85149;border:1px solid #f85149">退出对决</button>
+    <span class="hint" id="battle-msg"></span>
+  </div>
+</div>
+
+<!-- 对战区 -->
+<div id="battleArea">
+  <div class="question-bar">
+    <div class="q-title">第 <span id="qIdx">1</span> / <span id="qTotal">10</span> 题 · <span id="qCat"></span></div>
+    <div class="q-text" id="qText"></div>
+  </div>
+  <div class="duel-grid">
+    <div class="side-card">
+      <div class="side-head"><span class="side-name a" id="nameA">模型 A</span><span class="anon-tag" id="anonA"></span></div>
+      <div class="side-body" id="outA"><span class="hint">等待作答...</span></div>
+      <div class="side-status" id="statusA"></div>
+    </div>
+    <div class="side-card">
+      <div class="side-head"><span class="side-name b" id="nameB">模型 B</span><span class="anon-tag" id="anonB"></span></div>
+      <div class="side-body" id="outB"><span class="hint">等待作答...</span></div>
+      <div class="side-status" id="statusB"></div>
+    </div>
+  </div>
+  <div class="vote-bar">
+    <span class="progress-txt" id="vProgress"></span>
+    <button class="vote-btn nav-btn" id="prevBtn">上一题</button>
+    <button class="vote-btn" data-v="0">A更好</button>
+    <button class="vote-btn" data-v="1">A略好</button>
+    <button class="vote-btn" data-v="2">平手</button>
+    <button class="vote-btn" data-v="3">B略好</button>
+    <button class="vote-btn" data-v="4">B更好</button>
+    <button class="vote-btn nav-btn" id="nextBtn">下一题</button>
+  </div>
+</div>
+
+<!-- 结果统计弹窗 -->
+<div class="modal-mask" id="statModal">
+  <div class="modal">
+    <div class="modal-head"><h2>结果统计</h2><button class="btn-danger" id="statClose">关闭</button></div>
+    <div class="modal-body" id="statBody"></div>
+    <div class="modal-body" id="revealBox" style="display:none"></div>
+  </div>
+</div>
+</div>
+
+<script src="/static/common.js"></script>
+<script>
+CD.renderTopNav('battle');
+const esc = s => CD.esc(s);
+function getToken(){ return CD.getToken(); }
+async function apiFetch(url, opts={}){ return CD.apiFetch(url, opts); }
+
+const V_LABEL = ['A更好', 'A略好', '平手', 'B略好', 'B更好'];
+let questions = [];      // 题目列表
+let votes = {};          // {question_id: 0..4}
+let cur = 0;             // 当前题下标
+let streaming = false;   // 是否正在流式作答
+let abortCtl = null;     // 当前流式 AbortController
+let sessionKey = '';     // 本局标识（重新对战/开始对战时刷新）
+let answers = {};        // 已作答缓存 {question_id: {left,right,leftErr,rightErr,dir}}
+let dirs = {};           // 盲评每题方向 {question_id: 'a-left'|'b-left'}
+let revealed = false;    // 盲评是否已揭晓身份
+
+// ---- 数据集下拉 ----
+async function loadDatasets(){
+  const sel = document.getElementById('battle-ds');
+  try{
+    const r = await apiFetch('/api/datasets');
+    const d = await r.json();
+    const list = d.datasets || [];
+    sel.innerHTML = '<option value="">（未选择）</option>' +
+      list.map(ds=>`<option value="${esc(ds.name)}">${esc(ds.name)} (${ds.task_count}题)</option>`).join('');
+  }catch(e){
+    sel.innerHTML = '<option value="">（加载失败）</option>';
+  }
+}
+
+// ---- 抽题 ----
+async function startBattle(){
+  const msg = document.getElementById('battle-msg');
+  const mA = collectModel('A'), mB = collectModel('B');
+  if(!mA.url || !mA.name || !mB.url || !mB.name){
+    msg.textContent = '两个模型的 URL / 名称均必填';
+    return;
+  }
+  const count = parseInt(document.getElementById('battle-count').value, 10) || 10;
+  const source = document.getElementById('battle-source').value;
+  const dataset_name = source === 'custom' ? document.getElementById('battle-ds').value : null;
+  if(source === 'custom' && !dataset_name){
+    msg.textContent = '请选择评测集';
+    return;
+  }
+  try{
+    msg.textContent = '抽题中...';
+    const r = await apiFetch('/api/battle/questions', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({count, source, dataset_name})});
+    if(!r.ok){
+      const err = await r.json().catch(()=>({}));
+      throw new Error(err.detail || ('HTTP '+r.status));
+    }
+    const d = await r.json();
+    questions = d.questions || [];
+    if(!questions.length) throw new Error('没有可用题目');
+    votes = {};
+    answers = {};
+    dirs = {};
+    revealed = false;
+    sessionKey = Date.now().toString(36);
+    cur = 0;
+    document.getElementById('startBtn').style.display = 'none';
+    document.getElementById('restartBtn').style.display = '';
+    document.getElementById('statBtn').style.display = '';
+    document.getElementById('exitBtn').style.display = '';
+    document.getElementById('battleArea').style.display = 'block';
+    document.getElementById('qTotal').textContent = questions.length;
+    msg.textContent = '';
+    persistState();
+    renderQuestion();
+  }catch(e){
+    msg.textContent = '抽题失败：' + e.message;
+  }
+}
+
+function collectModel(side){
+  return {
+    url: document.getElementById('m'+side+'-url').value.trim(),
+    key: document.getElementById('m'+side+'-key').value,
+    name: document.getElementById('m'+side+'-name').value.trim(),
+    temperature: 0.7, max_tokens: 16384, top_p: null,
+  };
+}
+
+function displayName(side){
+  const anon = document.getElementById('anon-mode').checked;
+  if(anon) return '模型 ' + side;
+  return document.getElementById('m'+side+'-name').value.trim() || ('模型 ' + side);
+}
+
+// ---- 会话持久化（跳转/刷新不重置对局） ----
+const SESSION_KEY = 'battle_session';
+function collectSession(){
+  return {
+    v: 1,
+    modelA: collectModel('A'), modelB: collectModel('B'),
+    anon: document.getElementById('anon-mode').checked,
+    source: document.getElementById('battle-source').value,
+    dataset_name: document.getElementById('battle-ds').value,
+    count: document.getElementById('battle-count').value,
+    sessionKey, questions, votes, cur, revealed,
+    answers, dirs,
+  };
+}
+function persistState(){
+  try{ sessionStorage.setItem(SESSION_KEY, JSON.stringify(collectSession())); }catch(e){}
+}
+function clearSession(){
+  try{ sessionStorage.removeItem(SESSION_KEY); }catch(e){}
+}
+function restoreSession(){
+  let saved = null;
+  try{ saved = JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null'); }catch(e){ return; }
+  if(!saved || !saved.questions || !saved.questions.length) return;
+  const setM = (side, m) => {
+    if(!m) return;
+    const el = id => document.getElementById('m'+side+'-'+id);
+    if(m.url) el('url').value = m.url;
+    if(m.key) el('key').value = m.key;
+    if(m.name) el('name').value = m.name;
+  };
+  setM('A', saved.modelA); setM('B', saved.modelB);
+  document.getElementById('anon-mode').checked = !!saved.anon;
+  document.getElementById('battle-count').value = saved.count || 10;
+  if(saved.source === 'custom' && saved.dataset_name){
+    const sel = document.getElementById('battle-ds');
+    if([...sel.options].some(o=>o.value === saved.dataset_name)){
+      sel.value = saved.dataset_name;
+      document.getElementById('ds-wrap').style.display = 'block';
+    }
+  }
+  document.getElementById('battle-source').value =
+    (saved.source === 'custom' && document.getElementById('ds-wrap').style.display === 'block')
+      ? 'custom' : 'random';
+  sessionKey = saved.sessionKey || '';
+  questions = saved.questions;
+  votes = saved.votes || {};
+  answers = saved.answers || {};
+  dirs = saved.dirs || {};
+  revealed = !!saved.revealed;
+  cur = Math.max(0, Math.min(parseInt(saved.cur, 10) || 0, questions.length - 1));
+  document.getElementById('startBtn').style.display = 'none';
+  document.getElementById('restartBtn').style.display = '';
+  document.getElementById('statBtn').style.display = '';
+  document.getElementById('exitBtn').style.display = '';
+  if(Object.keys(votes).length >= questions.length){
+    document.getElementById('statBtn').classList.add('btn-ok');
+  }
+  document.getElementById('battleArea').style.display = 'block';
+  document.getElementById('qTotal').textContent = questions.length;
+  renderQuestion();
+}
+
+// ---- 题目渲染与流式 ----
+function currentDir(q){
+  const anon = document.getElementById('anon-mode').checked;
+  if(!anon) return 'a-left';
+  if(!dirs[q.question_id]) dirs[q.question_id] = Math.random() < 0.5 ? 'a-left' : 'b-left';
+  return dirs[q.question_id];
+}
+
+function renderQuestion(){
+  const q = questions[cur];
+  const cached = answers[q.question_id];
+  const dir = cached ? cached.dir : currentDir(q);
+  document.getElementById('qIdx').textContent = cur + 1;
+  document.getElementById('qCat').textContent = q.category || '';
+  document.getElementById('qText').textContent = q.prompt;
+  const anon = document.getElementById('anon-mode').checked && !revealed;
+  // 盲评未揭晓：代号固定贴栏（左=模型A 右=模型B），真实身份随机分配；已揭晓/非盲评：真实名
+  const nameA = anon ? '模型 A' : (document.getElementById('mA-name').value.trim() || '模型 A');
+  const nameB = anon ? '模型 B' : (document.getElementById('mB-name').value.trim() || '模型 B');
+  document.getElementById('nameA').textContent = nameA;
+  document.getElementById('nameB').textContent = nameB;
+  document.getElementById('anonA').textContent = anon ? '（匿名）' : '';
+  document.getElementById('anonB').textContent = anon ? '（匿名）' : '';
+  document.getElementById('prevBtn').disabled = cur <= 0;
+  document.getElementById('nextBtn').disabled = cur >= questions.length - 1;
+  updateVoteUI();
+  updateProgress();
+  if(cached){
+    renderCached(cached, dir);
+    return;
+  }
+  streamQuestion(q, dir);
+}
+
+function renderCached(cached, dir){
+  const outA = document.getElementById('outA'), outB = document.getElementById('outB');
+  const stA = document.getElementById('statusA'), stB = document.getElementById('statusB');
+  const leftSide = dir === 'a-left' ? 'a' : 'b';
+  [outA, outB].forEach(el=>{ el.className = 'side-body'; el.textContent = ''; });
+  [stA, stB].forEach(el=>{ el.style.display = 'none'; el.textContent = ''; });
+  putSide(outA, stA, leftSide === 'a' ? cached.left : cached.right,
+          leftSide === 'a' ? cached.leftErr : cached.rightErr);
+  putSide(outB, stB, leftSide === 'a' ? cached.right : cached.left,
+          leftSide === 'a' ? cached.rightErr : cached.leftErr);
+}
+
+function putSide(out, st, text, err){
+  if(err){
+    out.className = 'side-body err';
+    out.textContent = '❌ ' + (text || '该侧失败');
+    st.style.display = '';
+    st.textContent = '该侧失败，另一侧继续';
+  } else {
+    out.textContent = text || '';
+  }
+}
+
+function updateVoteUI(){
+  const v = votes[questions[cur].question_id];
+  document.querySelectorAll('.vote-bar .vote-btn[data-v]').forEach(b=>{
+    b.classList.toggle('sel', v !== undefined && parseInt(b.dataset.v, 10) === v);
+  });
+}
+
+function updateProgress(){
+  const rated = Object.keys(votes).length;
+  document.getElementById('vProgress').textContent = `已评分 ${rated} / ${questions.length}`;
+}
+
+async function streamQuestion(q, dir){
+  streaming = true;
+  const outA = document.getElementById('outA'), outB = document.getElementById('outB');
+  const stA = document.getElementById('statusA'), stB = document.getElementById('statusB');
+  const leftSide = dir === 'a-left' ? 'a' : 'b';
+  const rightSide = dir === 'a-left' ? 'b' : 'a';
+  const elOf = side => side === leftSide ? outA : outB;
+  const stOf = side => side === leftSide ? stA : stB;
+  const buf = {a:'', b:''};
+  const errText = {a:'', b:''};
+  const doneSide = new Set();
+  const errSide = new Set();
+  [outA, outB].forEach(el=>{ el.className = 'side-body'; el.textContent = ''; });
+  [stA, stB].forEach(el=>{ el.style.display = 'none'; el.textContent = ''; });
+  if(abortCtl) abortCtl.abort();
+  abortCtl = new AbortController();
+  const modelA = collectModel('A'), modelB = collectModel('B');
+  try{
+    const r = await fetch('/api/battle/stream', {
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json',
+        ...(getToken() ? {Authorization:'Bearer '+getToken()} : {}),
+      },
+      body: JSON.stringify({prompt: q.prompt, context: q.context || '', model_a: modelA, model_b: modelB}),
+      signal: abortCtl.signal,
+    });
+    if(!r.ok){
+      const err = await r.json().catch(()=>({detail:'HTTP '+r.status}));
+      throw new Error(err.detail || ('HTTP '+r.status));
+    }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let pending = '';
+    while(true){
+      const {done, value} = await reader.read();
+      if(done) break;
+      pending += dec.decode(value, {stream:true});
+      const parts = pending.split('\n\n');
+      pending = parts.pop();
+      for(const part of parts){
+        const line = part.split('\n').find(l=>l.startsWith('data:'));
+        if(!line) continue;
+        const data = line.slice(5).trim();
+        if(!data) continue;
+        let evt;
+        try{ evt = JSON.parse(data); }catch(_){ continue; }
+        if(evt.delta !== undefined && (evt.side === 'a' || evt.side === 'b')){
+          buf[evt.side] += evt.delta;
+          elOf(evt.side).textContent = buf[evt.side] + '▍';
+        } else if(evt.done !== undefined && (evt.side === 'a' || evt.side === 'b')){
+          doneSide.add(evt.side);
+        } else if(evt.error !== undefined && (evt.side === 'a' || evt.side === 'b')){
+          errSide.add(evt.side);
+          errText[evt.side] = evt.error || '未知错误';
+          putSide(elOf(evt.side), stOf(evt.side), '❌ ' + errText[evt.side], true);
+        }
+        if(doneSide.size + errSide.size >= 2){
+          if(abortCtl.signal.aborted) break;
+        }
+      }
+    }
+    // 流结束：去掉光标，补齐缺 done 的一侧，写缓存
+    outA.textContent = outA.textContent.replace(/▍$/, '');
+    outB.textContent = outB.textContent.replace(/▍$/, '');
+    for(const side of ['a', 'b']){
+      if(!errSide.has(side) && !doneSide.has(side)){
+        errSide.add(side);
+        errText[side] = '连接中断';
+        putSide(elOf(side), stOf(side), '❌ 连接中断', true);
+      }
+    }
+    answers[q.question_id] = {
+      left: errSide.has(leftSide) ? ('❌ ' + errText[leftSide]) : buf[leftSide],
+      right: errSide.has(rightSide) ? ('❌ ' + errText[rightSide]) : buf[rightSide],
+      leftErr: errSide.has(leftSide), rightErr: errSide.has(rightSide),
+      dir,
+    };
+    persistState();
+  }catch(e){
+    if(e.name === 'AbortError'){
+      outA.textContent = outA.textContent.replace(/▍$/, '');
+      outB.textContent = outB.textContent.replace(/▍$/, '');
+      stA.style.display = stB.style.display = '';
+      stA.textContent = '已停止'; stB.textContent = '已停止';
+    } else {
+      outA.className = outB.className = 'side-body err';
+      outA.textContent = '❌ ' + e.message;
+      outB.textContent = '❌ ' + e.message;
+    }
+  }
+  streaming = false;
+}
+
+function stopStreaming(){
+  if(abortCtl) abortCtl.abort();
+}
+
+// ---- 退出对决（结束当前对局，回到初始设置） ----
+function exitBattle(){
+  if(!confirm('确认退出当前对决？投票与作答将丢失。')) return;
+  stopStreaming();
+  clearSession();
+  questions = [];
+  votes = {};
+  answers = {};
+  dirs = {};
+  revealed = false;
+  sessionKey = '';
+  cur = 0;
+  streaming = false;
+  document.getElementById('battleArea').style.display = 'none';
+  document.getElementById('startBtn').style.display = '';
+  document.getElementById('restartBtn').style.display = 'none';
+  document.getElementById('statBtn').style.display = 'none';
+  document.getElementById('statBtn').classList.remove('btn-ok');
+  document.getElementById('exitBtn').style.display = 'none';
+  const msg = document.getElementById('battle-msg');
+  if(msg) msg.textContent = '已退出对决';
+}
+
+// ---- 投票与导航 ----
+function vote(v){
+  if(streaming) return;
+  const q = questions[cur];
+  if(!q) return;
+    votes[q.question_id] = v;
+    updateVoteUI();
+    updateProgress();
+    if(Object.keys(votes).length >= questions.length){
+      document.getElementById('statBtn').classList.add('btn-ok');
+    }
+    persistState();
+    // 不自动跳题：评完当前题停留，点「下一题」才进入下一道并让 AI 作答
+  }
+
+function nav(delta){
+  if(streaming) return;
+  const next = cur + delta;
+  if(next < 0 || next >= questions.length) return;
+  cur = next;
+  renderQuestion();
+}
+
+// ---- 结果统计 ----
+function openStat(){
+  const body = document.getElementById('statBody');
+  let rated = 0, aWin = 0, bWin = 0, tie = 0;
+  const rows = questions.map((q,i)=>{
+    const v = votes[q.question_id];
+    if(v !== undefined){
+      rated++;
+      if(v === 0) aWin++; else if(v === 4) bWin++; else if(v === 2) tie++;
+    }
+    const cls = v === 0 ? 'A' : v === 4 ? 'B' : v === 2 ? 'tie' : 'na';
+    const txt = v === undefined ? '未评分' : V_LABEL[v];
+    return `<div class="detail-row"><span class="no">${i+1}</span>
+      <span class="txt">${esc(q.prompt.length > 90 ? q.prompt.slice(0,90)+'...' : q.prompt)}</span>
+      <span class="res ${cls}">${esc(txt)}</span></div>`;
+  }).join('');
+  body.innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-cell"><div class="v">${questions.length}</div><div class="k">总题数</div></div>
+      <div class="stat-cell"><div class="v">${rated}</div><div class="k">已评分</div></div>
+      <div class="stat-cell"><div class="v">${questions.length - rated}</div><div class="k">未评分</div></div>
+      <div class="stat-cell"><div class="v" style="color:#58a6ff">${aWin}</div><div class="k">模型A获胜</div></div>
+      <div class="stat-cell"><div class="v" style="color:#f0883e">${bWin}</div><div class="k">模型B获胜</div></div>
+      <div class="stat-cell"><div class="v">${tie}</div><div class="k">平局</div></div>
+    </div>
+    <div class="hint" style="margin-bottom:8px">详细评分</div>
+    ${rows}`;
+  document.getElementById('statModal').classList.add('open');
+
+  // 盲评揭晓区块：全部评完才可揭晓
+  const anon = document.getElementById('anon-mode').checked;
+  const revealBox = document.getElementById('revealBox');
+  revealBox.style.display = anon ? 'block' : 'none';
+  if(anon){
+    const allDone = Object.keys(votes).length >= questions.length;
+    revealBox.innerHTML = `
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <button class="btn" id="revealBtn">${revealed ? '已揭晓' : '揭晓模型身份'}</button>
+        <span class="hint">${allDone || revealed ? '' : '（需全部题评完）'}</span>
+      </div>
+      <div id="revealInfo" class="hint" style="white-space:pre-wrap"></div>`;
+    const btn = document.getElementById('revealBtn');
+    if(btn && !revealed){
+      btn.disabled = !allDone;
+      btn.addEventListener('click', revealIdentity);
+    }
+  }
+}
+
+function revealIdentity(){
+  revealed = true;
+  persistState();
+  const realA = collectModel('A').name || '模型 A';
+  const realB = collectModel('B').name || '模型 B';
+  document.getElementById('nameA').textContent = realA;
+  document.getElementById('nameB').textContent = realB;
+  document.getElementById('anonA').textContent = '';
+  document.getElementById('anonB').textContent = '';
+  const info = document.getElementById('revealInfo');
+  info.textContent = `左栏（模型 A）= ${realA}\n右栏（模型 B）= ${realB}\n每道题真实模型左右位置随机，投票代号「模型A / 模型B」对应栏位作答内容。`;
+  const btn = document.getElementById('revealBtn');
+  if(btn){ btn.disabled = true; btn.textContent = '已揭晓'; }
+  renderQuestion();
+}
+
+// ---- 事件绑定 ----
+document.getElementById('startBtn').addEventListener('click', startBattle);
+document.getElementById('restartBtn').addEventListener('click', startBattle);
+document.getElementById('exitBtn').addEventListener('click', exitBattle);
+document.getElementById('statBtn').addEventListener('click', openStat);
+document.getElementById('battle-source').addEventListener('change', ()=>{
+  document.getElementById('ds-wrap').style.display =
+    document.getElementById('battle-source').value === 'custom' ? 'block' : 'none';
+});
+document.querySelectorAll('.vote-bar .vote-btn[data-v]').forEach(b=>{
+  b.addEventListener('click', ()=>vote(parseInt(b.dataset.v, 10)));
+});
+document.getElementById('prevBtn').addEventListener('click', ()=>nav(-1));
+document.getElementById('nextBtn').addEventListener('click', ()=>nav(1));
+document.getElementById('statClose').addEventListener('click', ()=>{
+  document.getElementById('statModal').classList.remove('open');
+});
+document.getElementById('statModal').addEventListener('click', e=>{
+  if(e.target === e.currentTarget) e.currentTarget.classList.remove('open');
+});
+// 流式中停止：点击任一输出区
+document.getElementById('outA').addEventListener('click', ()=>{ if(streaming) stopStreaming(); });
+document.getElementById('outB').addEventListener('click', ()=>{ if(streaming) stopStreaming(); });
+
+loadDatasets().then(restoreSession);
+</script>
+</body>
+</html>

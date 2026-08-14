@@ -43,6 +43,7 @@ a{color:#58a6ff}
 <h1>📝 出题批次审核</h1>
 <p class="sub" id="subInfo">加载中...</p>
 <div id="banner"></div>
+<div id="delBox" style="margin-top:12px"></div>
 <div id="content"><div class="loading">加载中...</div></div>
 </div>
 <script src="/static/common.js"></script>
@@ -61,7 +62,11 @@ function stateBanner(d){
     error:['出题失败','#f85149'],
     rejected:['批次已关闭','#8b949e'],
   };
-  const [txt, col] = map[d.state] || [d.state, '#8b949e'];
+  let [txt, col] = map[d.state] || [d.state, '#8b949e'];
+  const pg = d.progress && d.progress.total ? d.progress : null;
+  if(d.state === 'generating' && pg){
+    txt = `生成中 ${Math.min(pg.done, pg.total)}/${pg.total}`;
+  }
   return `<div class="state-banner" style="background:rgba(0,0,0,.25);border:1px solid ${col};color:${col}">● ${esc(txt)}${d.error ? '：' + esc(d.error) : ''}</div>`;
 }
 async function submitAction(itemId, action){
@@ -115,10 +120,29 @@ async function load(){
     const r = await apiFetch(`/api/generate/${genId}`);
     if(!r.ok) throw new Error((await r.json()).detail || '加载失败');
     const d = await r.json();
+    const dimTxt = (d.spec && d.spec.dimensions && d.spec.dimensions.length)
+      ? d.spec.dimensions.join('、')
+      : (d.spec && d.spec.dimension) || '';
     document.getElementById('subInfo').textContent =
-      `批次 ${esc(d.gen_id)} | 状态 ${esc(d.state)} | 维度 ${esc(d.spec && d.spec.dimension || '')} | 目标评测集 ${esc(d.spec && d.spec.target_dataset || '（自动命名）')} | 已审核 ${esc(d.item_stats && d.item_stats.approved)}/${esc(d.item_stats && d.item_stats.total)}`;
-    document.getElementById('banner').innerHTML = stateBanner(d);
-    const items = d.items || [];
+      `批次 ${esc(d.gen_id)} | 状态 ${esc(d.state)} | 维度 ${esc(dimTxt)} | 目标评测集 ${esc(d.spec && d.spec.target_dataset || '（自动命名）')} | 已审核 ${esc(d.item_stats && d.item_stats.approved)}/${esc(d.item_stats && d.item_stats.total)}`;
+document.getElementById('banner').innerHTML = stateBanner(d);
+  // 删除批次（生成中禁止）
+  const delBox = document.getElementById('delBox');
+  if(d.state === 'generating'){
+    delBox.innerHTML = '';
+  }else{
+    delBox.innerHTML = `<button id="delBatchBtn" style="background:transparent;color:#f85149;border:1px solid #f85149;padding:8px 16px;border-radius:6px;cursor:pointer">🗑 删除批次</button>
+      <span class="hint" style="margin-left:8px">已入库题目不受影响，删除后不可恢复</span>`;
+    document.getElementById('delBatchBtn').addEventListener('click', async ()=>{
+      if(!confirm('确认删除该出题批次？删除后不可恢复。')) return;
+      try{
+        const r = await apiFetch(`/api/generate/${genId}`, {method:'DELETE'});
+        if(!r.ok) throw new Error((await r.json()).detail || ('HTTP '+r.status));
+        window.location = '/tasks.html';
+      }catch(e){ alert('删除失败：' + e.message); }
+    });
+  }
+  const items = d.items || [];
     if(!items.length){ box.innerHTML = '<div class="loading">批次暂无题目（生成中或已清空）</div>'; return; }
     box.innerHTML = items.map(itemHtml).join('');
     box.querySelectorAll('button[data-act]').forEach(btn=>{

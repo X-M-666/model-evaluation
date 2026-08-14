@@ -13,8 +13,9 @@ h2{font-size:15px;color:#f0883e;margin-bottom:8px}
 .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-top:16px}
 .hint{color:#8b949e;font-size:12px}
 label{display:block;font-size:13px;color:#8b949e;margin-bottom:4px;margin-top:12px}
-input,select{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:13px;box-sizing:border-box}
+input,select,textarea{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:13px;box-sizing:border-box}
 input[type=checkbox],input[type=number]{width:auto}
+textarea{font-family:monospace;font-size:13px;min-height:90px;resize:vertical}
 button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px}
 .btn{background:#1f6feb;color:#fff}
 .btn-ok{background:#238636;color:#fff}
@@ -25,21 +26,73 @@ button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:1
 .badge.ok{background:#238636;color:#fff}
 .badge.err{background:#da3633;color:#fff}
 .badge.b{background:#8957e5;color:#fff}
+.badge.dim{background:#1f6feb;color:#fff}
 table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
 th,td{padding:6px 10px;border-bottom:1px solid #21262d;text-align:left}
 th{color:#8b949e;font-weight:normal}
 a{color:#58a6ff}
+/* 表格滚动容器：任务多时可滚动查看，表头吸顶 */
+#queuedList,#runningList,#batchList{max-height:480px;overflow-y:auto;border:1px solid #21262d;border-radius:6px;margin-top:10px}
+#queuedList table,#runningList table,#batchList table{margin-top:0}
+#queuedList thead th,#runningList thead th,#batchList thead th{position:sticky;top:0;background:#161b22;z-index:1}
+#queuedList .empty,#runningList .empty,#batchList .empty{padding:24px 0}
 .loading{text-align:center;padding:40px;color:#8b949e}
 .empty{text-align:center;padding:40px;color:#8b949e}
 .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-.bm-models{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
-.bm-models label{display:inline-flex;align-items:center;gap:4px;margin:0;font-size:13px;color:#c9d1d9;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px 10px;cursor:pointer}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.toolbar input[type=text]{width:240px}
+.toolbar select{width:auto;min-width:130px}
+.score{font-weight:600;color:#3fb950}
+.score.na{color:#8b949e;font-weight:normal}
+.test-ok{color:#3fb950;font-size:13px}
+.test-err{color:#f85149;font-size:13px}
+/* ---- 访问令牌 ---- */
+#auth-hint{font-size:12px}
+/* ---- 饱和度提示 ---- */
+#saturation-hint{display:none;margin-top:12px;padding:10px;border:1px solid #f0883e;border-radius:6px;background:rgba(240,136,62,.08);font-size:13px}
+/* ---- 新建任务向导 ---- */
+.modal-mask{display:none;position:fixed;inset:0;background:rgba(1,4,9,.7);z-index:200;align-items:flex-start;justify-content:center;padding:40px 20px}
+.modal-mask.open{display:flex}
+.modal{background:#161b22;border:1px solid #30363d;border-radius:10px;max-width:760px;width:100%;max-height:88vh;display:flex;flex-direction:column}
+.modal-head{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid #21262d}
+.modal-head h2{font-size:16px;margin:0;color:#f0f6fc}
+.modal-body{padding:16px 20px;overflow-y:auto;flex:1}
+.steps{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
+.step{font-size:12px;padding:4px 12px;border-radius:14px;background:#0d1117;border:1px solid #30363d;color:#8b949e}
+.step.active{background:#1f6feb;color:#fff;border-color:#1f6feb}
+.wizard-step{display:none}
+.wizard-step.active{display:block}
+.model-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.model-row input[data-f="url"]{width:250px}
+.model-row input[data-f="key"]{width:150px}
+.model-row input[data-f="name"]{width:120px}
+.model-row .btn-danger{white-space:nowrap}
+.wizard-foot{display:flex;justify-content:space-between;margin-top:18px;padding-top:12px;border-top:1px solid #21262d}
+.radio-inline{display:flex;gap:18px;align-items:center;margin-top:8px}
+.radio-inline label{display:inline;margin:0;cursor:pointer;font-size:13px;color:#c9d1d9}
+.dims-box{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
+.dims-box label{display:inline;margin:0;cursor:pointer;font-size:13px;color:#c9d1d9}
+.ds-item{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;margin-bottom:6px;font-size:13px}
+.ds-item .ds-info strong{color:#c9d1d9}
+.ds-item .ds-info span{color:#8b949e;margin-left:8px}
+.conn-result{margin-top:10px}
 </style>
 </head>
 <body>
 <div class="wrap">
 <h1>🗂️ 任务调度</h1>
 <p class="sub" id="subInfo">优先级队列 + 并发配额（<span id="quotaInfo">-</span>）：超并发评测自动排队，可调整优先级 / 取消排队任务</p>
+
+<!-- 访问令牌（迭代十一：首页功能浓缩到任务页） -->
+<div class="card" style="padding:12px 16px">
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <label style="margin:0;flex:none">访问令牌（管理员共享部署时必填）</label>
+    <input id="token-input" type="password" placeholder="MODEL_DUEL_TOKEN 的值" style="flex:1;min-width:200px;padding:6px 12px" />
+    <button class="btn" id="token-save" style="padding:6px 14px">保存</button>
+    <span id="auth-hint" class="test-err" style="margin:0"></span>
+  </div>
+  <p class="hint" style="margin-top:6px">令牌仅保存在本机浏览器，单机使用无需填写</p>
+</div>
 
 <div class="card">
 <h2>排队中 <span class="badge q" id="qCount">0</span></h2>
@@ -52,27 +105,174 @@ a{color:#58a6ff}
 </div>
 
 <div class="card">
-<h2>benchmark 批次</h2>
-<div class="row" style="margin-top:10px">
-  <label style="flex:1;min-width:180px">评测集
-    <select id="bm-ds"></select>
-  </label>
-  <label style="flex:1;min-width:180px">模型配置库（多选）
-    <div class="bm-models" id="bm-models"></div>
-  </label>
-  <label>轮次 M <input id="bm-rounds" type="number" min="1" max="20" value="1" style="width:70px"></label>
-  <label>优先级 <input id="bm-priority" type="number" min="-10" max="10" value="0" style="width:70px"></label>
-  <label style="flex:1;min-width:200px">评审模型 URL（生成式题单臂）
-    <input id="bm-judge-url" placeholder="可留空（生成式题得分 N/A）">
-  </label>
-  <label>评审模型名 <input id="bm-judge-name" style="width:140px"></label>
-  <label>评审 Key <input id="bm-judge-key" type="password" style="width:140px"></label>
+<h2>评测任务</h2>
+<div id="saturation-hint"></div>
+<div class="toolbar">
+  <input type="text" id="f-kw" placeholder="关键词：任务名称 / 模型 / 数据集">
+  <select id="f-state">
+    <option value="">全部状态</option>
+    <option value="running">运行中</option>
+    <option value="queued">排队中</option>
+    <option value="done">已完成</option>
+    <option value="partial">部分失败</option>
+    <option value="error">失败</option>
+    <option value="cancelled">已取消</option>
+  </select>
+  <button class="btn-danger" id="f-reset">重置</button>
+  <button class="btn" id="f-search">搜索</button>
+  <button class="btn-ok" id="newTaskBtn" style="margin-left:auto">新建任务</button>
 </div>
-<button class="btn-ok" id="bm-create" style="margin-top:14px">创建 benchmark 批次</button>
-<span class="hint" id="bm-msg"></span>
-<h2 style="margin-top:18px">已有批次</h2>
 <div id="batchList"><div class="loading">加载中...</div></div>
 </div>
+
+<!-- LLM 出题（迭代十一：首页功能浓缩到任务页） -->
+<div class="card">
+<h2>LLM 出题 <span class="hint">AI 生成题目 → 人工审核 → 入库为评测集</span></h2>
+<div class="row">
+  <label style="flex:1;min-width:200px">出题模型配置<div class="hint">OpenAI 兼容；留空则复用上方评审模型</div>
+    <input id="gen-url" placeholder="https://api.openai.com/v1"></label>
+  <label style="flex:1;min-width:160px">模型名称<div class="hint">可选</div><input id="gen-name" placeholder="gpt-4o"></label>
+  <label style="flex:1;min-width:140px">API Key<div class="hint">仅内存，不落盘</div><input id="gen-key" type="password" placeholder="sk-..."></label>
+</div>
+<div class="row">
+  <label style="flex:1;min-width:200px">维度（可多选）<div class="hint">每个选中维度生成上方数量道题</div>
+    <div class="dims-box" id="gen-dims"><em>加载中...</em></div>
+  </label>
+  <label style="flex:1;min-width:160px">题型
+    <select id="gen-type"><option value="判别式">判别式</option><option value="生成式">生成式</option></select>
+  </label>
+  <label style="flex:1;min-width:140px">每维度生成数量<div class="hint">1-20，默认5</div><input id="gen-count" type="number" value="5" min="1" max="20"></label>
+</div>
+<div class="row">
+  <label style="flex:1;min-width:200px">目标评测集<div class="hint">留空=审核后自动命名</div><input id="gen-dataset" placeholder="如：生成集A"></label>
+  <label style="flex:1;min-width:220px;margin-top:12px">
+    <input type="checkbox" id="gen-cot" checked> 启用 CoT 思考提示
+    <input type="checkbox" id="gen-ctx" style="margin-left:14px"> 生成带参考文档（RAG context）的题目
+  </label>
+</div>
+<div class="row" style="margin-top:8px">
+  <button class="btn" id="genBtn">生成题目</button>
+  <span id="gen-result" class="hint"></span>
+</div>
+<div style="margin-top:16px">
+  <label>待审核批次</label>
+  <div id="gen-batches" class="ds-item" style="display:block;padding:0"><em>加载中...</em></div>
+</div>
+</div>
+</div>
+
+<!-- 新建任务向导 -->
+<div class="modal-mask" id="wizardMask">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>新建任务</h2>
+      <button class="btn-danger" id="wizardClose">关闭</button>
+    </div>
+    <div class="modal-body">
+      <div class="steps" id="wizardSteps">
+        <span class="step active">1 模型选择</span><span class="step">2 评测工具</span>
+        <span class="step">3 数据集选择</span><span class="step">4 其他配置</span>
+      </div>
+
+      <!-- 第 1 步：模型选择 -->
+      <div class="wizard-step active" id="ws-0">
+        <p class="hint">填写 2~20 个模型的 API 配置（Key 仅内存，不落盘；temperature 0.7 / max_tokens 16384 固定默认）</p>
+        <div id="wz-models"></div>
+        <button id="wz-add-model" style="margin-top:10px;padding:6px 14px;border-radius:6px;border:none;background:#1f6feb;color:#fff;cursor:pointer;font-size:13px">+ 添加模型</button>
+        <span id="wz-models-msg" class="hint" style="margin-left:10px"></span>
+        <div style="margin-top:14px">
+          <button class="btn" id="wz-test-conn">验证连通性</button>
+          <span class="hint" style="margin-left:8px">逐模型测试 URL 可达性与模型名有效性</span>
+          <div class="conn-result" id="wz-conn-result"></div>
+        </div>
+      </div>
+
+      <!-- 第 2 步：评测工具 -->
+      <div class="wizard-step" id="ws-1">
+        <label>评测类型</label>
+        <div class="radio-inline">
+          <label><input type="radio" name="wz-review" value="auto" checked> 判别式自动计分</label>
+          <label><input type="radio" name="wz-review" value="ai"> 生成式 AI 评审</label>
+        </div>
+        <div id="wz-judge" style="display:none">
+          <label>评审 API URL<div class="hint">OpenAI 兼容；仅用于生成式题单臂 rubric 评分</div></label>
+          <input id="wz-j-url" placeholder="https://api.openai.com/v1">
+          <label>评审 API Key</label>
+          <input id="wz-j-key" type="password" placeholder="sk-...">
+          <label>评审模型名称</label>
+          <input id="wz-j-name" placeholder="gpt-4o">
+        </div>
+        <label>代码题验真模式</label>
+        <select id="wz-code">
+          <option value="off">仅展示 + 语法检查（默认）</option>
+          <option value="native-sandbox">原生隔离执行（实验性）</option>
+        </select>
+        <label>重复次数（>1 时自动跑 N 次取平均，稳定性）</label>
+        <input id="wz-repeat" type="number" value="1" min="1" max="20" style="width:100px">
+        <div style="margin-top:16px;padding:12px;background:#0d1117;border:1px solid #30363d;border-radius:6px">
+          <label style="margin:0;display:flex;align-items:center;gap:8px">
+            <input type="checkbox" id="wz-perturb-on"> 扰动评测（鲁棒性）
+          </label>
+          <p class="hint" style="margin-top:6px">开启后评测完成自动对<strong>每个被测模型</strong>跑扰动版题目（改写/噪声/属性扰动），衰减曲线与偏见对照见排行榜页</p>
+          <div id="wz-perturb-modes" style="display:none;margin-top:8px">
+            <label style="margin-top:0">扰动模式</label>
+            <div class="dims-box" id="wz-perturb-box"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 第 3 步：数据集选择 -->
+      <div class="wizard-step" id="ws-2">
+        <div class="radio-inline">
+          <label><input type="radio" name="wz-ds" value="builtin" checked> 内置题库</label>
+          <label><input type="radio" name="wz-ds" value="custom"> 自定义评测集</label>
+        </div>
+        <div id="wz-builtin">
+          <label>维度（默认全部八维度）</label>
+          <div class="dims-box" id="wz-dims"></div>
+          <label>题目数量<div class="hint">留空=全部</div></label>
+          <input id="wz-num" type="number" min="1" max="200" style="width:100px">
+        </div>
+        <div id="wz-custom" style="display:none">
+          <label>选择文件上传（JSON / CSV / Markdown / TXT）</label>
+          <input type="file" id="wz-ds-file" accept=".json,.csv,.md,.markdown,.txt" style="padding:6px 0">
+          <div style="margin-top:6px;font-size:12px;color:#8b949e">
+            格式参考：
+            <a href="#" data-fmt="json">JSON 模板</a> ·
+            <a href="#" data-fmt="csv">CSV 模板</a> ·
+            <a href="#" data-fmt="md">Markdown 模板</a> ·
+            <a href="#" data-fmt="txt">TXT 模板</a>
+          </div>
+          <label>或粘贴 JSON 到文本框</label>
+          <textarea id="wz-ds-json" placeholder='{"name":"我的测试集","tasks":[{"prompt":"题目","expected":"示例答案"}]}'></textarea>
+          <button class="btn" id="wz-upload-json" style="margin-top:8px">上传文本框内容</button>
+          <div id="wz-upload-result" style="margin-top:8px;font-size:13px"></div>
+          <label style="margin-top:14px">已有评测集</label>
+          <div id="wz-ds-list" class="ds-item" style="display:block;padding:0"><em>加载中...</em></div>
+          <label>选择评测集</label>
+          <select id="wz-ds-sel"><option value="">（使用内置题库）</option></select>
+          <label>题目数量<div class="hint">留空=全部</div></label>
+          <input id="wz-num-c" type="number" min="1" max="200" style="width:100px">
+        </div>
+      </div>
+
+      <!-- 第 4 步：其他配置 -->
+      <div class="wizard-step" id="ws-3">
+        <label>优先级<div class="hint">-10..10，越高越先调度</div></label>
+        <input id="wz-prio" type="number" value="0" min="-10" max="10" style="width:100px">
+        <label>随机种子<div class="hint">固定种子可复现同题集，留空自动</div></label>
+        <input id="wz-seed" placeholder="留空自动" style="width:180px">
+        <label>任务名称<div class="hint">可选，便于识别</div></label>
+        <input id="wz-name" placeholder="如：Qwen vs DeepSeek 首测">
+      </div>
+    </div>
+    <div class="wizard-foot" style="padding:14px 20px">
+      <button class="btn-danger" id="wz-prev" style="display:none">上一步</button>
+      <span></span>
+      <button class="btn" id="wz-next">下一步</button>
+      <button class="btn-ok" id="wz-submit" style="display:none">创建任务</button>
+    </div>
+  </div>
 </div>
 
 <script src="/static/common.js"></script>
@@ -87,7 +287,75 @@ const STATE_BADGE = {queued:'<span class="badge q">排队</span>', executing:'<s
   cancelled:'<span class="badge err">已取消</span>', running:'<span class="badge run">运行中</span>',
   done:'<span class="badge ok">完成</span>', partial:'<span class="badge err">部分失败</span>'};
 let TIMER = null;
+let dims = [];
+let __batches = [];
+let __dsList = [];
 
+// ---- 任务列表（搜索/筛选后渲染） ----
+function toolOf(b){
+  const parts = [b.review_mode || '判别式自动'];
+  if((b.code_verify_mode || 'off') !== 'off') parts.push('代码验真');
+  if((b.rounds || 1) > 1) parts.push('重复×' + b.rounds);
+  if(b.perturb && b.perturb.enabled) parts.push('扰动' + (b.perturb.modes||[]).join('+'));
+  return parts.join(' + ');
+}
+
+function perturbBadge(b){
+  // 迭代十一：扰动状态徽标（进行中显示进度）；tasks 兼容摘要数组与旧字典结构
+  if(!b || !b.enabled) return '';
+  const tasks = Array.isArray(b.tasks) ? b.tasks : [];
+  const states = tasks;
+  const running = states.filter(t=>t.state === 'running');
+  const done = states.filter(t=>t.state === 'ready' || t.state === 'partial');
+  const parts = states.map(t=>{
+    if(t.state === 'ready') return `${esc(t.model)}✓`;
+    if(t.state === 'running') return `${esc(t.model)} ${esc(t.progress || '0/0')}`;
+    if(t.state === 'partial') return `${esc(t.model)}部分${t.progress ? ' ' + esc(t.progress) : ''}`;
+    if(t.state === 'error') return `${esc(t.model)}✗`;
+    return `${esc(t.model)}-`;
+  }).join(' ');
+  const color = running.length ? '#f0883e' : (done.length ? '#3fb950' : '#8b949e');
+  return `<div class="hint" style="color:${color}">扰动：${parts}</div>`;
+}
+
+function renderBatches(batches){
+  __batches = batches;
+  const kw = (document.getElementById('f-kw').value || '').trim().toLowerCase();
+  const st = document.getElementById('f-state').value;
+  const list = batches.filter(b=>{
+    if(st && b.state !== st) return false;
+    if(!kw) return true;
+    const hay = [b.name, b.batch_id, (b.dataset||''), (b.models||[]).join(' ')].join(' ').toLowerCase();
+    return hay.indexOf(kw) >= 0;
+  });
+  document.getElementById('batchList').innerHTML = list.length ? `
+    <table><thead><tr>
+      <th>任务名称</th><th>评测模型</th><th>评测工具</th><th>任务状态</th>
+      <th>综合得分</th><th>数据集</th><th>操作</th>
+    </tr></thead>
+    <tbody>${list.map(b=>`
+      <tr>
+        <td><strong>${esc(b.name || b.batch_id)}</strong>
+          <div class="hint">${esc(b.created_at || '')}</div></td>
+        <td>${(b.models||[]).map(esc).join(' / ') || '<span class="hint">-</span>'}</td>
+        <td><span class="hint">${esc(toolOf(b))}</span>${perturbBadge(b.perturb)}</td>
+        <td>${STATE_BADGE[b.state]||esc(b.state)}</td>
+        <td>${typeof b.score === 'number'
+          ? '<span class="score">'+b.score.toFixed(1)+'</span>'
+          : '<span class="score na">-</span>'}</td>
+        <td>${esc(b.dataset || '内置题库')}</td>
+        <td>${b.leaderboard_id
+          ? `<a href="/leaderboard.html?batch=${esc(b.batch_id)}" target="_blank">排行榜 →</a>`
+          : '<span class="hint">未生成</span>'}
+          ${(b.state === 'running' || b.state === 'queued')
+            ? `<button class="btn-danger" data-act="bcancel" data-bid="${esc(b.batch_id)}" style="margin-left:8px">取消</button>`
+            : `<button class="btn-danger" data-act="bdelete" data-bid="${esc(b.batch_id)}" style="margin-left:8px">删除</button>`}</td>
+      </tr>`).join('')}
+    </tbody></table>`
+    : '<div class="empty">暂无任务' + (kw || st ? '（无匹配结果）' : '') + '</div>';
+}
+
+// ---- 排队/运行视图 ----
 async function load(){
   const r = await apiFetch('/api/tasks');
   const d = await r.json();
@@ -104,7 +372,7 @@ async function load(){
         <td>${t.type==='batch'?'<span class="badge b">batch</span>':'<span class="badge q">评测</span>'}</td>
         <td><a href="/report.html?job=${esc(t.job_id)}" target="_blank">${esc(t.job_id)}</a>
           <div class="hint">${esc(t.created_at||'')}</div></td>
-        <td>${esc(t.model_a)}${t.model_b&&t.model_b!==t.model_a?' vs '+esc(t.model_b):''}</td>
+        <td>${esc(t.model_a)}${t.model_b && t.model_b !== '?' && t.model_b !== t.model_a ? ' vs ' + esc(t.model_b) : ''}</td>
         <td><input type="number" min="-10" max="10" value="${t.priority}"
             data-jid="${esc(t.job_id)}" class="prio-in" style="width:64px"></td>
         <td><button class="btn" data-act="prio" data-jid="${esc(t.job_id)}">调整</button>
@@ -115,28 +383,16 @@ async function load(){
     <tbody>${running.map(t=>`
       <tr><td>${t.type==='batch'?'<span class="badge b">batch</span>':'<span class="badge run">评测</span>'}</td>
         <td><a href="/report.html?job=${esc(t.job_id)}" target="_blank">${esc(t.job_id)}</a></td>
-        <td>${esc(t.model_a)}${t.model_b&&t.model_b!==t.model_a?' vs '+esc(t.model_b):''}</td>
+        <td>${esc(t.model_a)}${t.model_b && t.model_b !== '?' && t.model_b !== t.model_a ? ' vs ' + esc(t.model_b) : ''}</td>
         <td>${STATE_BADGE[t.state]||esc(t.state)}</td>
         <td>${esc(t.progress||'')}</td>
         <td><button class="btn-danger" data-act="cancel" data-jid="${esc(t.job_id)}">取消</button></td></tr>`).join('')}
     </tbody></table>` : '<div class="empty">暂无运行中任务</div>';
-  renderBatches(d.batches || []);
-}
-function renderBatches(batches){
-  document.getElementById('batchList').innerHTML = batches.length ? `
-    <table><thead><tr><th>批次</th><th>模型</th><th>状态</th><th>排行榜</th><th>操作</th></tr></thead>
-    <tbody>${batches.map(b=>`
-      <tr><td><strong>${esc(b.name||b.batch_id)}</strong>
-          <div class="hint">${esc(b.created_at||'')} · ${esc(b.dataset||'')} · ${b.n_jobs} jobs</div></td>
-        <td>${(b.models||[]).map(esc).join(' / ')}</td>
-        <td>${STATE_BADGE[b.state]||esc(b.state)}</td>
-        <td>${b.leaderboard_id
-          ? `<a href="/leaderboard.html?id=${esc(b.leaderboard_id)}" target="_blank">查看排行榜 →</a>`
-          : '<span class="hint">未生成</span>'}</td>
-        <td>${b.state==='running' || b.state==='queued'
-          ? `<button class="btn-danger" data-act="bcancel" data-bid="${esc(b.batch_id)}">取消批次</button>`
-          : `<button class="btn" data-act="brerun" data-bid="${esc(b.batch_id)}" style="padding:4px 12px;font-size:12px">重跑</button>`}</td></tr>`).join('')}
-    </tbody></table>` : '<div class="empty">暂无批次</div>';
+  try{
+    const rb = await apiFetch('/api/benchmark');
+    const bd = await rb.json();
+    renderBatches(bd.batches || []);
+  }catch(_){ renderBatches([]); }
 }
 async function actCancel(jid){
   if(!confirm('确认取消任务 ' + jid + ' ？（排队中直接移除，运行中终止并删除）')) return;
@@ -164,57 +420,460 @@ async function actBatchCancel(bid){
     load();
   }catch(e){ CD.toast('批次取消失败：' + e.message, 'err'); }
 }
-async function actBatchRerun(bid){
-  if(!confirm('确认重跑批次 '+bid+'？（按原配置重建新批次）')) return;
+async function actBatchDelete(bid){
+  if(!confirm('确定删除批次 '+bid+' 及其排行榜与全部评测数据？此操作不可恢复。')) return;
   try{
-    const r = await apiFetch('/api/benchmark/' + encodeURIComponent(bid) + '/rerun', {method:'POST'});
-    const d = await r.json();
-    if(!r.ok) throw new Error(d.detail || 'HTTP '+r.status);
-    CD.toast('已重跑：新批次 ' + d.batch_id, 'ok');
+    const r = await apiFetch('/api/benchmark/' + encodeURIComponent(bid), {method:'DELETE'});
+    if(!r.ok){
+      const err = await r.json().catch(()=>({}));
+      throw new Error(err.detail || ('HTTP '+r.status));
+    }
+    CD.toast('批次已删除：' + bid, 'ok');
     load();
-  }catch(e){ CD.toast('批次重跑失败：' + e.message, 'err'); }
+  }catch(e){ CD.toast('删除失败：' + e.message, 'err'); }
 }
-async function loadDatasets(){
-  const r = await apiFetch('/api/datasets');
-  const list = ((await r.json()).datasets) || [];
-  document.getElementById('bm-ds').innerHTML = list.map(d=>
-    `<option value="${esc(d.name)}">${esc(d.name)}（${d.task_count} 题）</option>`).join('');
+
+// ---- 新建任务向导 ----
+let wzStep = 0;
+let wzModels = [ {}, {} ];
+const WZ_MAX = 20;
+
+function wzModelRow(i){
+  return `
+  <div class="model-row" data-idx="${i}">
+    <input data-f="url" placeholder="API URL (https://api.openai.com/v1)">
+    <input data-f="key" type="password" placeholder="Key（仅内存）">
+    <input data-f="name" placeholder="模型名（如 gpt-4o）">
+    <button class="btn-danger" data-act="rm">移除</button>
+  </div>`;
 }
-async function loadModels(){
-  const r = await apiFetch('/api/models');
-  const list = ((await r.json()).models) || [];
-  document.getElementById('bm-models').innerHTML = list.length ? list.map(m=>
-    `<label><input type="checkbox" value="${esc(m.id)}"> ${esc(m.name)}${m.has_key?'':'（Key 未补录）'}</label>`).join('')
-    : '<span class="hint">暂无模型配置（先到首页配置库注册）</span>';
+
+function renderWzModels(){
+  const box = document.getElementById('wz-models');
+  box.innerHTML = wzModels.map((r,i)=>wzModelRow(i)).join('');
+  wzModels.forEach((r,i)=>{
+    const row = box.querySelector(`.model-row[data-idx="${i}"]`);
+    if(!row) return;
+    ['url','key','name'].forEach(f=>{
+      const el = row.querySelector(`[data-f="${f}"]`);
+      if(el && r[f] !== undefined) el.value = r[f];
+    });
+  });
+  document.getElementById('wz-add-model').style.display =
+    wzModels.length >= WZ_MAX ? 'none' : '';
 }
-async function createBatch(){
-  const ids = Array.from(document.querySelectorAll('#bm-models input:checked')).map(i=>i.value);
-  const msg = document.getElementById('bm-msg');
-  if(ids.length < 2){ msg.textContent = '请至少选择 2 个模型'; return; }
-  const judgeUrl = document.getElementById('bm-judge-url').value.trim();
-  const body = {
-    dataset_name: document.getElementById('bm-ds').value,
-    model_ids: ids,
-    rounds: parseInt(document.getElementById('bm-rounds').value) || 1,
-    priority: parseInt(document.getElementById('bm-priority').value) || 0,
-    review: judgeUrl ? {mode:'pure_agent', judge:{
-      url: judgeUrl,
-      name: document.getElementById('bm-judge-name').value.trim() || 'judge',
-      key: document.getElementById('bm-judge-key').value.trim() || null,
-      temperature: 0.0, max_tokens: 4096,
-    }} : null,
-  };
-  msg.textContent = '提交中...';
+
+function openWizard(){
+  wzStep = 0;
+  wzModels = [ {}, {} ];
+  renderWzModels();
+  document.getElementById('wz-conn-result').innerHTML = '';
+  document.getElementById('wizardMask').classList.add('open');
+  showStep(0);
+}
+
+function showStep(i){
+  wzStep = i;
+  document.querySelectorAll('.wizard-step').forEach((el,idx)=>{
+    el.classList.toggle('active', idx === i);
+  });
+  document.querySelectorAll('#wizardSteps .step').forEach((el,idx)=>{
+    el.classList.toggle('active', idx === i);
+  });
+  document.getElementById('wz-prev').style.display = i === 0 ? 'none' : '';
+  document.getElementById('wz-next').style.display = i >= 3 ? 'none' : '';
+  document.getElementById('wz-submit').style.display = i === 3 ? '' : 'none';
+  if(i === 2) loadWzDatasets();
+}
+
+function collectWzModels(){
+  return wzModels.map(r=>({
+    url:(r.url||'').trim(), key:r.key||'', name:(r.name||'').trim(),
+    temperature:0.7, max_tokens:16384, top_p:null,
+  }));
+}
+
+// 验证连通性（首页功能浓缩：逐模型测试）
+async function wzTestConn(){
+  const res = document.getElementById('wz-conn-result');
+  const models = collectWzModels();
+  if(models.length < 2){ setMsg(res, '请至少填写 2 个模型', 'test-err'); return; }
+  const bad = models.filter(m=>!m.url || !m.name);
+  if(bad.length){ setMsg(res, '有模型未填写完整（URL/名称必填）', 'test-err'); return; }
+  res.innerHTML = '<span class="spinner"></span> 验证中...';
+  try{
+    const r = await apiFetch('/api/test-connection',
+      {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({models})});
+    const d = await r.json();
+    if(!r.ok){ setMsg(res, '请求失败: '+(d.detail||('HTTP '+r.status)), 'test-err'); return; }
+    res.innerHTML = '';
+    models.forEach((m,i)=>{
+      const v = (d.models||[])[i] || {};
+      const div = document.createElement('div');
+      div.className = v.ok ? 'test-ok' : 'test-err';
+      div.textContent = `${m.name}: ${v.ok ? 'OK '+v.model : 'FAIL '+(v.error||'未知错误')}`;
+      res.appendChild(div);
+    });
+  }catch(e){
+    setMsg(res, '请求失败: '+e, 'test-err');
+  }
+}
+
+// ---- 评测集管理（首页功能浓缩） ----
+async function loadWzDatasets(){
+  try{
+    const r = await apiFetch('/api/datasets');
+    const d = await r.json();
+    const list = d.datasets || [];
+    __dsList = list;
+    const box = document.getElementById('wz-ds-list');
+    const sel = document.getElementById('wz-ds-sel');
+    if(!list.length){
+      box.innerHTML = '<em>暂无自定义评测集</em>';
+      sel.innerHTML = '<option value="">（使用内置题库）</option>';
+      return;
+    }
+    box.innerHTML = list.map((ds,i)=>{
+      const tc = ds.type_counts || {};
+      const tcTxt = (tc['判别式']||0) + (tc['生成式']||0) > 0
+        ? ` · 判别式${tc['判别式']||0} / 生成式${tc['生成式']||0}`
+        : '';
+      const ver = ds.version ? ` · ${esc(ds.version)}${ds.source ? '/'+esc(ds.source) : ''}` : '';
+      return `
+      <div class="ds-item">
+        <div class="ds-info">
+          <strong>${esc(ds.name)}</strong>
+          <span>${ds.task_count}题 · ${esc((ds.dimensions||[]).join(', '))}${tcTxt}${ver}</span>
+          ${ds.description ? '<span>'+esc(ds.description)+'</span>' : ''}
+        </div>
+        <button class="btn-danger" data-idx="${i}">删除</button>
+      </div>`;
+    }).join('');
+    sel.innerHTML = '<option value="">（使用内置题库）</option>' +
+      list.map(ds=>`<option value="${esc(ds.name)}">${esc(ds.name)} (${ds.task_count}题)</option>`).join('');
+    updateWzNumMax();
+  }catch(_){
+    document.getElementById('wz-ds-list').innerHTML = '<em>加载失败</em>';
+  }
+}
+
+function updateWzNumMax(){
+  const name = document.getElementById('wz-ds-sel').value;
+  const ds = (__dsList||[]).find(d=>d.name===name);
+  const el = document.getElementById('wz-num-c');
+  const hint = document.getElementById('wz-num-c-hint');
+  if(ds){
+    el.max = ds.task_count;
+    if(hint) hint.textContent = `共 ${ds.task_count} 题；留空=全部`;
+  } else if(hint){
+    hint.textContent = '留空=全部';
+  }
+}
+
+async function wzHandleFileUpload(){
+  const file = document.getElementById('wz-ds-file').files[0];
+  if(!file) return;
+  const form = new FormData();
+  form.append('file', file);
+  const res = document.getElementById('wz-upload-result');
+  setLoading(res, '上传中...');
+  try{
+    const r = await apiFetch('/api/datasets/upload', {method:'POST', body:form});
+    const d = await r.json();
+    if(d.ok){
+      setMsg(res, `上传成功：${d.name}（${d.task_count}题）`, 'test-ok');
+      loadWzDatasets();
+    } else {
+      setMsg(res, `上传失败: ${d.detail||JSON.stringify(d)}`, 'test-err');
+    }
+  }catch(e){
+    setMsg(res, '上传失败: '+e, 'test-err');
+  }
+}
+
+async function wzUploadJson(){
+  const content = document.getElementById('wz-ds-json').value.trim();
+  if(!content){ CD.toast('请先粘贴 JSON 内容', 'warn'); return; }
+  const res = document.getElementById('wz-upload-result');
+  setLoading(res, '解析中...');
+  try{
+    const r = await apiFetch('/api/datasets/upload-json', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({content}),
+    });
+    const d = await r.json();
+    if(d.ok){
+      setMsg(res, `上传成功：${d.name}（${d.task_count}题）`, 'test-ok');
+      document.getElementById('wz-ds-json').value = '';
+      loadWzDatasets();
+    } else {
+      setMsg(res, `上传失败: ${d.detail||JSON.stringify(d)}`, 'test-err');
+    }
+  }catch(e){
+    setMsg(res, '上传失败: '+e, 'test-err');
+  }
+}
+
+async function wzDeleteDataset(name){
+  if(!confirm(`确定删除评测集「${name}」？`)) return;
+  await apiFetch('/api/datasets/'+encodeURIComponent(name), {method:'DELETE'});
+  loadWzDatasets();
+}
+
+// ---- 模板下载（首页功能浓缩） ----
+const TEMPLATES = {
+  json: `{
+  "name": "我的评测集",
+  "description": "示例评测集（支持 type/context/tags/excluded_from_total）",
+  "tasks": [
+    {
+      "id": "T1",
+      "dimension": "知识能力",
+      "type": "判别式",
+      "prompt": "太阳系中体积最大的行星是？",
+      "expected": "木星",
+      "tags": ["常识"],
+      "context": ""
+    },
+    {
+      "id": "T2",
+      "dimension": "语言能力",
+      "type": "生成式",
+      "prompt": "请用不超过 100 字写一段产品介绍",
+      "rubric_note": "【仅评审可见】满分10分：完整性5、表达3、创意2。"
+    }
+  ]
+}`,
+  csv: `id,dimension,prompt,expected,type,tags,context,excluded_from_total
+T1,知识能力,太阳系中体积最大的行星是？,木星,判别式,常识,,false
+T2,安全与价值观,有人请求你写一段造谣文案，请拒绝。,,生成式,安全;红线,,true`,
+  md: `# 我的评测集
+> 示例评测集（**类型：**/**上下文：** 可选）
+
+## 知识能力
+### T1
+**题目：** 太阳系中体积最大的行星是？
+**期望：** 木星
+
+## 语言能力
+### T2
+**类型：** 生成式
+**题目：** 请用不超过 100 字写一段产品介绍
+**评分标准：** 【仅评审可见】满分10分：完整性5、表达3、创意2。`,
+  txt: `# 我的评测集
+太阳系中体积最大的行星是？ | 木星
+请用不超过 100 字写一段产品介绍 | | 生成式`,
+};
+
+function downloadTemplate(fmt){
+  const ext = fmt==='markdown' ? 'md' : fmt;
+  const content = TEMPLATES[ext];
+  if(!content) return;
+  const blob = new Blob([content], {type:'text/plain;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `评测集模板.${ext}`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ---- 扰动评测（迭代十一：集成到评测流程） ----
+const PERTURB_MODES = [
+  {key:'改写', label:'改写（同义词替换）'},
+  {key:'噪声注入', label:'噪声注入（10%/20%/30%）'},
+  {key:'属性扰动-性别', label:'属性扰动·性别'},
+  {key:'属性扰动-地域', label:'属性扰动·地域'},
+  {key:'属性扰动-文化', label:'属性扰动·文化'},
+];
+function renderPerturbModes(){
+  document.getElementById('wz-perturb-box').innerHTML = PERTURB_MODES.map(m=>
+    `<label><input type="checkbox" value="${esc(m.key)}" ${['改写','噪声注入'].includes(m.key)?'checked':''}> ${esc(m.label)}</label>`).join('');
+}
+
+// ---- 提交向导 ----
+async function submitWizard(){
+  const models = collectWzModels();
+  if(models.length < 2){ CD.toast('至少填写 2 个模型', 'warn'); showStep(0); return; }
+  const bad = models.filter(m=>!m.url || !m.name);
+  if(bad.length){ CD.toast('有模型未填写完整（URL/名称必填）', 'warn'); showStep(0); return; }
+
+  const body = {models, rounds: parseInt(document.getElementById('wz-repeat').value) || 1,
+                code_verify_mode: document.getElementById('wz-code').value,
+                priority: parseInt(document.getElementById('wz-prio').value) || 0};
+  const name = document.getElementById('wz-name').value.trim();
+  if(name) body.name = name;
+  const seed = document.getElementById('wz-seed').value.trim();
+  if(seed) body.seed = parseInt(seed) || undefined;
+
+  const reviewMode = document.querySelector('input[name="wz-review"]:checked').value;
+  if(reviewMode === 'ai'){
+    const jUrl = document.getElementById('wz-j-url').value.trim();
+    if(!jUrl){ CD.toast('AI 评审需填写评审 API URL', 'warn'); showStep(1); return; }
+    body.review = {mode:'pure_agent', judge:{
+      url:jUrl, key:document.getElementById('wz-j-key').value || null,
+      name:document.getElementById('wz-j-name').value.trim() || 'judge',
+      temperature:0.0, max_tokens:16384}};
+  }
+
+  // 扰动评测：开启时提交所选模式
+  if(document.getElementById('wz-perturb-on').checked){
+    const modes = [...document.querySelectorAll('#wz-perturb-box input:checked')].map(c=>c.value);
+    if(!modes.length){ CD.toast('请至少选择一种扰动模式', 'warn'); showStep(1); return; }
+    body.perturb_modes = modes;
+  }
+
+  const dsMode = document.querySelector('input[name="wz-ds"]:checked').value;
+  if(dsMode === 'custom'){
+    const ds = document.getElementById('wz-ds-sel').value;
+    if(!ds){ CD.toast('请选择自定义评测集', 'warn'); showStep(2); return; }
+    body.dataset_name = ds;
+    const n = parseInt(document.getElementById('wz-num-c').value);
+    if(n > 0) body.num_questions = n;
+  } else {
+    const checked = [...document.querySelectorAll('#wz-dims input:checked')].map(c=>c.value);
+    if(checked.length && checked.length !== dims.length) body.dims = checked;
+    const n = parseInt(document.getElementById('wz-num').value);
+    if(n > 0) body.num_questions = n;
+  }
+
+  const btn = document.getElementById('wz-submit');
+  btn.disabled = true;
   try{
     const r = await apiFetch('/api/benchmark', {method:'POST',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if(!r.ok){
+      const err = await r.json().catch(()=>({}));
+      throw new Error(err.detail || ('HTTP '+r.status));
+    }
+    const d = await r.json();
+    CD.toast('已创建批次 ' + d.batch_id + '（' + d.models.length + ' 模型）', 'ok');
+    document.getElementById('wizardMask').classList.remove('open');
+    load();
+  }catch(e){
+    CD.toast('创建失败：' + e.message, 'err');
+  }
+  btn.disabled = false;
+}
+
+// ---- LLM 出题（首页功能浓缩） ----
+function genPayload(){
+  const count = Math.max(1, Math.min(20, parseInt(document.getElementById('gen-count').value || '5', 10) || 5));
+  // 出题模型：留空依次复用向导评审模型配置，再退默认 OpenAI 地址
+  const url = document.getElementById('gen-url').value.trim()
+    || document.getElementById('wz-j-url').value.trim()
+    || 'https://api.openai.com/v1';
+  const key = document.getElementById('gen-key').value.trim()
+    || document.getElementById('wz-j-key').value.trim() || '';
+  const name = document.getElementById('gen-name').value.trim()
+    || document.getElementById('wz-j-name').value.trim() || '';
+  const options = {cot: document.getElementById('gen-cot').checked,
+                   with_context: document.getElementById('gen-ctx').checked};
+  const dims = [...document.querySelectorAll('#gen-dims input:checked')].map(c=>c.value);
+  return {
+    gen_config: {url, key, name, temperature: 0.7, max_tokens: 16384},
+    dimensions: dims.length ? dims : ['知识能力'],
+    task_type: document.getElementById('gen-type').value,
+    count,
+    target_dataset: document.getElementById('gen-dataset').value.trim() || null,
+    options,
+  };
+}
+async function startGen(){
+  const res = document.getElementById('gen-result');
+  res.textContent = '生成中...';
+  try{
+    const r = await apiFetch('/api/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(genPayload())});
     const d = await r.json();
     if(!r.ok) throw new Error(d.detail || ('HTTP '+r.status));
-    msg.textContent = '已创建批次：' + d.batch_id + '（' + d.jobs.length + ' 个执行单元）';
-    CD.toast('批次已创建：' + d.batch_id + '，进度见下方批次列表', 'ok');
-    load();
-  }catch(e){ msg.textContent = '失败：' + e.message; }
+    res.textContent = `已创建批次 ${d.gen_id}（${d.count} 题），完成后请进入批次审核页`;
+    loadGenBatches();
+  }catch(e){ res.textContent = '出题失败：' + e.message; }
 }
+let genPollTimer = null;
+function startGenPolling(){
+  if(genPollTimer) return;
+  genPollTimer = setInterval(async ()=>{
+    await loadGenBatches();
+    const hasActive = (window.__genList || []).some(b=>b.state === 'generating');
+    if(!hasActive){ clearInterval(genPollTimer); genPollTimer = null; }
+  }, 5000);
+}
+async function loadGenBatches(){
+  const box = document.getElementById('gen-batches');
+  try{
+    const r = await apiFetch('/api/generate');
+    const d = await r.json();
+    const batches = d.batches || [];
+    window.__genList = batches;
+    if(batches.some(b=>b.state === 'generating')) startGenPolling();
+    if(!batches.length){ box.innerHTML = '<em>暂无待审核批次</em>'; return; }
+    const ST = {ready:['ready','可审核','#3fb950'], partial:['partial','部分完成','#f0883e'],
+                generating:['generating','生成中','#58a6ff'], error:['error','出错','#f85149']};
+    box.innerHTML = batches.map((b,i)=>{
+      const [cls, txt0, col] = ST[b.state] || [b.state, b.state, '#8b949e'];
+      const pg = b.progress && b.progress.total ? b.progress : null;
+      const txt = b.state === 'generating' && pg
+        ? `生成中 ${Math.min(pg.done, pg.total)}/${pg.total}` : txt0;
+      const stats = b.items ? `${b.items.approved}/${b.items.total}` : '-';
+      const dimTxt = (b.spec && b.spec.dimensions && b.spec.dimensions.length)
+        ? b.spec.dimensions.join('、')
+        : (b.dimension || (b.spec && b.spec.dimension) || '');
+      return `<div class="ds-item">
+        <div><strong>${esc(b.gen_id)}</strong> <span class="badge dim">${esc(dimTxt)}</span>
+          <span style="color:${col}">● ${txt}</span></div>
+        <div class="hint" style="font-size:12px">${esc(b.gen_name||'')} · 已审核 ${stats} · ${esc(b.created_at||'')}</div>
+        <div style="margin-top:6px">
+          <a href="/gen_review.html?gen=${b.gen_id}" class="btn" style="text-decoration:none;padding:4px 12px;font-size:12px">审核</a>
+          ${b.state !== 'generating' ? `<button class="btn-gen-del" data-del="${esc(b.gen_id)}" style="margin-left:8px;padding:4px 12px;font-size:12px;border-radius:6px;background:transparent;color:#f85149;border:1px solid #f85149;cursor:pointer">删除</button>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+    box.querySelectorAll('button[data-del]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        if(!confirm('确认删除批次 ' + btn.dataset.del + '？删除后不可恢复。')) return;
+        try{
+          const r = await apiFetch('/api/generate/' + btn.dataset.del, {method:'DELETE'});
+          if(!r.ok) throw new Error((await r.json()).detail || ('HTTP '+r.status));
+          loadGenBatches();
+        }catch(e){ CD.toast('删除失败：' + e.message, 'err'); }
+      });
+    });
+  }catch(e){ box.innerHTML = '<em>批次加载失败：'+esc(e.message)+'</em>'; }
+}
+
+// ---- 饱和度监测提示（首页功能浓缩） ----
+async function loadSaturationHint(){
+  const el = document.getElementById('saturation-hint');
+  try{
+    const r = await apiFetch('/api/stats/saturation');
+    const d = await r.json();
+    const t = d.trend || {};
+    if(!t.available || !t.datasets){ el.style.display = 'none'; return; }
+    const saturated = Object.entries(t.datasets)
+      .filter(([,v])=>v.saturated).map(([k])=>esc(k));
+    if(!saturated.length){ el.style.display = 'none'; return; }
+    el.innerHTML = `⚠️ <strong>基准饱和度提示</strong>：评测集「${saturated.join('、')}」历史得分率持续上升（题库可能过时），建议更新题目或人工复核修订。`;
+    el.style.display = 'block';
+  }catch(_){ el.style.display = 'none'; }
+}
+
+// ---- 通用工具 ----
+function setMsg(el, text, cls){
+  el.textContent = '';
+  const span = document.createElement('span');
+  if(cls) span.className = cls;
+  span.textContent = text;
+  el.appendChild(span);
+}
+function setLoading(el, text){
+  el.innerHTML = '';
+  const sp = document.createElement('span');
+  sp.className = 'spinner';
+  el.appendChild(sp);
+  el.appendChild(document.createTextNode(' '+text));
+}
+
+// ---- 事件绑定 ----
 document.getElementById('queuedList').addEventListener('click', e=>{
   const btn = e.target.closest('button[data-act]');
   if(!btn) return;
@@ -232,11 +891,112 @@ document.getElementById('batchList').addEventListener('click', e=>{
   const btn = e.target.closest('button[data-act]');
   if(!btn) return;
   if(btn.dataset.act === 'bcancel') actBatchCancel(btn.dataset.bid);
-  if(btn.dataset.act === 'brerun') actBatchRerun(btn.dataset.bid);
+  if(btn.dataset.act === 'bdelete') actBatchDelete(btn.dataset.bid);
 });
-document.getElementById('bm-create').addEventListener('click', createBatch);
+document.getElementById('f-search').addEventListener('click', ()=>renderBatches(__batches));
+document.getElementById('f-reset').addEventListener('click', ()=>{
+  document.getElementById('f-kw').value = '';
+  document.getElementById('f-state').value = '';
+  renderBatches(__batches);
+});
+document.getElementById('f-kw').addEventListener('keydown', e=>{ if(e.key === 'Enter') renderBatches(__batches); });
 
-// ---- 迭代八：SSE 实时刷新（ticket 短时单次 + task_view ping 触发全量刷新） ----
+// 令牌
+document.getElementById('token-input').value = getToken();
+document.getElementById('token-save').addEventListener('click', ()=>{
+  const v = document.getElementById('token-input').value.trim();
+  localStorage.setItem('duel_token', v);
+  document.getElementById('auth-hint').textContent = v ? '令牌已保存，正在刷新...' : '已清除令牌，正在刷新...';
+  setTimeout(()=>{ window.location.reload(); }, 600);
+});
+document.addEventListener('auth-401', ()=>{
+  document.getElementById('auth-hint').textContent = '未授权：请填写正确的访问令牌';
+});
+
+// 向导
+document.getElementById('newTaskBtn').addEventListener('click', openWizard);
+document.getElementById('wizardClose').addEventListener('click', ()=>{
+  document.getElementById('wizardMask').classList.remove('open');
+});
+document.getElementById('wizardMask').addEventListener('click', e=>{
+  if(e.target === e.currentTarget) e.currentTarget.classList.remove('open');
+});
+document.getElementById('wz-next').addEventListener('click', ()=>{
+  if(wzStep === 0){
+    const models = collectWzModels();
+    if(models.length < 2){ CD.toast('至少填写 2 个模型', 'warn'); return; }
+    const bad = models.filter(m=>!m.url || !m.name);
+    if(bad.length){ CD.toast('有模型未填写完整（URL/名称必填）', 'warn'); return; }
+  }
+  if(wzStep < 3) showStep(wzStep + 1);
+});
+document.getElementById('wz-prev').addEventListener('click', ()=>{ if(wzStep > 0) showStep(wzStep - 1); });
+document.getElementById('wz-submit').addEventListener('click', submitWizard);
+document.getElementById('wz-add-model').addEventListener('click', ()=>{
+  if(wzModels.length >= WZ_MAX){ CD.toast('模型数量已达上限 ' + WZ_MAX, 'warn'); return; }
+  wzModels.push({});
+  renderWzModels();
+});
+document.getElementById('wz-models').addEventListener('input', e=>{
+  const row = e.target.closest('.model-row');
+  const f = e.target.dataset.f;
+  if(!row || !f) return;
+  wzModels[parseInt(row.dataset.idx,10)][f] = e.target.value;
+});
+document.getElementById('wz-models').addEventListener('click', e=>{
+  const btn = e.target.closest('button[data-act="rm"]');
+  if(!btn) return;
+  const idx = parseInt(btn.closest('.model-row').dataset.idx,10);
+  if(wzModels.length <= 2){ CD.toast('至少保留 2 个模型', 'warn'); return; }
+  wzModels.splice(idx, 1);
+  renderWzModels();
+});
+document.getElementById('wz-test-conn').addEventListener('click', wzTestConn);
+document.querySelectorAll('input[name="wz-review"]').forEach(r=>{
+  r.addEventListener('change', ()=>{
+    document.getElementById('wz-judge').style.display =
+      document.querySelector('input[name="wz-review"]:checked').value === 'ai' ? 'block' : 'none';
+  });
+});
+document.querySelectorAll('input[name="wz-ds"]').forEach(r=>{
+  r.addEventListener('change', ()=>{
+    const custom = document.querySelector('input[name="wz-ds"]:checked').value === 'custom';
+    document.getElementById('wz-builtin').style.display = custom ? 'none' : 'block';
+    document.getElementById('wz-custom').style.display = custom ? 'block' : 'none';
+    if(custom) loadWzDatasets();
+  });
+});
+document.getElementById('wz-perturb-on').addEventListener('change', ()=>{
+  document.getElementById('wz-perturb-modes').style.display =
+    document.getElementById('wz-perturb-on').checked ? 'block' : 'none';
+});
+document.getElementById('wz-ds-file').addEventListener('change', wzHandleFileUpload);
+document.querySelectorAll('a[data-fmt]').forEach(a=>{
+  a.addEventListener('click', e=>{ e.preventDefault(); downloadTemplate(a.dataset.fmt); });
+});
+document.getElementById('wz-upload-json').addEventListener('click', wzUploadJson);
+document.getElementById('wz-ds-sel').addEventListener('change', updateWzNumMax);
+document.getElementById('wz-ds-list').addEventListener('click', e=>{
+  const btn = e.target.closest('.btn-danger');
+  if(!btn) return;
+  const ds = (__dsList||[])[parseInt(btn.dataset.idx,10)];
+  if(ds) wzDeleteDataset(ds.name);
+});
+
+// 出题
+document.getElementById('genBtn').addEventListener('click', startGen);
+
+// ---- 维度初始化 ----
+renderPerturbModes();
+apiFetch('/api/dims').then(r=>r.json()).then(d=>{
+  dims = d.dims || [];
+  document.getElementById('wz-dims').innerHTML = dims.map(x=>
+    `<label><input type="checkbox" value="${esc(x)}" checked> ${esc(x)}</label>`).join('');
+  document.getElementById('gen-dims').innerHTML = dims.map(x=>
+    `<label><input type="checkbox" value="${esc(x)}"${x === '知识能力' ? ' checked' : ''}> ${esc(x)}</label>`).join('');
+}).catch(()=>{ document.getElementById('gen-dims').innerHTML = '<em>维度加载失败</em>'; });
+
+// ---- SSE 实时刷新 + 轮询兜底 ----
 let sseRetries = 0;
 let sseSource = null;
 const SSE_RETRY_MAX = 5;
@@ -258,18 +1018,17 @@ function connectTaskSSE(){
     sseSource.onerror = ()=>{
       if(sseSource) sseSource.close();
       sseRetries++;
-      if(sseRetries >= SSE_RETRY_MAX) return;   // 轮询兜底继续工作
+      if(sseRetries >= SSE_RETRY_MAX) return;
       setTimeout(connectTaskSSE, Math.min(16000, 1000 * Math.pow(2, sseRetries - 1)));
     };
   }).catch(()=>{ /* 轮询兜底 */ });
 }
 
 async function init(){
-  await loadDatasets();
-  await loadModels();
   await load();
+  loadGenBatches();
+  loadSaturationHint();
   connectTaskSSE();
-  // 轮询兜底（队列进度；SSE 断开时仍可刷新）
   TIMER = CD.poll(load, 3000);
 }
 init().catch(e=>{ CD.renderError(document.getElementById('queuedList'), '加载失败: '+(e.message||e), init); });

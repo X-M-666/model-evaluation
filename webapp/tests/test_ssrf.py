@@ -151,11 +151,18 @@ def test_start_eval_rejects_private_url(client):
 
 
 def test_test_connection_reports_private_url(client):
-    r = client.post("/api/test-connection", json=_start_payload("http://192.168.1.1:8000/v1"))
+    r = client.post("/api/test-connection", json={
+        "models": [
+            _start_payload("http://192.168.1.1:8000/v1")["model_a"],
+            _start_payload("http://192.168.1.1:8000/v1")["model_b"],
+        ],
+    })
     assert r.status_code == 200
-    for label in ("model_a", "model_b"):
-        assert r.json()[label]["ok"] is False
-        assert "校验失败" in r.json()[label]["error"]
+    results = r.json()["models"]
+    assert len(results) == 2
+    for item in results:
+        assert item["ok"] is False
+        assert "校验失败" in item["error"]
 
 
 def test_start_eval_rejects_private_domain(monkeypatch, client):

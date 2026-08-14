@@ -203,7 +203,7 @@ async def test_pipeline_full_chain_mock():
     assert it["ok"]
     assert it["checks"]["dedup"]["ok"]
     assert it["checks"]["solvable"]["status"] == "verified"
-    assert progress == [(1, 1)]
+    assert progress == [(1, 1), (1, 1)]  # 生成完成 + autocheck 完成各上报一次
     await client.aclose()
 
 
@@ -248,4 +248,29 @@ async def test_pipeline_with_context_spec_produces_context_field():
             "options": {"with_context": True}}
     items = await gen.run_generation_pipeline(GEN_CONFIG, spec, client=client)
     assert items[0]["task"]["context"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_multi_dimensions_per_dim_count():
+    p1 = '{"tasks":[{"prompt":"数学题","expected":"e","rubric_note":"r"}]}'
+    p2 = '{"tasks":[{"prompt":"语言题","expected":"e","rubric_note":"r"}]}'
+    # pipeline 顺序：先生成全部维度，再逐题 autocheck
+    client = _client_for(p1, p2, "PASS", "e", "PASS", "e")
+    spec = {"task_type": "判别式", "dimensions": ["数学能力", "语言能力"],
+            "count": 1}
+    progress: list[tuple[int, int]] = []
+
+    async def cb(done, total):
+        progress.append((done, total))
+
+    items = await gen.run_generation_pipeline(GEN_CONFIG, spec, client=client,
+                                              progress_cb=cb)
+    assert len(items) == 2
+    dims = {it["task"]["dimension"] for it in items}
+    assert dims == {"数学能力", "语言能力"}
+    assert items[0]["task"]["prompt"] == "数学题"
+    assert items[1]["task"]["prompt"] == "语言题"
+    # 每维度生成后 + 每题 autocheck 后各上报一次（进度封顶 total）
+    assert progress == [(1, 2), (2, 2), (2, 2), (2, 2)]
     await client.aclose()

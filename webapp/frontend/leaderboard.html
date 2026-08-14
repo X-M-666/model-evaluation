@@ -36,6 +36,11 @@ a{color:#58a6ff}
 .job-item input{width:auto;margin:0}
 .lb-item{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #21262d;cursor:pointer}
 .lb-item:hover{background:#0d1117}
+/* 滚动容器：历史评测选择 / 排行榜列表 / 查看视图表格 */
+#jobList,#lbList,#compositeTable,#dimTable,#winTable{max-height:480px;overflow-y:auto;border:1px solid #21262d;border-radius:6px;margin-top:8px;padding:0 12px}
+#compositeTable table,#dimTable table,#winTable table{margin-top:0}
+#compositeTable thead th,#dimTable thead th,#winTable thead th{position:sticky;top:0;background:#161b22;z-index:1}
+#jobList .empty,#lbList .empty{padding:24px 0}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:900px){.grid{grid-template-columns:1fr}}
 </style>
@@ -45,6 +50,18 @@ a{color:#58a6ff}
 <div class="wrap">
 <h1>🏆 N 模型排行榜</h1>
 <p class="sub" id="subInfo">由 N 个已完成评测（同一评测集）聚合：分维度排名 + 综合分 + 胜率矩阵 + bootstrap CI 标注</p>
+
+<!-- KPI 概览（迭代十一：原 KPI 看板融入排行榜页） -->
+<div class="card">
+<h2>KPI 概览 <span class="hint">历史已完成评测：耗时 / Token 趋势</span></h2>
+<div class="kpi-cards" id="kpiCards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:14px"></div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+  <div><h2 style="font-size:14px">评测耗时趋势（完成时间）</h2><div id="chartDur" style="width:100%;height:260px"></div></div>
+  <div><h2 style="font-size:14px">Token 消耗趋势</h2><div id="chartTok" style="width:100%;height:260px"></div></div>
+</div>
+<div class="hint" style="margin-top:10px">评测明细</div>
+<div id="kpiTable" style="max-height:280px;overflow-y:auto;border:1px solid #21262d;border-radius:6px;margin-top:6px"></div>
+</div>
 
 <div class="card">
 <h2>创建排行榜</h2>
@@ -69,6 +86,12 @@ a{color:#58a6ff}
   <div class="card" style="margin-top:12px"><h2>分维度得分（点击行查看维度详情）</h2><div id="dimTable"></div></div>
 </div>
 <div class="card" style="margin-top:12px"><h2>胜率矩阵 + 置信区间（行模型 vs 列模型）</h2><div id="winTable"></div></div>
+<div class="card" id="perturbCard" style="margin-top:12px;display:none">
+  <h2>鲁棒性评测 <span class="hint">批次扰动评测（改写/噪声/属性扰动）：扰动强度 → 平均得分</span></h2>
+  <p class="hint" id="perturbNote"></p>
+  <div id="perturbCurves"></div>
+  <div style="margin-top:14px"><h2 style="margin-bottom:8px">偏见与公平性对照（属性扰动）</h2><div id="perturbBias"></div></div>
+</div>
 <div class="grid">
   <div class="card" style="margin-top:12px"><h2>维度能力雷达（多模型叠加）</h2><div id="chartRadar" class="chart"></div></div>
   <div class="card" style="margin-top:12px"><h2>逐题得分分布（箱线图）</h2><div id="chartBox" class="chart"></div></div>
@@ -87,14 +110,70 @@ async function apiFetch(url, opts={}){ return CD.apiFetch(url, opts); }
 const PALETTE = ['#58a6ff','#3fb950','#f0883e','#8957e5','#f85149','#e3b341','#39c5cf','#bc8cff'];
 let CURRENT = null;
 
+// ---- KPI 概览（迭代十一：KPI 看板融入排行榜页） ----
+async function loadKpi(){
+  const r = await apiFetch('/api/dashboard');
+  const d = await r.json();
+  const trend = d.jobs_trend || [];
+  const total = trend.length;
+  const dur = trend.reduce((s,x)=>s+(x.duration_sec||0),0);
+  const tok = trend.reduce((s,x)=>s+(x.total_tokens||0),0);
+  document.getElementById('kpiCards').innerHTML = `
+    <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:14px;text-align:center">
+      <div style="font-size:26px;color:#58a6ff">${total}</div><div style="font-size:12px;color:#8b949e">已完成评测</div></div>
+    <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:14px;text-align:center">
+      <div style="font-size:26px;color:#58a6ff">${Math.round(dur).toLocaleString()}</div><div style="font-size:12px;color:#8b949e">累计耗时（s）</div></div>
+    <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:14px;text-align:center">
+      <div style="font-size:26px;color:#3fb950">${tok.toLocaleString()}</div><div style="font-size:12px;color:#8b949e">累计 Token</div></div>
+    <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:14px;text-align:center">
+      <div style="font-size:26px;color:#8b949e">${trend.filter(x=>x.duration_sec!=null).length}/${total}</div><div style="font-size:12px;color:#8b949e">有 KPI 数据</div></div>`;
+  const sorted = trend.slice().sort((a,b)=>String(a.created_at||'').localeCompare(String(b.created_at||'')));
+  const labels = sorted.map(x=>x.job_id);
+  const durChart = echarts.init(document.getElementById('chartDur'));
+  durChart.setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'axis'},
+    xAxis:{type:'category', data:labels, axisLabel:{color:'#8b949e', rotate:30}, splitLine:{lineStyle:{color:'#21262d'}}},
+    yAxis:{type:'value', name:'秒', axisLabel:{color:'#8b949e'}, splitLine:{lineStyle:{color:'#21262d'}}},
+    series:[{name:'耗时', type:'bar', itemStyle:{color:'#58a6ff'},
+      data:sorted.map(x=>x.duration_sec==null?null:x.duration_sec)}],
+  });
+  const tokChart = echarts.init(document.getElementById('chartTok'));
+  tokChart.setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'axis'},
+    xAxis:{type:'category', data:labels, axisLabel:{color:'#8b949e', rotate:30}, splitLine:{lineStyle:{color:'#21262d'}}},
+    yAxis:{type:'value', name:'Token', axisLabel:{color:'#8b949e'}, splitLine:{lineStyle:{color:'#21262d'}}},
+    series:[{name:'Token', type:'bar', itemStyle:{color:'#3fb950'},
+      data:sorted.map(x=>x.total_tokens==null?null:x.total_tokens)}],
+  });
+  document.getElementById('kpiTable').innerHTML = trend.length ? `
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <thead><tr style="position:sticky;top:0;background:#161b22">
+      <th style="text-align:left;padding:8px">job</th><th style="text-align:left;padding:8px">模型</th>
+      <th style="text-align:right;padding:8px">耗时(s)</th><th style="text-align:right;padding:8px">Token</th>
+      <th style="text-align:left;padding:8px">创建时间</th></tr></thead>
+    <tbody>${trend.map(x=>`<tr>
+      <td style="padding:6px 8px"><a href="/report.html?job=${esc(x.job_id)}" target="_blank">${esc(x.job_id)}</a></td>
+      <td style="padding:6px 8px">${esc(x.model_a||'')}${x.model_b && x.model_b !== '?' && x.model_b !== x.model_a ? ' vs ' + esc(x.model_b) : ''}</td>
+      <td style="padding:6px 8px;text-align:right">${x.duration_sec==null?'N/A':x.duration_sec}</td>
+      <td style="padding:6px 8px;text-align:right">${x.total_tokens==null?'N/A':x.total_tokens.toLocaleString()}</td>
+      <td style="padding:6px 8px;color:#8b949e;font-size:12px">${esc(x.created_at||'')}</td></tr>`).join('')}
+    </tbody></table>` : '<div class="empty">暂无已完成评测数据</div>';
+}
+
 async function loadJobs(){
   const r = await apiFetch('/api/history');
   const jobs = (await r.json()).jobs || [];
   const done = jobs.filter(j=>j.state === 'completed');
   document.getElementById('jobList').innerHTML = done.length
-    ? done.map(j=>`<div class="job-item"><input type="checkbox" value="${esc(j.job_id)}">
-        <span>${esc(j.job_id)}</span><span class="hint">${esc(j.model_a)} vs ${esc(j.model_b)}</span>
-        <span class="hint">${esc(j.created_at||'')}</span></div>`).join('')
+    ? done.map(j=>{
+        const m = (j.model_b && j.model_b !== '?' && j.model_b !== j.model_a)
+          ? `${esc(j.model_a)} vs ${esc(j.model_b)}` : esc(j.model_a);
+        return `<div class="job-item"><input type="checkbox" value="${esc(j.job_id)}">
+        <span>${esc(j.job_id)}</span><span class="hint">${m}</span>
+        <span class="hint">${esc(j.created_at||'')}</span></div>`;
+      }).join('')
     : '<div class="empty">暂无已完成评测（先完成一次评测）</div>';
 }
 async function loadList(){
@@ -104,7 +183,10 @@ async function loadList(){
     <div class="lb-item" data-id="${esc(x.lb_id)}">
       <div><strong>${esc(x.name||x.lb_id)}</strong>
         <span class="hint">${esc(x.created_at||'')} · ${esc(x.dataset||'')} · ${(x.models||[]).join(' / ')}</span></div>
-      <div><span class="hint">${x.n_jobs} jobs</span></div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="hint">${x.n_jobs} jobs</span>
+        <button class="lb-del" data-del="${esc(x.lb_id)}" title="删除排行榜" style="padding:3px 10px;font-size:12px;border-radius:6px;background:transparent;color:#f85149;border:1px solid #f85149;cursor:pointer">删除</button>
+      </div>
     </div>`).join('') : '<div class="empty">暂无排行榜</div>';
 }
 async function create(){
@@ -123,14 +205,19 @@ async function create(){
 }
 async function openLb(id){
   try{
-    const r = await apiFetch('/api/leaderboard/' + id);
+    // 迭代十一：?batch= 走批次排行榜端点（含扰动评测结果）；?id= 普通排行榜
+    const params = new URLSearchParams(window.location.search);
+    const batchId = params.get('batch') || null;
+    const r = batchId
+      ? await apiFetch('/api/benchmark/' + encodeURIComponent(batchId) + '/leaderboard')
+      : await apiFetch('/api/leaderboard/' + id);
     const d = await r.json();
     if(!r.ok) throw new Error(d.detail || ('HTTP '+r.status));
     CURRENT = d;
   document.getElementById('viewCard').style.display = 'block';
-  document.getElementById('viewTitle').textContent = d.name || d.lb_id;
+  document.getElementById('viewTitle').textContent = d.name || (batchId || d.lb_id);
   document.getElementById('viewMeta').textContent =
-    `数据集 ${d.dataset||'-'} · ${d.models.length} 个模型 · ${d.jobs.length} 个 job · 创建 ${d.created_at||''}`;
+    `数据集 ${d.dataset||'-'} · ${d.models.length} 个模型 · ${(d.jobs||[]).length} 个 job · 创建 ${d.created_at||''}`;
   document.getElementById('viewNote').textContent = d.note || '';
   renderComposite(d);
   renderDims(d);
@@ -139,6 +226,7 @@ async function openLb(id){
   renderBox(d);
   renderK(d);
   renderScatter(d);
+  renderPerturb(d.perturb || []);
   }catch(e){
     CD.toast('排行榜加载失败：' + (e.message||e), 'err');
     document.getElementById('viewCard').style.display = 'none';
@@ -149,6 +237,72 @@ function rankBadge(rank){
   if(rank === 2) return '<span class="badge silver">🥈 2</span>';
   if(rank === 3) return '<span class="badge bronze">🥉 3</span>';
   return '<span class="badge">'+rank+'</span>';
+}
+function renderPerturb(list){
+  const card = document.getElementById('perturbCard');
+  const note = document.getElementById('perturbNote');
+  const wrap = document.getElementById('perturbCurves');
+  const biasBox = document.getElementById('perturbBias');
+  if(!list || !list.length){
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'block';
+  const states = list.map(x=>`${esc(x.model)}：${esc(x.state)}${x.state === 'running' ? ' ' + esc(x.progress||'') : ''}`).join(' · ');
+  note.textContent = states;
+  // 迭代十一：扰动进行中（无曲线数据）→ 提示进度，不渲染空图
+  const hasData = list.some(x=>x.state === 'ready' && Object.keys((x.curves||{}).curves || {}).length);
+  if(!hasData){
+    const anyRun = list.some(x=>x.state === 'running');
+    wrap.innerHTML = `<div class="empty" style="padding:18px;text-align:center;color:#8b949e">
+      ${anyRun ? '🔄 扰动评测进行中，完成后自动展示衰减曲线与偏见对照（可稍后刷新查看）'
+               : '扰动评测未产出数据（error/partial/缺失）'}</div>`;
+    biasBox.innerHTML = '';
+    return;
+  }
+  // ---- 衰减曲线：每模式一张图，各模型一条线 ----
+  const modes = [...new Set(list.flatMap(x=>(x.modes||[])))];
+  wrap.innerHTML = modes.map((mode, mi)=>`
+    <div style="margin-top:12px"><h2 style="font-size:14px;color:#f0f6fc;margin-bottom:4px">${esc(mode)}</h2>
+    <div id="pcurve-${mi}" class="chart-sm"></div></div>`).join('');
+  modes.forEach((mode, mi)=>{
+    const chart = echarts.init(document.getElementById('pcurve-'+mi));
+    const series = list.map(x=>{
+      const c = (((x.curves||{}).curves||{})[mode]) || {};
+      return {
+        name: x.model, type:'line', smooth:true, symbolSize:6,
+        data: (c.intensities||[]).map((iv,i)=>({value:[iv, c.scores[i]], n:(c.n_tasks||[])[i]})),
+      };
+    }).filter(s=>s.data.length);
+    chart.setOption({
+      backgroundColor:'transparent',
+      tooltip:{trigger:'axis', formatter: p=>p.map(x=>`${x.marker} ${x.seriesName}<br>强度 ${x.value[0]} → 得分 ${x.value[1]}（题数 ${x.value[2]}）`).join('<br>')},
+      legend:{textStyle:{color:'#8b949e'}, top:0},
+      xAxis:{type:'value', name:'扰动强度', axisLabel:{color:'#8b949e'}, splitLine:{lineStyle:{color:'#21262d'}}},
+      yAxis:{type:'value', name:'平均得分', min:0, max:10, axisLabel:{color:'#8b949e'}, splitLine:{lineStyle:{color:'#21262d'}}},
+      series,
+    });
+  });
+  // ---- 偏见对照：合并表（加模型列） ----
+  const rows = [];
+  list.forEach(x=>{
+    ((x.bias||{}).pairs||[]).forEach(p=>{
+      rows.push({model: x.model, ...p});
+    });
+  });
+  const flagged = rows.filter(p=>p.discriminates);
+  note.textContent = (states ? states + '；' : '') +
+    (rows.length ? `共 ${rows.length} 组属性扰动对照 · 潜在歧视 ${flagged.length} 组` : '无属性扰动对照数据（所选模式不含属性扰动或无槽位命中）');
+  biasBox.innerHTML = rows.length ? `
+    <table><thead><tr><th>模型</th><th>题目</th><th>模式</th><th>原版分</th><th>扰动分</th><th>分差</th><th>一致性</th><th>判定</th></tr></thead>
+    <tbody>${rows.map(p=>`
+      <tr><td>${esc(p.model)}</td><td>${esc(p.task_id)}</td><td>${esc(p.mode)}</td>
+        <td>${p.score_original==null?'N/A':p.score_original}</td>
+        <td>${p.score_perturbed==null?'N/A':p.score_perturbed}</td>
+        <td>${p.diff==null?'N/A':p.diff}</td>
+        <td>${p.consistency==null?'N/A':p.consistency}</td>
+        <td>${p.discriminates?'<span class="badge err">疑似歧视</span>':'<span class="badge ok">无显著差异</span>'}</td></tr>`).join('')}
+    </tbody></table>` : '<div class="empty">无属性扰动对照数据</div>';
 }
 function renderComposite(d){
   const models = d.models;
@@ -255,14 +409,35 @@ function renderScatter(d){
   });
 }
 document.getElementById('createBtn').addEventListener('click', create);
-document.getElementById('lbList').addEventListener('click', e=>{
+document.getElementById('lbList').addEventListener('click', async e=>{
+  const delBtn = e.target.closest('.lb-del');
+  if(delBtn){
+    // 删除排行榜（不触发跳转）
+    e.stopPropagation();
+    if(!confirm('确认删除排行榜 ' + delBtn.dataset.del + '？仅删除榜单记录，不影响评测数据。')) return;
+    try{
+      const r = await apiFetch('/api/leaderboard/' + delBtn.dataset.del, {method:'DELETE'});
+      if(!r.ok) throw new Error((await r.json()).detail || ('HTTP '+r.status));
+      if(CURRENT && CURRENT.lb_id === delBtn.dataset.del){
+        CURRENT = null;
+        document.getElementById('viewCard').style.display = 'none';
+      }
+      loadList();
+    }catch(err){ CD.toast('删除失败：' + err.message, 'err'); }
+    return;
+  }
   const item = e.target.closest('.lb-item');
-  if(item) openLb(item.dataset.id);
+  if(item){
+    // 跳转到对应排行榜（URL 带 id，页面加载即展开）
+    window.location = '/leaderboard.html?id=' + encodeURIComponent(item.dataset.id);
+  }
 });
 loadJobs().catch(e=>{ CD.renderError(document.getElementById('jobList'), '加载失败: '+e.message, loadJobs); });
 loadList().catch(e=>{ CD.renderError(document.getElementById('lbList'), '排行榜列表加载失败: '+e.message, loadList); });
+loadKpi().catch(e=>{ CD.renderError(document.getElementById('kpiTable'), 'KPI 加载失败: '+e.message, loadKpi); });
 const params = new URLSearchParams(window.location.search);
-if(params.get('id')) openLb(params.get('id'));
+if(params.get('batch')) openLb(params.get('batch'));
+else if(params.get('id')) openLb(params.get('id'));
 </script>
 </body>
 </html>

@@ -154,7 +154,7 @@ def client():
 
 async def _perf_fake_execute(model_label, config, tasks, stability_repeat,
                              progress_cb=None, embedding_cfg=None, skip_ids=None,
-                             persist_cb=None):
+                             persist_cb=None, concurrency=1):
     answers = []
     for t in tasks:
         answers.append({
@@ -170,7 +170,6 @@ async def _perf_fake_execute(model_label, config, tasks, stability_repeat,
 def test_batch_n10_full_pipeline(client, monkeypatch):
     """N=10 模型批次全链路（mock 单臂）→ done + 排行榜聚合。"""
     from backend import audit
-    from backend import models_registry
 
     main_module._jobs.clear()
     main_module._tasks.clear()
@@ -188,13 +187,11 @@ def test_batch_n10_full_pipeline(client, monkeypatch):
         ],
     }
     storage.save_dataset("perf_批次集", ds)
-    ids = []
-    for i in range(10):
-        r = client.post("/api/models", json={"name": f"P{i}", "url": "https://8.8.8.8/v1", "key": "k"})
-        ids.append(r.json()["model"]["id"])
+    models = [{"url": "https://8.8.8.8/v1", "key": "k", "name": f"P{i}",
+               "temperature": 0.7, "max_tokens": 4096} for i in range(10)]
     t0 = time.perf_counter()
     r = client.post("/api/benchmark", json={
-        "dataset_name": "perf_批次集", "model_ids": ids, "rounds": 1})
+        "dataset_name": "perf_批次集", "models": models, "rounds": 1})
     assert r.status_code == 200, r.text
     bid = r.json()["batch_id"]
     batch = storage.load_batch(bid)
@@ -208,6 +205,3 @@ def test_batch_n10_full_pipeline(client, monkeypatch):
     assert len(finished["models"]) == 10
     assert elapsed < 30.0                 # 宽阈值：10 模型全链路 < 30s
     audit._log_path().write_text("", encoding="utf-8")
-    models_registry.clear_memory_keys()
-    for p in models_registry.MODELS_DIR.glob("*.json"):
-        p.unlink(missing_ok=True)

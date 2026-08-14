@@ -3,11 +3,11 @@
 
 产出四类演示数据（写入 .eval/ 与 webapp/data/ 运行产物目录，不碰代码）：
 1. 双模型 completed 报告 ×3（不同模型组合，同一 seed → 同一任务集，
-   含金标元评估段 + bad case 库 + 饱和度数据）——供 report.html 演示
+   含金标元评估段 + 饱和度数据）——供 report.html 演示
 2. N 模型排行榜：3 个 mock job 聚合 → leaderboard（分维度/胜率矩阵/CI/雷达）——
    供 leaderboard.html 演示（含 N 模型 benchmark 形态）
-3. 扰动评测 ready 记录（curves/bias 数据）——供 perturb.html 演示
-4. KPI 看板数据：由上述 history 自动聚合——供 dashboard.html 演示
+3. 扰动评测 ready 记录（curves/bias 数据）——供 /api/perturb 调试（独立扰动页已移除，正式用法为批次内集成）
+4. KPI 概览数据：由上述 history 自动聚合——供 leaderboard.html 顶部 KPI 卡演示
 
 用法：
   python -m scripts.demo_seed            # 写入真实运行目录
@@ -32,31 +32,23 @@ def _redirect_tmp(tmp: bool) -> None:
     if not tmp:
         return
     from backend import storage
-    from backend import models_registry
     import tempfile
     root = Path(tempfile.mkdtemp(prefix="demo_seed_"))
     _ORIG["storage.BASE_DIR"] = storage.BASE_DIR
     _ORIG["storage.PERTURB_DIR"] = storage.PERTURB_DIR
-    _ORIG["storage.BADCASES_DIR"] = storage.BADCASES_DIR
     _ORIG["storage.STATS_DIR"] = storage.STATS_DIR
-    _ORIG["models_registry.MODELS_DIR"] = models_registry.MODELS_DIR
     storage.BASE_DIR = root / "history"
     storage.PERTURB_DIR = root / "perturb"
-    storage.BADCASES_DIR = root / "badcases"
     storage.STATS_DIR = root / "stats"
-    models_registry.MODELS_DIR = root / "models"
 
 
 def _restore_dirs() -> None:
     if not _ORIG:
         return
     import backend.storage as storage
-    import backend.models_registry as mr
     storage.BASE_DIR = _ORIG["storage.BASE_DIR"]
     storage.PERTURB_DIR = _ORIG["storage.PERTURB_DIR"]
-    storage.BADCASES_DIR = _ORIG["storage.BADCASES_DIR"]
     storage.STATS_DIR = _ORIG["storage.STATS_DIR"]
-    mr.MODELS_DIR = _ORIG["models_registry.MODELS_DIR"]
 
 
 def _seed_dual_job(seed: int) -> str:
@@ -192,11 +184,9 @@ def main() -> int:
         elapsed = time.perf_counter() - t0
         mode = "（临时目录，不污染正式数据）" if args.tmp else "（写入正式运行目录）"
         print(f"\n演示数据就绪（{elapsed:.1f}s）{mode}，演示路线：")
-        print("  1. 首页  http://localhost:8910/            → 历史记录（3 条 completed）")
-        print("  2. 报告  http://localhost:8910/report.html?job=<job_id>  → 全指标/环境快照/元评估/Bad Case")
-        print("  3. 排行榜 http://localhost:8910/leaderboard.html?id=" + lb_id)
-        print("  4. 扰动  http://localhost:8910/perturb.html? id 见列表")
-        print("  5. 看板  http://localhost:8910/dashboard.html")
+        print("  1. 首页  http://localhost:8910/            → 评测工作台入口")
+        print("  2. 报告  http://localhost:8910/report.html?job=<job_id>  → 全指标/环境快照/元评估")
+        print("  3. 排行榜 http://localhost:8910/leaderboard.html?id=" + lb_id + "  → 排名 + KPI 概览")
         return 0
     finally:
         _restore_dirs()

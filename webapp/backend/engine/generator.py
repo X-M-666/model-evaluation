@@ -272,7 +272,11 @@ async def _call_gen(
         payload["model"] = gen_config["name"]
     headers = {"Authorization": f"Bearer {gen_config['key']}", "Content-Type": "application/json"}
     try:
-        resp = await client.post(url, json=payload, headers=headers, timeout=180)
+        # 超时分离：connect 10s 快速失败（上游不可达立即报错），read 180s 容忍长生成
+        resp = await client.post(
+            url, json=payload, headers=headers,
+            timeout=httpx.Timeout(connect=10, read=180, write=30, pool=10),
+        )
         if resp.status_code >= 400:
             return None
         body = resp.json()
@@ -435,9 +439,12 @@ async def run_generation_pipeline(
     pool：去重比对池（现有题库 + 目标数据集题面，缺省用内置题库）。
     """
     task_type = spec.get("task_type", "判别式")
-    dimension = spec.get("dimension", "知识能力")
     count = spec.get("count", DEFAULT_COUNT)
     options = spec.get("options") or {}
+    dims = spec.get("dimensions") or [spec.get("dimension") or "知识能力"]
+    dims = [str(d).strip() for d in dims if d and str(d).strip()]
+    if not dims:
+        dims = ["知识能力"]
 
     from backend.engine.tasks import QUESTION_POOL
 
@@ -447,24 +454,33 @@ async def run_generation_pipeline(
             base_pool.extend(str(q.get("prompt", "")) for q in qs)
     base_pool = [s for s in base_pool if s]
 
-    examples = None
-    if options.get("few_shots"):
-        from backend.engine.tasks import QUESTION_POOL as _QP
-
-        examples = [q for q in _QP.get(dimension, [])][:2]
-
     own_client = client is None
     if own_client:
         client = build_upstream_client()
     try:
-        raw_tasks = await generate_tasks(
-            gen_config, task_type, dimension, count, options, examples,
-            client=client, progress_cb=progress_cb,
-        )
+        total = max(1, count * len(dims))
+        done = 0
+        raw_tasks: list[dict[str, Any]] = []
+        for dim in dims:
+            examples = None
+            if options.get("few_shots"):
+                from backend.engine.tasks import QUESTION_POOL as _QP
+
+                examples = [q for q in _QP.get(dim, [])][:2]
+            subtasks = await generate_tasks(
+                gen_config, task_type, dim, count, options, examples,
+                client=client, progress_cb=None,
+            )
+            for t in subtasks:
+                t.setdefault("dimension", dim)
+            raw_tasks.extend(subtasks)
+            done += len(subtasks)
+            if progress_cb:
+                await progress_cb(min(done, total), total)
         items: list[dict[str, Any]] = []
         local_pool = list(base_pool)
         for t in raw_tasks:
-            t.setdefault("dimension", dimension)
+            t.setdefault("dimension", dims[0])
             t.setdefault("type", task_type)
             t.setdefault("difficulty", t.get("difficulty") or "medium")
             result = await autocheck(
@@ -474,6 +490,9 @@ async def run_generation_pipeline(
             items.append({"task": t, "checks": result["checks"], "issues": result["issues"],
                           "ok": result["ok"]})
             local_pool.append(str(t.get("prompt", "")))
+            done += 1
+            if progress_cb:
+                await progress_cb(min(done, total), total)
         return items
     finally:
         if own_client:

@@ -10,8 +10,17 @@ class ModelConfig(BaseModel):
     key: str = Field(..., description="API Key")
     name: str = Field(..., description="模型名称，如 gpt-4o")
     temperature: float = Field(0.7, ge=0, le=2, description="温度参数 0-2")
-    max_tokens: int = Field(4096, ge=1, le=128000, description="最大生成 token 数")
+    max_tokens: int = Field(16384, ge=1, le=128000, description="最大生成 token 数")
     top_p: float | None = Field(None, ge=0, le=1, description="Top-P 采样，None=不设置")
+
+
+class TestConnectionRequest(BaseModel):
+    """连通性测试请求（迭代九：N 模型列表逐模型测试）。
+
+    返回与 models 顺序一致的结果列表（不再固定 model_a/model_b 两槽位）。
+    """
+    models: list[ModelConfig] = Field(..., min_length=1, max_length=20,
+                                      description="待测试模型配置列表")
 
 
 class StartRequest(BaseModel):
@@ -22,7 +31,8 @@ class StartRequest(BaseModel):
     seed: int | None = Field(None, description="随机种子")
     dataset_name: str | None = Field(None, description="自定义评测集名称，None=用内置题库")
     repeat_n: int = Field(1, ge=1, le=20, description="重复评测次数，取平均")
-    num_questions: int | None = Field(None, ge=1, le=8, description="内置题库题目数量（仅内置题库模式生效，3/5/7/8，None=全维度）")
+    num_questions: int | None = Field(None, ge=1, le=200,
+                                      description="题目数量：内置题库=从勾选维度随机抽 N 个维度出题（None=全维度）；自定义评测集=随机抽 N 题（None=全量）")
     code_verify_mode: str = Field(
         "off", pattern=r"^(off|native-sandbox)$",
         description="代码验真模式：off=仅展示与语法检查（默认，不执行）；native-sandbox=Windows 原生隔离（AppContainer+Job Object）",
@@ -80,16 +90,6 @@ class DatasetInfo(BaseModel):
     source: str = "upload"
     type_counts: dict[str, int] = {}
     created_at: str
-
-
-class ModelRegisterRequest(BaseModel):
-    """模型配置库注册请求（迭代一）。Key 仅存进程内存，不落盘。"""
-    name: str = Field(..., min_length=1, max_length=200, description="模型配置名称（唯一）")
-    url: str = Field(..., max_length=500, description="API base URL，如 https://api.example.com/v1")
-    key: str | None = Field(None, description="API Key（可选；仅存内存，重启需补录）")
-    temperature: float = Field(0.7, ge=0, le=2)
-    max_tokens: int = Field(4096, ge=1, le=128000)
-    top_p: float | None = Field(None, ge=0, le=1)
 
 
 class ReviewConfig(BaseModel):
@@ -166,8 +166,9 @@ class GenerateRequest(BaseModel):
     gen_config: ModelConfig | None = Field(None, description="出题模型配置（Key 仅内存）")
     target_dataset: str | None = Field(None, max_length=200, description="审核入库目标数据集")
     task_type: str = Field("判别式", pattern=r"^(判别式|生成式)$")
-    dimension: str | None = Field(None, max_length=100, description="目标维度（空=随机）")
-    count: int = Field(5, ge=1, le=20, description="生成题数（1-20，默认 5）")
+    dimension: str | None = Field(None, max_length=100, description="目标维度（单值兼容，空=随机）")
+    dimensions: list[str] = Field(default_factory=list, max_length=10, description="目标维度多选（优先于 dimension；每个维度生成 count 题）")
+    count: int = Field(5, ge=1, le=20, description="每维度生成题数（1-20，默认 5）")
     options: dict = Field(default_factory=dict, description="出题选项（cot/few_shots/with_context）")
 
 
@@ -205,18 +206,28 @@ class LeaderboardRequest(BaseModel):
 
 
 class BenchmarkRequest(BaseModel):
-    """benchmark 批次请求（迭代七）：1 任务集 × N 模型 × M 轮。
+    """benchmark 批次请求（迭代七，迭代九改纯内联）：1 任务集 × N 模型 × M 轮。
 
-    model_ids 引用模型配置库（Key 取进程内存，未补录 400 提示）；
+    模型一律内联配置（models 列表，Key 走请求体仅存内存，不落盘不入库）；
+    任务集两种来源（二选一）：dataset_name 自定义评测集；dims/seed/num_questions
+    内置题库（与 /api/eval/start 同语义）。
     每模型一个执行单元，单臂评审（判别式指标分 + 生成式单臂 rubric）。
     """
     model_config = {"protected_namespaces": ()}
-    dataset_name: str = Field(..., max_length=200, description="评测集名称（必填）")
-    model_ids: list[str] = Field(..., min_length=2, max_length=20,
-                                 description="模型配置库 id 列表（N≥2）")
+    dataset_name: str | None = Field(None, max_length=200,
+                                     description="评测集名称；缺省用内置题库（dims/seed/num_questions）")
+    models: list[ModelConfig] = Field(..., min_length=2, max_length=20,
+                                      description="内联模型配置列表（N≥2；Key 仅内存不落盘）")
+    dims: list[str] | None = Field(None, description="内置题库评测维度，None=全部维度")
+    seed: int | None = Field(None, description="内置题库随机种子")
+    num_questions: int | None = Field(None, ge=1, le=200,
+                                      description="题目数量：内置题库=从勾选维度随机抽 N 个维度出题；自定义评测集=随机抽 N 题（None=全量）")
     rounds: int = Field(1, ge=1, le=20, description="每模型重复轮数 M")
     priority: int = Field(0, ge=-10, le=10, description="批次任务优先级（越高越先调度）")
     name: str | None = Field(None, max_length=200, description="批次名称（可选）")
+    perturb_modes: list[str] | None = Field(
+        None, description="扰动评测模式列表（迭代十一）：非空时对每个模型自动跑扰动评测；"
+                          "合法值 改写/噪声注入/属性扰动-性别/属性扰动-地域/属性扰动-文化")
     review: ReviewConfig | None = Field(None, description="评审配置（judge 用于生成式题单臂）")
     prompt_strategy: str = Field("cot", pattern=r"^(cot|direct|fewshot)$")
     code_verify_mode: str = Field("off", pattern=r"^(off|native-sandbox)$")
@@ -229,12 +240,20 @@ class PriorityRequest(BaseModel):
     priority: int = Field(0, ge=-10, le=10, description="新优先级（-10..10）")
 
 
-class RerunRequest(BaseModel):
-    """批次重跑请求（迭代八）：其余配置从 batch 文件恢复，仅可覆盖评审与优先级。
+class BattleQuestionsRequest(BaseModel):
+    """文本对战抽题请求（迭代十一）。"""
+    count: int = Field(10, ge=1, le=50, description="抽取题数 1-50")
+    source: str = Field("random", pattern=r"^(random|custom)$",
+                        description="random=内置题库；custom=自定义评测集")
+    dataset_name: str | None = Field(None, max_length=200,
+                                     description="custom 源评测集名称")
+    seed: int | None = Field(None, description="随机种子（可复现同题集）")
 
-    模型 Key 一律从配置库进程内存重新取；原批次使用评审模型时（Key 不落盘），
-    重跑必须重新提供 review（judge），否则 400。
-    """
-    name: str | None = Field(None, max_length=200, description="新批次名称（可选）")
-    priority: int = Field(0, ge=-10, le=10, description="新批次优先级")
-    review: ReviewConfig | None = Field(None, description="评审配置（覆盖原批次；原批次有 judge 时必填）")
+
+class BattleStreamRequest(BaseModel):
+    """文本对战流式请求（迭代十一）：双模型同题并排作答。"""
+    model_config = {"protected_namespaces": ()}
+    prompt: str = Field(..., max_length=100000, description="题目文本")
+    context: str = Field("", max_length=64000, description="参考文档（可选）")
+    model_a: ModelConfig
+    model_b: ModelConfig

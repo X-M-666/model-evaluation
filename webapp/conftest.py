@@ -91,28 +91,22 @@ def _isolate_storage(tmp_path_factory):
     """
     from backend import main as main_module
     from backend import storage
-    from backend import models_registry
 
     orig_base = storage.BASE_DIR
     orig_datasets = storage.DATASETS_DIR
     orig_stats = storage.STATS_DIR
     orig_generated = storage.GENERATED_DIR
-    orig_badcases = storage.BADCASES_DIR
     orig_perturb = storage.PERTURB_DIR
     orig_leaderboards = storage.LEADERBOARD_DIR
     orig_batches = storage.BATCHES_DIR
-    orig_models = models_registry.MODELS_DIR
     storage.BASE_DIR = tmp_path_factory.mktemp("history")
     storage.DATASETS_DIR = tmp_path_factory.mktemp("datasets")
     storage.STATS_DIR = tmp_path_factory.mktemp("stats")
     storage.SATURATION_FILE = storage.STATS_DIR / "saturation.json"
     storage.GENERATED_DIR = tmp_path_factory.mktemp("generated")
-    storage.BADCASES_DIR = tmp_path_factory.mktemp("badcases")
     storage.PERTURB_DIR = tmp_path_factory.mktemp("perturb")
     storage.LEADERBOARD_DIR = tmp_path_factory.mktemp("leaderboards")
     storage.BATCHES_DIR = tmp_path_factory.mktemp("batches")
-    models_registry.MODELS_DIR = tmp_path_factory.mktemp("models")
-    models_registry.clear_memory_keys()
     for jid in list(main_module._jobs):
         main_module._jobs.pop(jid)
     for jid in list(main_module._tasks):
@@ -125,8 +119,6 @@ def _isolate_storage(tmp_path_factory):
     storage.STATS_DIR = orig_stats
     storage.SATURATION_FILE = orig_stats / "saturation.json"
     storage.GENERATED_DIR = orig_generated
-    storage.BADCASES_DIR = orig_badcases
     storage.PERTURB_DIR = orig_perturb
     storage.LEADERBOARD_DIR = orig_leaderboards
     storage.BATCHES_DIR = orig_batches
-    models_registry.MODELS_DIR = orig_models

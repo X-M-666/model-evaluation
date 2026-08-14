@@ -65,16 +65,6 @@ def dataset_deleted(name: str, actor: str = "local") -> None:
     _append({"event": "dataset_deleted", "target": name, "actor": actor})
 
 
-def model_registered(model_id: str, actor: str = "local") -> None:
-    """模型配置库新增配置（迭代一；Key 不落盘，仅存内存）。"""
-    _append({"event": "model_registered", "target": model_id, "actor": actor})
-
-
-def model_deleted(model_id: str, actor: str = "local") -> None:
-    """模型配置库删除配置。"""
-    _append({"event": "model_deleted", "target": model_id, "actor": actor})
-
-
 def auth_failed(path: str, actor: str = "unknown") -> None:
     _append({"event": "auth_failed", "path": path, "actor": actor})
 
@@ -104,16 +94,6 @@ def dataset_exported(job_id: str, actor: str = "local") -> None:
     _append({"event": "dataset_exported", "target": job_id, "actor": actor})
 
 
-def badcase_mined(job_id: str, count: int, actor: str = "local") -> None:
-    """bad case 挖掘入库（迭代五：job 完成时）。"""
-    _append({"event": "badcase_mined", "target": job_id, "count": count, "actor": actor})
-
-
-def badcase_attribution(case_id: str, path: str, actor: str = "local") -> None:
-    """bad case 归因更新（迭代五）：path=llm|confirm|revert。"""
-    _append({"event": "badcase_attribution", "target": case_id, "path": path, "actor": actor})
-
-
 def perturb_started(perturb_id: str, actor: str = "local") -> None:
     """扰动评测启动（迭代六）。"""
     _append({"event": "perturb_started", "target": perturb_id, "actor": actor})
@@ -128,6 +108,11 @@ def perturb_completed(perturb_id: str, count: int, actor: str = "local") -> None
 def leaderboard_created(lb_id: str, actor: str = "local") -> None:
     """排行榜创建（迭代六）。"""
     _append({"event": "leaderboard_created", "target": lb_id, "actor": actor})
+
+
+def leaderboard_deleted(lb_id: str, actor: str = "local") -> None:
+    """排行榜删除（迭代十一：已有排行榜可删除）。"""
+    _append({"event": "leaderboard_deleted", "target": lb_id, "actor": actor})
 
 
 def eval_queued(job_id: str, actor: str = "local") -> None:
@@ -164,10 +149,15 @@ def benchmark_cancelled(batch_id: str, count: int, actor: str = "local") -> None
              "count": count, "actor": actor})
 
 
-def benchmark_rerun(batch_id: str, new_batch_id: str, actor: str = "local") -> None:
-    """benchmark 批次重跑（迭代八，new_batch_id=重建的新批次）。"""
-    _append({"event": "benchmark_rerun", "target": batch_id,
-             "path": new_batch_id, "actor": actor})
+def benchmark_deleted(batch_id: str, count: int, actor: str = "local") -> None:
+    """benchmark 批次记录删除（迭代十一：已完成数据可删除）。"""
+    _append({"event": "benchmark_deleted", "target": batch_id,
+             "count": count, "actor": actor})
+
+
+def generation_deleted(gen_id: str, actor: str = "local") -> None:
+    """出题批次删除（迭代十一：审核完成的批次可删除）。"""
+    _append({"event": "generation_deleted", "target": gen_id, "actor": actor})
 
 
 def read_events() -> list[dict[str, Any]]:

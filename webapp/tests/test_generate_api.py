@@ -184,6 +184,66 @@ def test_generation_list_summary():
     assert entry["gen_name"] == "gen-model"
 
 
+def test_generate_multi_dimensions_persists_spec():
+    resp = _call(main_module.generate_tasks, GenerateRequest(**_gen_payload(
+        dimensions=["数学能力", "语言能力"], count=3)))
+    assert resp["count"] == 6  # 每维度 count 题
+    gen_id = resp["gen_id"]
+    raw = json.loads((storage.GENERATED_DIR / f"{gen_id}.json").read_text(encoding="utf-8"))
+    assert raw["spec"]["dimensions"] == ["数学能力", "语言能力"]
+    assert raw["spec"]["dimension"] == "数学能力"  # 首维兼容字段
+
+
+def test_generate_single_dimension_falls_back_to_list():
+    resp = _call(main_module.generate_tasks, GenerateRequest(**_gen_payload()))
+    gen_id = resp["gen_id"]
+    raw = json.loads((storage.GENERATED_DIR / f"{gen_id}.json").read_text(encoding="utf-8"))
+    assert raw["spec"]["dimensions"] == ["数学能力"]
+    assert raw["spec"]["dimension"] == "数学能力"
+
+
+# ---- 批次删除（迭代十一：审核完成可删除） ----
+
+def test_generation_delete_success_and_list_gone():
+    gen_id = _start(_gen_payload())
+    resp = _call(main_module.generation_delete, gen_id)
+    assert resp["deleted"] is True
+    assert storage.load_generation_batch(gen_id) is None
+    entries = _call(main_module.generate_list)["batches"]
+    assert all(b["gen_id"] != gen_id for b in entries)
+
+
+def test_generation_delete_missing_404():
+    with pytest.raises(HTTPException) as ei:
+        _call(main_module.generation_delete, "gen_20260101_000000_abcdef")
+    assert ei.value.status_code == 404
+
+
+def test_generation_delete_bad_id_400():
+    with pytest.raises(HTTPException) as ei:
+        _call(main_module.generation_delete, "../evil")
+    assert ei.value.status_code == 400
+
+
+def test_generation_delete_generating_409():
+    gen_id = _start(_gen_payload())
+    batch = storage.load_generation_batch(gen_id)
+    batch["state"] = "generating"
+    storage.save_generation_batch(gen_id, batch)
+    with pytest.raises(HTTPException) as ei:
+        _call(main_module.generation_delete, gen_id)
+    assert ei.value.status_code == 409
+    assert storage.load_generation_batch(gen_id) is not None
+
+
+def test_generation_delete_audited():
+    gen_id = _start(_gen_payload())
+    _call(main_module.generation_delete, gen_id)
+    events = audit.read_events()
+    assert any(e["event"] == "generation_deleted" and e["target"] == gen_id
+               for e in events)
+
+
 def test_interrupted_generation_settles_partial():
     gen_id = _start(_gen_payload())
     _settle(gen_id, state="generating")

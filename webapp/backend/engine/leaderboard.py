@@ -108,11 +108,13 @@ def _box(values: list[float]) -> dict[str, Any]:
                 "max": None, "n": 0, "values": []}
     v = sorted(values)
     n = len(v)
+    q1 = statistics.median(v[: n // 2]) if n >= 2 else None
+    q3 = statistics.median(v[(n + 1) // 2:]) if n >= 2 else None
     return {
         "min": round(v[0], 2),
-        "q1": round(statistics.median(v[: n // 2]), 2),
+        "q1": round(q1, 2) if q1 is not None else None,
         "median": round(statistics.median(v), 2),
-        "q3": round(statistics.median(v[(n + 1) // 2:]), 2),
+        "q3": round(q3, 2) if q3 is not None else None,
         "max": round(v[-1], 2),
         "n": n,
         "values": [round(x, 2) for x in v],

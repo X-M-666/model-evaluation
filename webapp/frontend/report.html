@@ -55,7 +55,6 @@ td{color:#c9d1d9}
 <p class="sub" id="subInfo">加载中...</p>
 <div style="margin:8px 0 12px" id="exportBar" style="display:none">
   <button id="exportBtn" style="padding:8px 16px;background:#238636;color:#fff;border:none;border-radius:6px;cursor:pointer">⬇ 导出评测包（zip）</button>
-  <a href="#" id="badcaseLink" style="display:none;padding:8px 16px;background:#8957e5;color:#fff;border-radius:6px;text-decoration:none;margin-left:10px">🕵️ Bad Case（<span id="badcaseCount">0</span>）</a>
 </div>
 <div style="margin-bottom:16px">
 <a href="/">← 返回配置</a>
@@ -92,7 +91,6 @@ td{color:#c9d1d9}
 </div>
 
 <div class="card" id="groundingCard" style="display:none"></div>
-<div class="card" id="badcaseCard" style="display:none"></div>
 
 <div class="card" id="metaEvalCard" style="display:none"></div>
 <div class="card" id="consistencyCard" style="display:none"></div>
@@ -105,7 +103,7 @@ td{color:#c9d1d9}
 <div class="card">
 <h2>逐题评分明细</h2>
 <table id="scoreTable">
-<thead><tr><th>题目</th><th>维度</th><th>答案X</th><th>答案Y</th><th>胜方</th><th>依据</th></tr></thead>
+<thead><tr><th>题目</th><th>维度</th><th id="thX">答案X</th><th id="thY">答案Y</th><th id="thWin">胜方</th><th>依据</th></tr></thead>
 <tbody id="scoreBody"></tbody>
 </table>
 </div>
@@ -190,6 +188,12 @@ function renderReport(data){
   const mb = cfg.model_b?.name || '?';
   const dsName = cfg.dataset_name || null;
   const repeatN = cfg.repeat_n || 1;
+  // 迭代十一：batch 单臂评测（slim report）兼容——单臂分支渲染
+  const singleArm = !!(s && (s.mode === 'single_arm' || (s.total_x === undefined && s.n_tasks !== undefined)));
+  if(singleArm){
+    renderSingleArm(data, s, rep, v, ma, tasks, repeatN, dsName, cfg);
+    return;
+  }
 
   const modeText = rep?.review?.mode === 'pure_agent' ? 'AI 自动评审'
     : rep?.review?.mode === 'hybrid' ? `Hybrid（AI 预评 + 人工复核 Top-${rep.review.k_top_human ?? '?'}）`
@@ -230,7 +234,6 @@ function renderReport(data){
     renderConsistency(rep);
     renderGrounding(rep);
     renderEnv(rep);
-    renderBadcases();
   }else{
     document.getElementById('statCard').style.display='none';
     document.querySelectorAll('.chart-card').forEach(c=>c.style.display='none');
@@ -239,6 +242,52 @@ function renderReport(data){
 
   renderScoreTable(v, data.round_scores);
   renderAnswers(data);
+}
+
+// ---- 单臂评测报告（迭代十一：batch 任务 slim report 兼容） ----
+function renderSingleArm(data, s, rep, v, modelName, tasks, repeatN, dsName, cfg){
+  const kpi = rep?.kpi || {};
+  const model = s.model || modelName || '?';
+  const nTasks = s.n_tasks ?? tasks.length;
+  const totals = v.totals || {};
+  const validScores = (v.scores || []).filter(x=>!x._invalid);
+  const avg = validScores.length ? (totals.score || 0) / validScores.length : null;
+  document.getElementById('subInfo').textContent =
+    `${model} | 任务集: ${nTasks} 题 | 单臂评分（批内 M 轮均值） | jobId: ${jobId}` +
+    (dsName ? ` | 评测集: ${dsName}` : '') +
+    (repeatN > 1 ? ` | 重复 ${repeatN} 次取平均` : '') +
+    (cfg.seed != null ? ` | seed=${cfg.seed}` : '');
+
+  document.getElementById('winnerCard').innerHTML = `
+    <div class="label">单臂总分</div>
+    <div class="score">${fmt(totals.score ?? 0)}<span style="font-size:14px;color:#8b949e"> / ${fmt(totals.max ?? 0)}</span></div>
+    <div class="vs">平均分 ${avg == null ? '—' : fmt(avg)} · 计分题 ${validScores.length}/${nTasks}</div>
+    <div class="detail">模型 ${esc(model)}（评测耗时 ${kpi.duration_sec == null ? '—' : kpi.duration_sec + 's'} · Token ${kpi.total_tokens ? kpi.total_tokens.x : '—'}）</div>`;
+
+  document.getElementById('statCard').innerHTML = `<h2>核心指标（单臂）</h2><div class="stat-grid">${
+    [
+      {k:'被测模型', v:esc(model)},
+      {k:'总题数', v:nTasks},
+      {k:'总分', v:fmt(totals.score ?? 0)},
+      {k:'满分', v:fmt(totals.max ?? 0)},
+      {k:'平均分', v:avg == null ? '—' : fmt(avg)},
+      {k:'评测耗时（s）', v:kpi.duration_sec == null ? '—' : kpi.duration_sec},
+      {k:'Token 消耗', v:kpi.total_tokens ? kpi.total_tokens.x : '—'},
+      {k:'评测轮次', v:repeatN},
+    ].map(st=>`<div class="stat-box"><div class="v">${st.v}</div><div class="k">${st.k}</div></div>`).join('')
+  }</div>`;
+
+  // 隐藏双模型相关段
+  document.querySelectorAll('.chart-card').forEach(c=>c.style.display='none');
+  document.getElementById('analysisCard').style.display='none';
+  document.getElementById('metaEvalCard').style.display='none';
+  document.getElementById('consistencyCard').style.display='none';
+  document.getElementById('groundingCard').style.display='none';
+  document.getElementById('stabilityCard').style.display='none';
+
+  renderScoreTable(v, null);
+  renderAnswers(data);
+  renderEnv(rep);
 }
 
 // ---- 元评估（金标）段（迭代三） ----
@@ -280,28 +329,6 @@ function renderConsistency(rep){
       <tr style="color:#8b949e;text-align:left"><th style="padding:4px 6px">题目</th><th style="padding:4px 6px">逐轮胜方（稳定空间）</th><th style="padding:4px 6px">一致率</th></tr>
       ${perRows || '<tr><td colspan="3" style="color:#8b949e">无逐题数据</td></tr>'}
     </table>`;
-}
-
-// ---- Bad Case 概览（迭代五） ----
-async function renderBadcases(){
-  const link = document.getElementById('badcaseLink');
-  try{
-    const r = await apiFetch(`/api/badcases/stats?job_id=${jobId}`);
-    const s = await r.json();
-    document.getElementById('badcaseCount').textContent = s.total || 0;
-    if(s.total > 0){
-      link.style.display = 'inline-block';
-      link.href = `/badcases.html?job=${jobId}`;
-      const el = document.getElementById('badcaseCard');
-      el.style.display = 'block';
-      const catColor = {事实错误:'#f0883e', 语义错误:'#58a6ff', 推理错误:'#8957e5', 安全偏见输出:'#f85149', 执行错误:'#3fb950', 未归类:'#8b949e'};
-      const topCat = Object.entries(s.by_category||{}).sort((a,b)=>b[1]-a[1]).slice(0,3)
-        .map(([k,v])=>`<span class="badge" style="background:${catColor[k]||'#30363d'}">${esc(k)} ${v}</span>`).join(' ');
-      el.innerHTML = `<h2>🕵️ Bad Case 概览</h2>
-        <p style="font-size:13px;color:#c9d1d9">本评测自动产出 <strong>${s.total}</strong> 条 bad case（已确认 ${s.confirmed}），分类 top：${topCat || '—'}</p>
-        <a href="/badcases.html?job=${jobId}" style="font-size:13px">进入 Bad Case 库 →</a>`;
-    }
-  }catch(_){ /* 无数据/失败静默 */ }
 }
 
 // ---- RAG 忠实性段（迭代四，带 context 的题目） ----
@@ -593,6 +620,8 @@ function renderEnv(rep){
 function renderAnswers(data){
   const rounds = data.rounds;
   const box = document.getElementById('ansRounds');
+  // 迭代十一：单臂（batch）报告只展示被测模型答案
+  const single = (data.verdict?.meta?.mode === 'single_arm');
   const ansText = (ans, label) => {
     const rows = (ans && ans.answers) ? ans.answers : [];
     const meta = a => {
@@ -606,6 +635,14 @@ function renderAnswers(data){
     };
     return rows.map(a=>`<pre style="white-space:pre-wrap;font-size:13px;margin-top:10px;color:#8b949e">[${esc(a.id)}]${meta(a)}\n${esc(a.raw_answer||'(无回答)')}</pre>`).join('\n') || '<div class="basis">无数据</div>';
   };
+  if(single){
+    const ansA = data.answers_a || {};
+    box.innerHTML = `
+      <details><summary style="cursor:pointer;color:#8b949e">展开答案原文（${esc(ansA.model || '被测模型')}）</summary>
+        ${ansText(ansA)}
+      </details>`;
+    return;
+  }
   if(rounds && rounds.length){
     box.innerHTML = rounds.map(r=>`
       <details${rounds.length>1?'':''}>
@@ -629,9 +666,28 @@ function renderAnswers(data){
 
 function renderScoreTable(v, roundScores){
   const scores = v.scores || [];
+  // 迭代十一：单臂（batch）逐题评分——题目/维度/得分/依据
+  const tbody = document.getElementById('scoreBody');
+  if(v.meta?.mode === 'single_arm'){
+    document.getElementById('thX').textContent = '得分（满分10）';
+    document.getElementById('thY').style.display = 'none';
+    document.getElementById('thWin').style.display = 'none';
+    tbody.innerHTML = scores.map(s=>`
+      <tr>
+        <td><strong>${esc(s.id)}</strong></td>
+        <td>${esc(s.dimension)}</td>
+        <td class="${s._invalid ? 'loser-cell' : 'winner-cell'}">${s.score == null ? 'N/A' : s.score + '/10'}</td>
+        <td></td>
+        <td>${s._invalid ? '<span class="tag l">N/A</span>' : ''}</td>
+        <td><details><summary style="cursor:pointer;color:#8b949e">展开</summary><div class="basis">${esc(s.basis||'')}</div></details></td>
+      </tr>`).join('');
+    return;
+  }
+  document.getElementById('thX').textContent = '答案X';
+  document.getElementById('thY').style.display = '';
+  document.getElementById('thWin').style.display = '';
   const isAvg = v.meta?.repeat_n > 1;
   const hasRoundDetail = Array.isArray(roundScores) && roundScores.length > 1;
-  const tbody = document.getElementById('scoreBody');
   tbody.innerHTML = scores.map(s=>{
     const winnerTag = s.winner==='tie'?'<span class="tag t">平</span>':
       s.winner==='answer_x'?'<span class="tag w">X胜</span>':'<span class="tag l">Y胜</span>';

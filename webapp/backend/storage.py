@@ -472,9 +472,6 @@ GENERATED_DIR = Path(__file__).resolve().parent.parent / "data" / "generated"
 STATS_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".eval" / "stats"
 SATURATION_FILE = STATS_DIR / "saturation.json"
 
-# Bad Case 库（迭代五）：<case_id>.json，结构见 save_badcase
-BADCASES_DIR = Path(__file__).resolve().parent.parent.parent.parent / ".eval" / "badcases"
-
 
 def update_saturation(job_id: str, entries: list[dict], dataset: str | None = None) -> bool:
     """向跨 job 汇总表追加一轮评测的逐题结果（按 job_id 幂等：重复调用跳过）。
@@ -518,111 +515,7 @@ def get_saturation() -> dict:
         return {"jobs": []}
 
 
-# ---- Bad Case 库（迭代五） ----
-
-# case_id = bc_<job_id>_<task_id 消毒>，job_id 段与 create_job_id 同格式
-BAD_CASE_ID_RE = re.compile(r"^bc_\d{8}_\d{6}_[0-9a-f]{6}_[0-9A-Za-z_]+$")
-
-
-def is_valid_badcase_id(case_id: str) -> bool:
-    """case_id 必须符合 save_badcase 生成格式（防路径穿越）。"""
-    return isinstance(case_id, str) and bool(BAD_CASE_ID_RE.fullmatch(case_id))
-
-
-def make_badcase_id(job_id: str, task_id: str) -> str:
-    """由 job_id + task_id 生成 case_id（task_id 消毒为安全文件名段）。"""
-    return f"bc_{job_id}_{_safe_dataset_name(str(task_id))}"
-
-
-def save_badcase(case: dict) -> Path:
-    """写入一条 bad case 记录（按 case_id 覆盖更新）。"""
-    case_id = case.get("case_id", "")
-    if not is_valid_badcase_id(case_id):
-        raise ValueError(f"非法 case_id: {case_id!r}")
-    BADCASES_DIR.mkdir(parents=True, exist_ok=True)
-    p = BADCASES_DIR / f"{case_id}.json"
-    p.write_text(json.dumps(case, ensure_ascii=False, indent=2), encoding="utf-8")
-    return p
-
-
-def load_badcase(case_id: str) -> dict | None:
-    """读取单条 bad case；非法 id / 不存在 / 损坏返回 None。"""
-    if not is_valid_badcase_id(case_id):
-        return None
-    p = BADCASES_DIR / f"{case_id}.json"
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return None
-
-
-def list_badcases(job_id: str | None = None) -> list[dict]:
-    """列出 bad case 摘要（新→旧）；job_id 非空时仅返回该 job 的记录。"""
-    BADCASES_DIR.mkdir(parents=True, exist_ok=True)
-    result = []
-    for p in sorted(BADCASES_DIR.glob("bc_*.json"), reverse=True):
-        try:
-            case = json.loads(p.read_text(encoding="utf-8"))
-            if job_id and case.get("job_id") != job_id:
-                continue
-            attribution = case.get("attribution") or {}
-            result.append({
-                "case_id": case.get("case_id", p.stem),
-                "job_id": case.get("job_id", ""),
-                "task_id": case.get("task_id", ""),
-                # 归因后以 attribution.label 为权威分类（LLM/人工确认均可更新）
-                "category": attribution.get("label") or case.get("category", "未归类"),
-                "sources": case.get("sources", []),
-                "model": case.get("model", "both"),
-                "score": case.get("score", {}),
-                "confirmed": bool(attribution.get("confirmed")),
-                "attribution_by": attribution.get("by", "auto"),
-                "suggestion": attribution.get("suggestion", ""),
-                "created_at": case.get("created_at", ""),
-            })
-        except (json.JSONDecodeError, OSError):
-            continue
-    return result
-
-
-def delete_badcase(case_id: str) -> bool:
-    """删除一条 bad case。"""
-    if not is_valid_badcase_id(case_id):
-        return False
-    p = BADCASES_DIR / f"{case_id}.json"
-    if not p.exists():
-        return False
-    p.unlink()
-    return True
-
-
-def update_badcase_attribution(case_id: str, attribution: dict) -> dict | None:
-    """更新归因字段（人工确认/改标/驳回），返回更新后的记录；不存在返回 None。"""
-    case = load_badcase(case_id)
-    if case is None:
-        return None
-    merged = dict(case.get("attribution") or {})
-    merged.update({k: v for k, v in attribution.items() if v is not None})
-    case["attribution"] = merged
-    save_badcase(case)
-    return case
-
-
-def export_badcases_json(job_id: str | None = None) -> str:
-    """导出 bad case 清单（含修订建议），序列化为 JSON 字符串。"""
-    cases = []
-    for p in sorted(BADCASES_DIR.glob("bc_*.json")):
-        try:
-            case = json.loads(p.read_text(encoding="utf-8"))
-            if job_id and case.get("job_id") != job_id:
-                continue
-            cases.append(case)
-        except (json.JSONDecodeError, OSError):
-            continue
-    return json.dumps({"job_id": job_id, "total": len(cases), "cases": cases},
-                      ensure_ascii=False, indent=2)
+# ---- Bad Case 库（迭代五；迭代十一：功能移除） ----
 
 
 # Windows 文件名非法字符（含路径分隔、控制字符），全部替换为下划线
@@ -833,6 +726,17 @@ def load_generation_batch(gen_id: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def delete_generation_batch(gen_id: str) -> bool:
+    """删除出题批次文件（格式校验防路径穿越）。返回文件是否存在。"""
+    if not is_valid_gen_id(gen_id):
+        return False
+    p = GENERATED_DIR / f"{gen_id}.json"
+    if not p.exists():
+        return False
+    p.unlink()
+    return True
+
+
 def list_generation_batches() -> list[dict]:
     """列出全部出题批次摘要（含题目状态分布）。"""
     _ensure_generated_dir()
@@ -856,6 +760,7 @@ def list_generation_batches() -> list[dict]:
             "target_dataset": (data.get("spec") or {}).get("target_dataset"),
             "gen_name": (data.get("spec") or {}).get("gen_name", ""),
             "items": stats,
+            "progress": data.get("progress"),
         })
     return result
 
@@ -905,6 +810,20 @@ def load_perturb(perturb_id: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def delete_perturb(perturb_id: str) -> bool:
+    """删除扰动评测记录（幂等）。非法格式拒绝（防路径穿越）。"""
+    if not is_valid_perturb_id(perturb_id):
+        return False
+    p = PERTURB_DIR / f"{perturb_id}.json"
+    if not p.exists():
+        return False
+    try:
+        p.unlink()
+    except OSError:
+        return False
+    return True
 
 
 def list_perturbs() -> list[dict]:
@@ -966,6 +885,20 @@ def load_leaderboard(lb_id: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def delete_leaderboard(lb_id: str) -> bool:
+    """删除排行榜文件（幂等）。非法格式拒绝。"""
+    if not is_valid_lb_id(lb_id):
+        return False
+    p = LEADERBOARD_DIR / f"{lb_id}.json"
+    if not p.exists():
+        return False
+    try:
+        p.unlink()
+    except OSError:
+        return False
+    return True
+
+
 def list_leaderboards() -> list[dict]:
     _ensure_leaderboard_dir()
     result = []
@@ -1024,6 +957,56 @@ def load_batch(batch_id: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def delete_batch(batch_id: str) -> bool:
+    """删除批次记录文件（幂等）。非法格式拒绝（防路径穿越）。"""
+    if not is_valid_batch_id(batch_id):
+        return False
+    p = BATCHES_DIR / f"{batch_id}.json"
+    if not p.exists():
+        return False
+    try:
+        p.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def _batch_summary(data: dict) -> dict:
+    """从完整批次记录生成列表摘要（迭代十一：列表/自愈统一返回此结构）。"""
+    jobs = data.get("jobs", []) if isinstance(data.get("jobs"), list) else []
+    # 迭代十一：扰动评测摘要（enabled/modes + 各模型 prb 状态与进度）
+    pt = data.get("perturb") or {}
+    perturb_summary = None
+    if pt.get("enabled"):
+        prb_states = []
+        for m_name, prb_id in (pt.get("tasks") or {}).items():
+            prb = load_perturb(prb_id)
+            prb_states.append({
+                "model": m_name,
+                "state": (prb or {}).get("state", "missing"),
+                "progress": (prb or {}).get("progress", ""),
+            })
+        perturb_summary = {
+            "enabled": True,
+            "modes": pt.get("modes", []),
+            "tasks": prb_states,
+        }
+    return {
+        "batch_id": data.get("batch_id", ""),
+        "name": data.get("name", ""),
+        "state": data.get("state", "unknown"),
+        "created_at": data.get("created_at", ""),
+        "dataset": data.get("dataset", ""),
+        "n_jobs": len(jobs),
+        "models": data.get("models", []),
+        "rounds": data.get("rounds", 1),
+        "review_mode": data.get("review_mode", "判别式自动"),
+        "code_verify_mode": data.get("code_verify_mode", "off"),
+        "leaderboard_id": data.get("leaderboard_id"),
+        "perturb": perturb_summary,
+    }
+
+
 def list_batches() -> list[dict]:
     """列出全部批次摘要（job 终态计数随详情读取，此处给出静态字段）。"""
     _ensure_batches_dir()
@@ -1032,17 +1015,7 @@ def list_batches() -> list[dict]:
         data = load_batch(p.stem)
         if data is None:
             continue
-        jobs = data.get("jobs", []) if isinstance(data.get("jobs"), list) else []
-        result.append({
-            "batch_id": p.stem,
-            "name": data.get("name", ""),
-            "state": data.get("state", "unknown"),
-            "created_at": data.get("created_at", ""),
-            "dataset": data.get("dataset", ""),
-            "n_jobs": len(jobs),
-            "models": data.get("models", []),
-            "leaderboard_id": data.get("leaderboard_id"),
-        })
+        result.append(_batch_summary(data))
     return result
 
 

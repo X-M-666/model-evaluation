@@ -88,16 +88,18 @@ def test_tasks_view(client):
 def test_tasks_view_shows_batch_jobs(client, monkeypatch):
     """batch 执行单元在任务视图中标记 type=batch。"""
     from backend.schemas import BenchmarkRequest
-    from backend.models_registry import register
-    register("b模型1", PUBLIC_URL, key="k")
-    register("b模型2", PUBLIC_URL, key="k")
     storage.save_dataset("批次集X", {"name": "批次集X", "tasks": [
         {"id": "T1", "type": "判别式", "dimension": "知识能力",
          "prompt": "p", "test_cases": [{"input": "i", "expected": "e"}]}]})
     main_module._SCHEDULER.clear()
     main_module._jobs.clear()
     resp = _call(main_module.create_benchmark, BenchmarkRequest(
-        dataset_name="批次集X", model_ids=["b模型1", "b模型2"], rounds=1))
+        dataset_name="批次集X", models=[
+            {"url": PUBLIC_URL, "key": "k", "name": "b模型1",
+             "temperature": 0.7, "max_tokens": 4096},
+            {"url": PUBLIC_URL, "key": "k", "name": "b模型2",
+             "temperature": 0.7, "max_tokens": 4096},
+        ], rounds=1))
     body = client.get("/api/tasks").json()
     batch_ids = {x["job_id"] for x in body["running"] if x.get("type") == "batch"}
     assert set(resp["jobs"]) == batch_ids

@@ -5,12 +5,10 @@
   'use strict';
 
   var TOKEN_KEY = 'duel_token';
-  var NAV_LINKS = [
+  var   NAV_LINKS = [
     {key: 'tasks',    href: '/tasks.html',      label: '任务调度'},
+    {key: 'battle',   href: '/battle.html',     label: '文本对战'},
     {key: 'lb',       href: '/leaderboard.html',label: '排行榜'},
-    {key: 'perturb',  href: '/perturb.html',    label: '扰动评测'},
-    {key: 'dash',     href: '/dashboard.html',  label: 'KPI 看板'},
-    {key: 'badcase',  href: '/badcases.html',   label: 'Bad Case'},
     {key: 'gen',      href: '/gen_review.html', label: '出题审核'},
   ];
 

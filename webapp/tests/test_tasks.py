@@ -313,3 +313,71 @@ def test_dataset_auto_ids_avoid_explicit_collision():
     ]
     ts = build_task_set_from_dataset(_raw_dataset(tasks))
     assert [t["id"] for t in ts["tasks"]] == ["T2", "T3"]
+
+
+# ---- build_task_set_from_dataset：自定义做题数量抽样 ----
+
+def _full_dataset(n=10):
+    return _raw_dataset([{"id": f"Q{i+1}", "prompt": f"p{i+1}"} for i in range(n)])
+
+
+def test_dataset_sampling_quantity_order_ids():
+    ts = build_task_set_from_dataset(_full_dataset(), num_questions=4)
+    ids = [t["id"] for t in ts["tasks"]]
+    assert len(ids) == 4
+    assert set(ids) <= {f"Q{i}" for i in range(1, 11)}
+    assert ids == sorted(ids, key=lambda x: int(x[1:]))
+    assert ts["meta"]["total"] == 4
+    assert ts["meta"]["num_questions"] == 4
+
+
+def test_dataset_sampling_seed_reproducible():
+    a = [t["id"] for t in build_task_set_from_dataset(_full_dataset(), num_questions=4, seed=2026)["tasks"]]
+    b = [t["id"] for t in build_task_set_from_dataset(_full_dataset(), num_questions=4, seed=2026)["tasks"]]
+    c = [t["id"] for t in build_task_set_from_dataset(_full_dataset(), num_questions=4, seed=7)["tasks"]]
+    assert a == b
+    assert a != c
+
+
+def test_dataset_sampling_n_ge_total_no_shuffle():
+    ts = build_task_set_from_dataset(_full_dataset(5), num_questions=5)
+    assert [t["id"] for t in ts["tasks"]] == ["Q1", "Q2", "Q3", "Q4", "Q5"]
+    ts = build_task_set_from_dataset(_full_dataset(5), num_questions=9)
+    assert [t["id"] for t in ts["tasks"]] == ["Q1", "Q2", "Q3", "Q4", "Q5"]
+
+
+def test_dataset_sampling_none_means_all():
+    ts = build_task_set_from_dataset(_full_dataset(10))
+    assert len(ts["tasks"]) == 10
+    assert ts["meta"]["num_questions"] is None
+
+
+def test_dataset_sampling_preserves_selected_fields():
+    tasks = [
+        {"id": "A", "dimension": "知识能力", "prompt": "p1"},
+        {"id": "B", "dimension": "代码能力", "prompt": "p2"},
+    ]
+    ts = build_task_set_from_dataset(_raw_dataset(tasks), num_questions=1)
+    t = ts["tasks"][0]
+    assert t["dimension"] in ("知识能力", "代码能力")
+    assert t["test_cases"] == [] and t["type"] == "判别式"
+
+
+def test_dataset_sampling_stability_kept_in_results():
+    tasks = [
+        {"id": "S1", "dimension": STABILITY_DIMENSION, "prompt": "p"},
+        {"id": "K1", "dimension": "知识能力", "prompt": "p"},
+    ]
+    ts = build_task_set_from_dataset(_raw_dataset(tasks), num_questions=1, seed=42)
+    assert [t["id"] for t in ts["tasks"]] == ["S1"]
+    assert ts["meta"]["eval_flags"] == {"stability_repeat": {"S1": 2}}
+
+
+def test_dataset_sampling_no_stability_flag_when_dropped():
+    tasks = [
+        {"id": "S1", "dimension": STABILITY_DIMENSION, "prompt": "p"},
+        {"id": "K1", "dimension": "知识能力", "prompt": "p"},
+    ]
+    ts = build_task_set_from_dataset(_raw_dataset(tasks), num_questions=1, seed=0)
+    assert [t["id"] for t in ts["tasks"]] == ["K1"]
+    assert "eval_flags" not in ts["meta"]

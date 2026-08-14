@@ -58,41 +58,34 @@ from backend.storage import (
     list_gold, save_gold, delete_gold, load_gold, save_hybrid_review,
     load_hybrid_review,
     save_generation_batch, load_generation_batch, list_generation_batches,
+    delete_generation_batch,
     bump_dataset_version, is_valid_gen_id,
     save_env_snapshot, load_env_snapshot, collect_env_snapshot,
     build_export_zip,
-    save_badcase, load_badcase, list_badcases, delete_badcase,
-    update_badcase_attribution, export_badcases_json,
     save_perturb, load_perturb, list_perturbs, is_valid_perturb_id,
-    save_leaderboard, load_leaderboard, list_leaderboards, is_valid_lb_id,
-    save_batch, load_batch, list_batches, is_valid_batch_id,
+    save_leaderboard, load_leaderboard, list_leaderboards, delete_leaderboard, is_valid_lb_id,
+    save_batch, load_batch, list_batches, is_valid_batch_id, _batch_summary,
     save_answers_inc, load_answers_inc, partial_answers_count,
 )
 from backend.gold import ensure_demo_gold, compute_meta_eval
 from backend.engine.rag_demo import ensure_demo_rag_dataset
 from backend.engine.longtext import ensure_longtext_bench
-from backend.engine.badcase import (
-    BAD_CASE_CATEGORIES, UNCATEGORIZED, mine_bad_cases, attribute_badcase,
-)
 from backend.engine.stats import saturation_trend
 from backend.engine.perturb import (
     PERTURB_MODES, build_perturb_set, score_task_metric,
     build_robustness_curves, bias_analysis,
 )
 from backend.engine.leaderboard import build_leaderboard, LeaderboardError
+from backend.engine.battle import sample_battle_questions, stream_battle
 from backend.engine.dashboard import build_jobs_trend
-from backend.hwmon import collect_hw
 from backend.scheduler import Scheduler
 from backend.schemas import (
-    StartRequest, StartResponse, ReviewSubmission, ModelRegisterRequest,
+    StartRequest, StartResponse, ReviewSubmission,
     GoldSetRequest, GenerateRequest, ReviewDecisionRequest,
     PerturbRequest, LeaderboardRequest, BenchmarkRequest, PriorityRequest,
-    RerunRequest,
+    TestConnectionRequest, BattleQuestionsRequest, BattleStreamRequest,
 )
 from backend.security import redact_sensitive, sanitize_config
-from backend.models_registry import (
-    delete_model, get_key, get_model, list_models, register, ModelRegistryError,
-)
 
 # 资源限制（issue #8）：并发执行任务上限 / 上传大小（数据集题数上限在 datasets.py 校验层统一生效）
 MAX_ACTIVE_JOBS = 2
@@ -302,33 +295,23 @@ async def gen_review_page():
     return _page_response("gen_review.html")
 
 
-@app.get("/badcases.html", response_class=HTMLResponse)
-async def badcases_page():
-    return _page_response("badcases.html")
-
-
-@app.get("/perturb.html", response_class=HTMLResponse)
-async def perturb_page():
-    """对抗扰动评测页（迭代六）：配置 → 运行 → 衰减曲线/偏见对照。"""
-    return _page_response("perturb.html")
-
-
 @app.get("/leaderboard.html", response_class=HTMLResponse)
 async def leaderboard_page():
-    """N 模型排行榜页（迭代六）：历史 job 聚合 → 排名/胜率矩阵/图表。"""
+    """N 模型排行榜页（迭代六）：历史 job 聚合 → 排名/胜率矩阵/图表；
+    迭代十一：批次扰动评测结果（衰减曲线/偏见对照）+ KPI 概览（耗时/token 趋势）同页展示。"""
     return _page_response("leaderboard.html")
-
-
-@app.get("/dashboard.html", response_class=HTMLResponse)
-async def dashboard_page():
-    """KPI 看板页（迭代六）：耗时/token 趋势 + CPU/GPU 硬件利用率。"""
-    return _page_response("dashboard.html")
 
 
 @app.get("/tasks.html", response_class=HTMLResponse)
 async def tasks_page():
     """任务调度页（迭代七）：排队/运行视图、优先级调整、benchmark 批次。"""
     return _page_response("tasks.html")
+
+
+@app.get("/battle.html", response_class=HTMLResponse)
+async def battle_page():
+    """文本对战页（迭代十一）：双模型同题并排流式作答 + 人工 5 档投票。"""
+    return _page_response("battle.html")
 
 
 @app.get("/api/dims")
@@ -509,41 +492,69 @@ def _item_stats(items: list[dict]) -> dict:
     return stats
 
 
-async def _run_generation(gen_id: str, gen_config: dict, req: GenerateRequest):
-    """后台出题协程：生成 → 五级校验 → 批次置 ready。错误落盘不复活。"""
+async def _run_generation(gen_id: str, gen_config: dict, req: GenerateRequest,
+                          dims: list[str] | None = None):
+    """后台出题协程：生成 → 五级校验 → 批次置 ready。错误落盘不复活。
+
+    进度落盘：每生成/校验一批题目写 batch.progress（前端展示"生成中 X/Y"），
+    上游不可达时快速失败（connect 超时 10s），避免长时间无进展。
+    """
     try:
+        if not dims:
+            dims = [str(d).strip() for d in (req.dimensions or []) if d and str(d).strip()]
+            if not dims and req.dimension and str(req.dimension).strip():
+                dims = [str(req.dimension).strip()]
+            if not dims:
+                dims = ["知识能力"]
         pool = None
         if req.target_dataset:
             ds = load_dataset(req.target_dataset)
             if ds:
                 pool = [str(t.get("prompt", "")) for t in ds.get("tasks", []) if isinstance(t, dict)]
+
+        total = max(1, req.count * len(dims))
+
+        async def progress_cb(done: int, ttl: int):
+            batch = load_generation_batch(gen_id)
+            if batch is None:
+                return
+            batch["progress"] = {"done": min(done, ttl), "total": ttl}
+            save_generation_batch(gen_id, batch)
+
         spec = {
             "task_type": req.task_type,
-            "dimension": req.dimension or "知识能力",
+            "dimensions": dims,
+            "dimension": dims[0],
             "count": req.count,
             "options": req.options or {},
             "target_dataset": req.target_dataset,
             "gen_name": gen_config.get("name", ""),
             "gen_key_masked": "***",
         }
-        items = await run_generation_pipeline(gen_config, spec, pool=pool)
+        items = await run_generation_pipeline(gen_config, spec, pool=pool,
+                                              progress_cb=progress_cb)
         batch = load_generation_batch(gen_id)
         if batch is None:
             return
-        batch["items"] = [
-            {
-                "item_id": f"{gen_id}-{i + 1}",
-                "task": it["task"],
-                "checks": it["checks"],
-                "issues": it["issues"],
-                "ok": it["ok"],
-                "status": "pending",
-                "edits": None,
-                "reviewed_at": None,
-            }
-            for i, it in enumerate(items)
-        ]
-        batch["state"] = "ready"
+        if not items:
+            batch["state"] = "error"
+            batch["error"] = "出题失败：出题模型未返回任何有效题目（请检查出题模型 URL / Key / 名称）"
+        else:
+            batch["items"] = [
+                {
+                    "item_id": f"{gen_id}-{i + 1}",
+                    "task": it["task"],
+                    "checks": it["checks"],
+                    "issues": it["issues"],
+                    "ok": it["ok"],
+                    "status": "pending",
+                    "edits": None,
+                    "reviewed_at": None,
+                }
+                for i, it in enumerate(items)
+            ]
+            batch["state"] = "ready"
+        batch.pop("progress", None)
         save_generation_batch(gen_id, batch)
     except asyncio.CancelledError:
         raise
@@ -552,6 +563,7 @@ async def _run_generation(gen_id: str, gen_config: dict, req: GenerateRequest):
         if batch is not None:
             batch["state"] = "error"
             batch["error"] = f"出题失败: {exc}"
+            batch.pop("progress", None)
             save_generation_batch(gen_id, batch)
 
 
@@ -573,6 +585,12 @@ async def generate_tasks(req: GenerateRequest):
     if active >= _GENERATION_MAX_ACTIVE:
         raise HTTPException(429, f"当前已有 {active} 个出题任务在执行，请稍后再试")
 
+    dims = [str(d).strip() for d in (req.dimensions or []) if d and str(d).strip()]
+    if not dims and req.dimension and str(req.dimension).strip():
+        dims = [str(req.dimension).strip()]
+    if not dims:
+        dims = ["知识能力"]
+
     gen_id = "gen_" + create_job_id()
     gen_cfg = {
         "name": req.gen_config.name,
@@ -586,7 +604,8 @@ async def generate_tasks(req: GenerateRequest):
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "spec": {
             "task_type": req.task_type,
-            "dimension": req.dimension,
+            "dimensions": dims,
+            "dimension": dims[0],
             "count": req.count,
             "options": req.options or {},
             "target_dataset": req.target_dataset,
@@ -596,11 +615,11 @@ async def generate_tasks(req: GenerateRequest):
         "items": [],
     }
     save_generation_batch(gen_id, batch)
-    task = asyncio.create_task(_run_generation(gen_id, gen_cfg, req))
+    task = asyncio.create_task(_run_generation(gen_id, gen_cfg, req, dims))
     _tasks[gen_id] = task
     task.add_done_callback(lambda t, gid=gen_id: _task_done(gid, t))
     audit.task_generate_started(gen_id)
-    return {"ok": True, "gen_id": gen_id, "state": "generating", "count": req.count}
+    return {"ok": True, "gen_id": gen_id, "state": "generating", "count": req.count * len(dims)}
 
 
 # ---- 对抗扰动评测（迭代六）----
@@ -621,43 +640,60 @@ def _settle_perturb(data: dict) -> dict:
     return data
 
 
-async def _run_perturb(perturb_id: str, req: PerturbRequest, data: dict):
-    """后台扰动评测：构建扰动集 → 单模型作答 → 判别式指标/生成式单臂评审 → 落盘。"""
-    try:
-        dataset = load_dataset(req.dataset_name)
-        if dataset is None:
-            raise ValueError(f"评测集 '{req.dataset_name}' 不存在")
-        task_set = build_task_set_from_dataset(dataset)
-        perturbed = build_perturb_set(task_set, req.modes, req.intensities, req.seed)
+async def _run_perturb_core(
+    perturb_id: str,
+    data: dict,
+    dataset_name: str,
+    model_cfg: dict,
+    modes: list[str],
+    intensities: dict[str, list[float]] | None,
+    seed: int | None,
+    judge_cfg: dict | None,
+    prompt_strategy: str,
+):
+    """扰动评测核心管线（迭代十一：/api/perturb 与 batch 集成共用）。
 
-        model_cfg = {
-            "name": req.model.name, "url": req.model.url, "key": req.model.key or "",
-            "temperature": req.model.temperature, "max_tokens": req.model.max_tokens,
-            "top_p": req.model.top_p, "code_verify_mode": "off",
-            "prompt_strategy": req.prompt_strategy,
-        }
+    构建扰动集 → 单模型作答 → 判别式指标/生成式单臂评审 → 曲线/偏见 → 落盘。
+    data 为初始记录（含 perturb_id/state 等）；异常置 error，取消原样上抛。
+    """
+    try:
+        dataset = load_dataset(dataset_name)
+        if dataset is None:
+            raise ValueError(f"评测集 '{dataset_name}' 不存在")
+        task_set = build_task_set_from_dataset(dataset)
+        perturbed = build_perturb_set(task_set, modes, intensities, seed)
+
+        model_cfg = dict(model_cfg)
+        model_cfg["code_verify_mode"] = "off"
+        model_cfg["prompt_strategy"] = prompt_strategy
 
         async def progress_cb(_label, done, total):
             data["progress"] = f"{done}/{total}"
+            save_perturb(perturb_id, dict(data))  # 迭代十一：进度落盘，界面实时可见
 
         answers = await _execute_model("P", model_cfg, perturbed["tasks"], None,
-                                       progress_cb, embedding_cfg=None)
+                                       progress_cb, embedding_cfg=None,
+                                       concurrency=3)  # 迭代十一：扰动提速（限 3 路并发）
 
         # 生成式题单臂评审（可选 judge；缺省该类题得分 N/A）
         single_scores: dict[str, float] = {}
         invalid = 0
-        if req.judge is not None:
-            judge_cfg = {"name": req.judge.name, "url": req.judge.url,
-                         "key": req.judge.key or ""}
+        if judge_cfg is not None:
             gen_tasks = [t for t in perturbed["tasks"] if t.get("type") == "生成式"]
             answers_map = {a["id"]: a for a in answers.get("answers", [])}
             gen_answers = [answers_map[t["id"]] for t in gen_tasks
                            if t["id"] in answers_map]
             if gen_answers:
+
+                async def judge_progress_cb(done, total):
+                    # 迭代十一：评审阶段进度落盘（"评审 X/Y"），界面持续可见
+                    data["progress"] = f"评审 {done}/{total}"
+                    save_perturb(perturb_id, dict(data))
+
                 sa = await run_single_arm_judge(
                     {"tasks": gen_tasks, "meta": {}},
                     {"model": model_cfg["name"], "answers": gen_answers},
-                    judge_cfg)
+                    judge_cfg, progress_cb=judge_progress_cb)
                 single_scores = {v["id"]: v.get("score")
                                  for v in sa.get("scores", [])}
                 invalid = sa.get("meta", {}).get("invalid", 0)
@@ -685,7 +721,7 @@ async def _run_perturb(perturb_id: str, req: PerturbRequest, data: dict):
                           + (api.get("completion_tokens") or 0),
             })
 
-        curves = build_robustness_curves(per_task, req.modes)
+        curves = build_robustness_curves(per_task, modes)
         bias = await bias_analysis(per_task)
         warnings = [
             {"code": "perturb_skipped", "task_id": s.get("task_id"),
@@ -718,6 +754,22 @@ async def _run_perturb(perturb_id: str, req: PerturbRequest, data: dict):
         _PERTURB_REQS.pop(perturb_id, None)
     finally:
         save_perturb(perturb_id, data)
+
+
+async def _run_perturb(perturb_id: str, req: PerturbRequest, data: dict):
+    """后台扰动评测（/api/perturb 独立入口；batch 集成走 _run_perturb_core）。"""
+    model_cfg = {
+        "name": req.model.name, "url": req.model.url, "key": req.model.key or "",
+        "temperature": req.model.temperature, "max_tokens": req.model.max_tokens,
+        "top_p": req.model.top_p,
+    }
+    judge_cfg = None
+    if req.judge is not None:
+        judge_cfg = {"name": req.judge.name, "url": req.judge.url,
+                     "key": req.judge.key or ""}
+    await _run_perturb_core(
+        perturb_id, data, req.dataset_name, model_cfg,
+        req.modes, req.intensities, req.seed, judge_cfg, req.prompt_strategy)
 
 
 @app.post("/api/perturb", response_model=None)
@@ -771,7 +823,8 @@ async def create_perturb(req: PerturbRequest):
 
 @app.get("/api/perturb")
 async def perturb_list():
-    return {"perturbs": list_perturbs()}
+    """扰动列表（迭代十一：running 遗留记录先沉降，与详情接口一致）。"""
+    return {"perturbs": [_settle_perturb(d) for d in list_perturbs()]}
 
 
 @app.get("/api/perturb/{perturb_id}")
@@ -819,13 +872,23 @@ async def leaderboard_detail(lb_id: str):
     return data
 
 
-# ---- KPI 看板（迭代六）----
+@app.delete("/api/leaderboard/{lb_id}")
+async def leaderboard_delete(lb_id: str):
+    """删除排行榜（迭代十一：已有排行榜可删除；仅删 lb 记录，不联动批次/job）。"""
+    if not is_valid_lb_id(lb_id):
+        raise HTTPException(400, "invalid lb_id format")
+    if not delete_leaderboard(lb_id):
+        raise HTTPException(404, "leaderboard not found")
+    audit.leaderboard_deleted(lb_id)
+    return {"ok": True, "lb_id": lb_id, "deleted": True}
+
+
+# ---- KPI 趋势（迭代六；迭代十一：融入排行榜页，不再独立看板）----
 
 @app.get("/api/dashboard")
 async def dashboard():
-    """KPI 看板：硬件利用率（CPU 增量采样，GPU N/A）+ 历史 job 耗时/token 趋势。"""
+    """KPI 趋势数据（排行榜页 KPI 概览）：历史 job 耗时/token 趋势。"""
     return {
-        "hw": collect_hw(),
         "jobs_trend": build_jobs_trend(list_jobs()),
     }
 
@@ -851,7 +914,10 @@ def _task_view_entry(job_id: str, j: dict, kind: str) -> dict:
 
 @app.get("/api/tasks")
 async def tasks_view():
-    """任务队列视图：排队（含位置/优先级）+ 运行中 + 批次摘要。"""
+    """任务队列视图：排队（含位置/优先级）+ 运行中 + 批次摘要。
+
+    迭代十一：批次摘要先做遗留沉降（重启后自动收尾已完成批次）。
+    """
     queued = []
     for item in _SCHEDULER.queue_view():
         j = _jobs.get(item["job_id"])
@@ -866,13 +932,14 @@ async def tasks_view():
         for job_id, j in _jobs.items()
         if _job_running(j)
     ]
+    batches = [_settle_batch(b) for b in list_batches()]
     return {
         "quota": {"concurrency": _SCHEDULER.concurrency(),
                   "active": _SCHEDULER.active_count(),
                   "queued": len(queued)},
         "queued": queued,
         "running": running,
-        "batches": list_batches(),
+        "batches": batches,
     }
 
 
@@ -946,11 +1013,13 @@ async def resume_eval(job_id: str):
 
 # ---- benchmark 批次（迭代七）----
 
-def _on_batch_job_done(batch_id: str, job_id: str) -> None:
-    """批次子任务终态回调（幂等计数）：全部终态时聚合排行榜并置批次终态。
+def _finalize_batch_if_ready(batch_id: str) -> None:
+    """批次收尾（幂等）：全部 job 终态时聚合排行榜并置批次终态。
 
     completed job 聚合进排行榜（build_leaderboard 复用）；error/cancelled
     模型标注 N/A 排除；不足 2 个完成模型 → 无排行榜 + note。
+    迭代十一：扰动评测与主流程解耦——不再等待扰动任务终态，批次即刻完成，
+    扰动结果由排行榜接口动态附加（running 显示进度，ready 显示曲线/偏见）。
     """
     batch = load_batch(batch_id)
     if batch is None or batch.get("state") in ("done", "partial", "cancelled"):
@@ -994,6 +1063,28 @@ def _on_batch_job_done(batch_id: str, job_id: str) -> None:
         batch["aggregation_error"] = "不足 2 个完成模型，无法生成排行榜"
     save_batch(batch_id, batch)
     audit.benchmark_done(batch_id, partial)
+    _notify_tasks_view()
+
+
+def _on_batch_job_done(batch_id: str, job_id: str) -> None:
+    """批次子任务终态回调（幂等计数）：全部终态时收尾（含扰动等待）。"""
+    _finalize_batch_if_ready(batch_id)
+
+
+def _settle_batch(batch: dict) -> dict:
+    """批次遗留沉降（迭代十一）：进程重启后 running 批次若满足收尾条件则自动完成。
+
+    场景：job 已全部终态、扰动协程随旧进程丢失（_settle_perturb 沉降 partial），
+    重启后无人触发 _on_batch_job_done → 批次永久 running。任何列表/详情查询
+    调用本函数自愈：满足条件立即聚合排行榜并置终态，否则原样返回。
+    返回值统一为列表摘要结构（与 list_batches 一致，供列表接口消费）。
+    """
+    if batch.get("state") in ("running",):
+        _finalize_batch_if_ready(batch.get("batch_id"))
+        settled = load_batch(batch.get("batch_id"))
+        if settled is not None:
+            return _batch_summary(settled)
+    return batch
 
 
 async def _run_batch_job(job_id: str):
@@ -1098,11 +1189,19 @@ async def _run_batch_job(job_id: str):
                        "max": round(10.0 * len(valid), 2)},
         }
         save_verdict(job_id, verdict)
+        # 迭代十一：KPI Token 趋势——全部轮次作答 token 累计（api_info 口径同报告）
+        tok_total = sum(
+            (a.get("api_info") or {}).get("prompt_tokens", 0)
+            + (a.get("api_info") or {}).get("completion_tokens", 0)
+            for round_ans in all_rounds
+            for a in round_ans.get("answers", [])
+        )
         report = {
             "summary": {"model": model_cfg["name"], "n_tasks": len(scores),
                         "rounds": rounds, "mode": "single_arm",
                         "invalid": verdict["meta"]["invalid"]},
-            "kpi": {"duration_sec": _job_duration_sec(job_id, cfg)},
+            "kpi": {"duration_sec": _job_duration_sec(job_id, cfg),
+                    "total_tokens": {"x": tok_total, "y": 0}},
             "warnings": warnings,
         }
         save_report(job_id, {
@@ -1134,36 +1233,42 @@ async def _run_batch_job(job_id: str):
 
 @app.post("/api/benchmark", response_model=None)
 async def create_benchmark(req: BenchmarkRequest):
-    """创建 benchmark 批次：1 任务集 × N 模型（配置库）× M 轮。
+    """创建 benchmark 批次：1 任务集 × N 模型 × M 轮。
 
-    每模型一个执行单元（单臂评审），全部经调度器入队；Key 取进程内存。
+    模型来源二选一：req.models 内联配置（迭代九，Key 走请求体仅内存）或
+    模型一律内联配置（models，Key 走请求体仅存内存）；任务集二选一：自定义评测集
+    dataset_name 或内置题库（dims/seed/num_questions）。
+    每模型一个执行单元（单臂评审），全部经调度器入队。
     """
-    dataset = load_dataset(req.dataset_name)
-    if dataset is None:
-        raise HTTPException(404, f"评测集 '{req.dataset_name}' 不存在")
-    try:
-        task_set = build_task_set_from_dataset(dataset)
-    except DatasetValidationError as e:
-        raise HTTPException(400, f"数据集格式错误: {e}")
+    # 任务集：自定义评测集 or 内置题库（迭代九：首页 N 模型入口支持内置题库）
+    if req.dataset_name:
+        dataset = load_dataset(req.dataset_name)
+        if dataset is None:
+            raise HTTPException(404, f"评测集 '{req.dataset_name}' 不存在")
+        try:
+            task_set = build_task_set_from_dataset(
+                dataset, num_questions=req.num_questions, seed=req.seed)
+        except DatasetValidationError as e:
+            raise HTTPException(400, f"数据集格式错误: {e}")
+    else:
+        task_set = build_task_set(dims=req.dims, seed=req.seed,
+                                  num_questions=req.num_questions)
 
-    seen_ids: set[str] = set()
     models: list[dict] = []
-    for mid in req.model_ids:
-        if mid in seen_ids:
-            raise HTTPException(400, f"模型配置重复：{mid}")
-        seen_ids.add(mid)
-        info = get_model(mid)
-        if info is None:
-            raise HTTPException(400, f"模型配置不存在：{mid}")
-        key = get_key(mid)
-        if not key:
-            raise HTTPException(
-                400, f"模型「{info.get('name')}」未补录 API Key（配置库重启后需重新填写）")
+    for i, mc in enumerate(req.models):
+        try:
+            validate_upstream_url(mc.url)
+        except UpstreamUrlError as e:
+            raise HTTPException(400, f"第 {i + 1} 个模型 URL 校验失败: {e}")
+        if not (mc.name or "").strip():
+            raise HTTPException(400, f"第 {i + 1} 个模型名称不能为空")
         models.append({
-            "id": mid, "name": info["name"], "url": info["url"], "key": key,
-            "temperature": info.get("temperature", 0.7),
-            "max_tokens": info.get("max_tokens", 4096),
-            "top_p": info.get("top_p"),
+            "id": None,
+            "name": mc.name.strip(),
+            "url": mc.url, "key": mc.key,
+            "temperature": mc.temperature,
+            "max_tokens": mc.max_tokens,
+            "top_p": mc.top_p,
         })
 
     judge_cfg = None
@@ -1174,6 +1279,14 @@ async def create_benchmark(req: BenchmarkRequest):
             validate_upstream_url(req.review.judge.url)
         except UpstreamUrlError as e:
             raise HTTPException(400, f"评审模型 URL 校验失败: {e}")
+
+    # 扰动评测（迭代十一）：启用时为每个模型创建扰动任务（复用 _run_perturb_core）
+    perturb_modes: list[str] | None = req.perturb_modes or None
+    if perturb_modes:
+        invalid_modes = [m for m in perturb_modes if m not in PERTURB_MODES]
+        if invalid_modes:
+            raise HTTPException(
+                400, f"非法扰动模式: {invalid_modes}（合法值 {PERTURB_MODES}）")
 
     budget_check = check_budget(
         req.budget.model_dump() if req.budget else None,
@@ -1233,14 +1346,62 @@ async def create_benchmark(req: BenchmarkRequest):
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "dataset": req.dataset_name,
         "models": [m["name"] for m in models],
-        "model_ids": [m["id"] for m in models],   # 迭代八：批次重跑恢复源（Key 不落盘，id 非敏感）
         "rounds": req.rounds,
+        "review_mode": "生成式AI评审" if judge_cfg else "判别式自动",
+        "code_verify_mode": req.code_verify_mode,
         "jobs": job_ids,
+        "perturb": {
+            "enabled": bool(perturb_modes),
+            "modes": perturb_modes or [],
+            "tasks": {},   # {model_name: prb_id}
+        },
         "leaderboard_id": None,
         "failed_models": [],
         "aggregation_error": None,
         "finished_at": None,
     }
+    # 为每个模型创建扰动评测任务（与主 job 并行，Key 走模型配置仅内存）
+    if perturb_modes:
+        for m in models:
+            prb_id = "prb_" + create_job_id()
+            pdata = {
+                "perturb_id": prb_id,
+                "state": "running",
+                "error": None,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "model_name": m["name"],
+                "model_url": m["url"],
+                "model_key_masked": "***",
+                "dataset": req.dataset_name,
+                "modes": perturb_modes,
+                "intensities": None,
+                "seed": req.seed,
+                "has_judge": judge_cfg is not None,
+                "judge_name": judge_cfg["name"] if judge_cfg else None,
+                "batch_id": batch_id,
+                "progress": "0/0",
+                "per_task": [],
+                "curves": {},
+                "bias": {},
+                "warnings": [],
+            }
+            save_perturb(prb_id, pdata)
+            _PERTURB_REQS[prb_id] = m  # 仅内存（含 Key），随进程销毁
+            task = asyncio.create_task(_run_perturb_core(
+                prb_id, pdata, req.dataset_name, m, perturb_modes, None,
+                req.seed, judge_cfg, req.prompt_strategy))
+            _tasks[prb_id] = task
+
+            def _prb_done(bid: str, pid: str, t: asyncio.Task) -> None:
+                _task_done(pid, t)
+                try:
+                    _on_batch_job_done(bid, pid)
+                except Exception:  # noqa: BLE001 批次回调异常不影响任务回收
+                    pass
+
+            task.add_done_callback(lambda t, pid=prb_id, bid=batch_id: _prb_done(bid, pid, t))
+            audit.perturb_started(prb_id)
+            batch["perturb"]["tasks"][m["name"]] = prb_id
     save_batch(batch_id, batch)
     audit.benchmark_started(batch_id, len(models))
     await _dispatch_pending()
@@ -1250,7 +1411,66 @@ async def create_benchmark(req: BenchmarkRequest):
 
 @app.get("/api/benchmark")
 async def benchmark_list():
-    return {"batches": list_batches()}
+    """批次列表（迭代十一：完成批次补充综合得分 score，供任务表格展示）。
+
+    迭代十一：running 遗留批次先做沉降自愈（重启后 job 已终态 + 扰动已沉降
+    的批次自动聚合排行榜并置终态）。
+    """
+    batches = [_settle_batch(b) for b in list_batches()]
+    for b in batches:
+        b["score"] = None
+        lb_id = b.get("leaderboard_id")
+        if not lb_id:
+            continue
+        lb = load_leaderboard(lb_id)
+        if not lb:
+            continue
+        comp = lb.get("composite") or {}
+        vals = [v.get("score") for v in comp.values() if isinstance(v, dict)]
+        scores = [v for v in vals if isinstance(v, (int, float))]
+        if scores:
+            b["score"] = round(sum(scores) / len(scores), 2)
+    return {"batches": batches}
+
+
+@app.post("/api/battle/questions", response_model=None)
+async def battle_questions(req: BattleQuestionsRequest):
+    """文本对战抽题（迭代十一）：返回仅题面列表（不含期望答案）。"""
+    try:
+        questions = sample_battle_questions(
+            req.count, req.source, req.dataset_name, req.seed)
+    except DatasetValidationError as e:
+        raise HTTPException(400, f"数据集格式错误: {e}")
+    except FileNotFoundError:
+        raise HTTPException(404, f"评测集 '{req.dataset_name}' 不存在")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"questions": questions, "total": len(questions)}
+
+
+@app.post("/api/battle/stream", response_model=None)
+async def battle_stream(req: BattleStreamRequest):
+    """文本对战流式（迭代十一）：双路 SSE 逐 token 转发（单侧失败降级）。"""
+    for i, mc in enumerate((req.model_a, req.model_b)):
+        try:
+            validate_upstream_url(mc.url)
+        except UpstreamUrlError as e:
+            raise HTTPException(400, f"第 {i + 1} 个模型 URL 校验失败: {e}")
+        if not (mc.name or "").strip():
+            raise HTTPException(400, f"第 {i + 1} 个模型名称不能为空")
+
+    async def sse():
+        yield "retry: 2000\n\n"
+        async for evt in stream_battle(
+            req.model_a.model_dump(), req.model_b.model_dump(),
+            req.prompt, req.context or "",
+        ):
+            yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        sse(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/benchmark/{batch_id}/leaderboard")
@@ -1266,6 +1486,24 @@ async def benchmark_leaderboard(batch_id: str):
     data = load_leaderboard(lb_id)
     if data is None:
         raise HTTPException(404, "leaderboard not found")
+    # 迭代十一：附加扰动评测结果（动态读取，运行中显示进度，完成显示曲线/偏见）
+    data["perturb"] = []
+    prb_tasks = (batch.get("perturb") or {}).get("tasks") or {}
+    if prb_tasks:
+        for model_name, prb_id in prb_tasks.items():
+            prb = load_perturb(prb_id)
+            if prb is not None:
+                prb = _settle_perturb(prb)
+            data["perturb"].append({
+                "model": model_name,
+                "state": (prb or {}).get("state", "missing"),
+                "progress": (prb or {}).get("progress", ""),
+                "modes": (prb or {}).get("modes", []),
+                "curves": (prb or {}).get("curves", {}),
+                "bias": (prb or {}).get("bias", {}),
+                "warnings": (prb or {}).get("warnings", []),
+                "error": (prb or {}).get("error"),
+            })
     return data
 
 
@@ -1276,6 +1514,12 @@ async def benchmark_detail(batch_id: str):
     batch = load_batch(batch_id)
     if batch is None:
         raise HTTPException(404, "batch not found")
+    # 迭代十一：查询即自愈遗留 running 批次（副作用；详情需完整记录，故自愈后重读）
+    if batch.get("state") == "running":
+        _finalize_batch_if_ready(batch_id)
+        batch = load_batch(batch_id)
+        if batch is None:
+            raise HTTPException(404, "batch not found")
     jobs = []
     for jid in batch.get("jobs", []):
         if jid in _jobs:
@@ -1335,61 +1579,72 @@ async def benchmark_cancel(batch_id: str):
     return {"ok": True, "batch_id": batch_id, "state": "cancelled"}
 
 
-@app.post("/api/benchmark/{batch_id}/rerun")
-async def benchmark_rerun(batch_id: str, body: RerunRequest):
-    """批次重跑（迭代八）：复用原批次配置重建新批次。
+@app.delete("/api/benchmark/{batch_id}")
+async def benchmark_delete(batch_id: str):
+    """删除已终态批次及其关联数据（迭代十一）。
 
-    恢复源为 batch 文件（model_ids/rounds/dataset/name）+ job config.json
-    （prompt_strategy/code_verify_mode/budget/embedding）。模型 Key 从配置库
-    进程内存重新取（未补录 400）；原批次使用评审模型时 Key 不落盘，必须重新
-    提供评审配置。运行中批次 409，旧批次（无 model_ids 字段）400。
+    删除范围：批次记录 + 关联排行榜 + 关联 job 历史目录（与排行榜引用一并清理，
+    保持"评测任务表格删除 = 该批次数据完整消失"语义）。
+    运行中/排队中批次 409（请先取消）；不存在 404。
     """
+    from backend.storage import delete_leaderboard, delete_job, delete_batch, delete_perturb
+
     if not is_valid_batch_id(batch_id):
         raise HTTPException(404, "batch not found")
     batch = load_batch(batch_id)
     if batch is None:
         raise HTTPException(404, "batch not found")
-    if batch.get("state") == "running":
-        raise HTTPException(409, "批次运行中，无法重跑（先取消）")
+    if batch.get("state") in ("running", "queued"):
+        raise HTTPException(409, f"批次运行中（state={batch.get('state')}），请先取消再删除")
 
-    model_ids = [str(m) for m in (batch.get("model_ids") or [])]
-    if len(model_ids) < 2:
-        raise HTTPException(
-            400, "批次文件缺少 model_ids（迭代七创建的历史批次无法重跑）")
-
-    common_cfg = {}
+    lb_id = batch.get("leaderboard_id")
+    if lb_id:
+        delete_leaderboard(lb_id)
     for jid in batch.get("jobs", []):
-        st = get_job_status(jid)
-        cfg = (st or {}).get("config") or {}
-        if cfg:
-            common_cfg = cfg
-            break
-
-    orig_judge = common_cfg.get("judge")
-    if orig_judge and body.review is None:
-        raise HTTPException(
-            400, "原批次使用评审模型（Key 不落盘无法复用），重跑需重新提供评审配置 review.judge")
-
-    req = BenchmarkRequest(
-        dataset_name=str(batch.get("dataset")),
-        model_ids=model_ids,
-        rounds=int(batch.get("rounds", 1) or 1),
-        priority=body.priority,
-        name=body.name or batch.get("name") or None,
-        review=body.review,
-        prompt_strategy=common_cfg.get("prompt_strategy", "cot"),
-        code_verify_mode=common_cfg.get("code_verify_mode", "off"),
-        budget=common_cfg.get("budget"),
-        embedding=common_cfg.get("embedding"),
-    )
-    res = await create_benchmark(req)
-    audit.benchmark_rerun(batch_id, res["batch_id"])
-    return {**res, "from_batch": batch_id}
+        delete_job(jid)
+    # 迭代十一：联动清理关联扰动评测记录；运行中的扰动协程先取消
+    # （防删除后协程仍写文件重建记录）
+    for prb_id in ((batch.get("perturb") or {}).get("tasks") or {}).values():
+        task = _tasks.get(prb_id)
+        if task is not None and not task.done():
+            task.cancel()
+        _tasks.pop(prb_id, None)
+        delete_perturb(prb_id)
+    delete_batch(batch_id)
+    audit.benchmark_deleted(batch_id, len(batch.get("jobs", [])))
+    _notify_tasks_view()
+    return {"ok": True, "batch_id": batch_id, "deleted": True}
 
 
 @app.get("/api/generate")
 async def generate_list():
-    return {"batches": list_generation_batches()}
+    """出题批次列表：generating 批次先做遗留沉降（进程中断 → partial）。"""
+    raw = list_generation_batches()
+    out = []
+    for entry in raw:
+        if entry["state"] == "generating":
+            full = load_generation_batch(entry["gen_id"])
+            if full is not None:
+                full = _settle_generation(full)
+                entry["state"] = full["state"]
+                entry["error"] = full.get("error")
+                entry["progress"] = full.get("progress")
+        out.append(entry)
+    return {"batches": out}
+
+
+@app.delete("/api/generate/{gen_id}")
+async def generation_delete(gen_id: str):
+    """删除出题批次（生成中禁止，防协程写文件竞态；删除后不可恢复）。"""
+    _require_gen_id(gen_id)
+    batch = load_generation_batch(gen_id)
+    if batch is None:
+        raise HTTPException(404, "generation batch not found")
+    if batch.get("state") == "generating":
+        raise HTTPException(409, "生成中批次不可删除，请等待生成完成")
+    delete_generation_batch(gen_id)
+    audit.generation_deleted(gen_id)
+    return {"ok": True, "gen_id": gen_id, "deleted": True}
 
 
 @app.get("/api/generate/{gen_id}")
@@ -1405,6 +1660,7 @@ async def generate_detail(gen_id: str):
         "error": batch.get("error"),
         "created_at": batch.get("created_at", ""),
         "spec": batch.get("spec", {}),
+        "progress": batch.get("progress"),
         "item_stats": _item_stats(batch.get("items", [])),
         "items": batch.get("items", []),
     }
@@ -1531,46 +1787,6 @@ async def gold_meta_eval(name: str, job_id: str):
     return {"meta_eval": compute_meta_eval(verdict, task_set, gold)}
 
 
-# ---- 模型配置库（迭代一） ----
-
-@app.post("/api/models")
-async def models_create(req: ModelRegisterRequest):
-    """注册模型配置。API Key 仅存进程内存，落盘文件只保留 key_masked（***）。"""
-    try:
-        info = register(
-            name=req.name, url=req.url, key=req.key or "",
-            temperature=req.temperature, max_tokens=req.max_tokens, top_p=req.top_p,
-        )
-    except ModelRegistryError as e:
-        raise HTTPException(400, f"模型注册失败: {e}")
-    audit.model_registered(info["id"])
-    return {"ok": True, "model": info}
-
-
-@app.get("/api/models")
-async def models_list():
-    return {"models": list_models()}
-
-
-@app.get("/api/models/{model_id}")
-async def models_get(model_id: str):
-    info = get_model(model_id)
-    if info is None:
-        raise HTTPException(404, "model not found")
-    # 单条读取：附带进程内存中的 Key（本地前端「填入」流程使用；
-    # 列表接口 /api/models 仍不返回 Key）
-    return {**info, "key": get_key(model_id)}
-
-
-@app.delete("/api/models/{model_id}")
-async def models_delete(model_id: str):
-    ok = delete_model(model_id)
-    if not ok:
-        raise HTTPException(404, "model not found")
-    audit.model_deleted(model_id)
-    return {"ok": True}
-
-
 # ---- 跨 job 历史汇总与饱和度监测（迭代一接口 + 迭代五趋势） ----
 
 @app.get("/api/stats/saturation")
@@ -1586,10 +1802,12 @@ async def stats_saturation():
 # ---- 连通性测试 ----
 
 @app.post("/api/test-connection")
-async def test_connection(config: StartRequest):
+async def test_connection(req: TestConnectionRequest):
+    """连通性测试（迭代九：N 模型列表逐模型测试，结果按输入顺序返回）。"""
     import httpx
-    results = {}
-    for label, cfg in [("model_a", config.model_a), ("model_b", config.model_b)]:
+    results = []
+    for i, cfg in enumerate(req.models):
+        label = (cfg.name or "").strip() or f"模型{i + 1}"
         try:
             # SSRF 防护：仅允许公网 http/https 目标（内网场景需显式开关放行）
             validate_upstream_url(cfg.url)
@@ -1601,21 +1819,23 @@ async def test_connection(config: StartRequest):
                 resp = await client.post(url, json=payload, headers=headers, timeout=15)
                 body = resp.json()
                 if resp.status_code >= 400:
-                    results[label] = {"ok": False, "error": body.get("error", {}).get("message", f"HTTP {resp.status_code}")}
+                    results.append({"name": label, "ok": False,
+                                    "error": body.get("error", {}).get("message", f"HTTP {resp.status_code}")})
                 else:
                     usage = body.get("usage", {})
-                    results[label] = {"ok": True, "model": body.get("model", cfg.name),
-                                      "prompt_tokens": usage.get("prompt_tokens", 0),
-                                      "completion_tokens": usage.get("completion_tokens", 0)}
+                    results.append({"name": label, "ok": True,
+                                    "model": body.get("model", cfg.name),
+                                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                                    "completion_tokens": usage.get("completion_tokens", 0)})
         except UpstreamUrlError as e:
-            results[label] = {"ok": False, "error": f"目标地址校验失败: {e}"}
+            results.append({"name": label, "ok": False, "error": f"目标地址校验失败: {e}"})
         except httpx.TimeoutException:
-            results[label] = {"ok": False, "error": "连接超时（>15s）"}
+            results.append({"name": label, "ok": False, "error": "连接超时（>15s）"})
         except httpx.ConnectError as e:
-            results[label] = {"ok": False, "error": f"连接失败: {e}"}
+            results.append({"name": label, "ok": False, "error": f"连接失败: {e}"})
         except Exception as e:
-            results[label] = {"ok": False, "error": f"未知错误: {e}"}
-    return results
+            results.append({"name": label, "ok": False, "error": f"未知错误: {e}"})
+    return {"models": results}
 
 
 # ---- 评测启动 ----
@@ -1671,7 +1891,8 @@ async def start_eval(req: StartRequest):
         if dataset is None:
             raise HTTPException(404, f"评测集 '{req.dataset_name}' 不存在")
         try:
-            task_set = build_task_set_from_dataset(dataset)
+            task_set = build_task_set_from_dataset(
+                dataset, num_questions=req.num_questions, seed=seed)
         except DatasetValidationError as e:
             raise HTTPException(400, f"数据集格式错误: {e}")
     else:
@@ -2301,7 +2522,7 @@ def _finalize_job(
         "verdict": verdict,
         "report": report,
     })
-    _finalize_badcases(job_id, verdict, task_set, answers_a, answers_b, report, cfg)
+    _finalize_saturation(job_id, verdict, task_set, cfg)
     if job_id in _jobs:
         j = _jobs[job_id]
         j["verdict"] = verdict
@@ -2313,18 +2534,12 @@ def _finalize_job(
         j["progress"] = "done"
 
 
-# ---- Bad Case 与饱和度（迭代五） ----
+# ---- 饱和度（迭代五；迭代十一：bad case 功能已移除，仅保留饱和度） ----
 
-def _finalize_badcases(
-    job_id: str, verdict: dict, task_set: dict,
-    answers_a: dict, answers_b: dict, report: dict, cfg: dict,
+def _finalize_saturation(
+    job_id: str, verdict: dict, task_set: dict, cfg: dict,
 ) -> None:
-    """job 完成收尾：saturation 幂等写入 + bad case 同步挖掘入库 + 后台异步归因。
-
-    挖掘为纯规则（零网络，即时产出满足「一次评测自动产出 bad case 库」）；
-    LLM 归因复用 review.judge 配置异步跑批，失败逐条静默降级「未归类」。
-    """
-    # 1. 跨 job 历史汇总（饱和度监测数据源，按 job_id 幂等）
+    """job 完成收尾：饱和度幂等写入（跨 job 历史汇总，按 job_id 幂等）。"""
     type_map = {t.get("id"): t.get("type", "判别式") for t in task_set.get("tasks", [])}
     entries = [
         {
@@ -2338,157 +2553,6 @@ def _finalize_badcases(
         for s in verdict.get("scores", [])
     ]
     update_saturation(job_id, entries, dataset=cfg.get("dataset_name"))
-
-    # 2. bad case 挖掘入库（同步）
-    answers_x, answers_y = reveal_answers(answers_a, answers_b, verdict)
-    per_task_metrics = (report.get("metrics") or {}).get("per_task") if isinstance(report, dict) else None
-    cases = mine_bad_cases(job_id, task_set, verdict, answers_x, answers_y,
-                           per_task_metrics, dataset_name=cfg.get("dataset_name"))
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    for c in cases:
-        c["created_at"] = now
-        try:
-            save_badcase(c)
-        except Exception:
-            continue
-    if cases:
-        audit.badcase_mined(job_id, len(cases))
-
-    # 3. 后台异步 LLM 归因（复用 review.judge；无配置/失败则保持未归类）
-    review = cfg.get("review") or {}
-    judge_cfg = review.get("judge") if isinstance(review, dict) else None
-    if cases and judge_cfg and judge_cfg.get("url"):
-        task_map = {t.get("id"): t for t in task_set.get("tasks", [])}
-        _spawn_attribution(job_id, cases, task_map, judge_cfg)
-
-
-def _spawn_attribution(
-    job_id: str, cases: list[dict], task_map: dict, judge_cfg: dict,
-) -> None:
-    """在独立 daemon 线程的事件循环中跑归因跑批。
-
-    _finalize_badcases 处于同步链深处，若直接 create_task，归因协程可能
-    在宿主事件循环收尾（asyncio.run 驱动的测试）前从未被调度。独立线程
-    自带 loop（asyncio.run），测试与真实环境均确定运行；daemon 不阻塞主线程。
-    """
-    import threading
-
-    def _runner():
-        try:
-            asyncio.run(_attribute_cases_async(job_id, cases, task_map, judge_cfg))
-        except Exception:
-            pass
-
-    threading.Thread(target=_runner, name=f"badcase-{job_id}", daemon=True).start()
-
-
-async def _attribute_cases_async(
-    job_id: str, cases: list[dict], task_map: dict, judge_cfg: dict,
-) -> None:
-    """后台归因跑批：逐条 LLM 归因，失败保持未归类；整体不抛异常。"""
-    for c in cases:
-        try:
-            task = task_map.get(c["task_id"]) or {}
-            result = await attribute_badcase(c, task, judge_cfg)
-            if result is None:
-                continue
-            updated = update_badcase_attribution(c["case_id"], result)
-            if updated is not None:
-                audit.badcase_attribution(c["case_id"], "llm")
-        except Exception:
-            continue
-
-
-def _require_badcase_id(case_id: str) -> str:
-    """校验 bad case id 为系统生成格式（防路径穿越）。"""
-    from backend.storage import is_valid_badcase_id
-    if not is_valid_badcase_id(case_id):
-        raise HTTPException(400, "invalid case_id format")
-    return case_id
-
-
-@app.get("/api/badcases")
-async def badcases_list(job_id: str | None = None, category: str | None = None,
-                        confirmed: str | None = None):
-    """bad case 列表（按 job/分类/确认态筛选，新→旧）。"""
-    cases = list_badcases(job_id)
-    if category:
-        cases = [c for c in cases if c["category"] == category]
-    if confirmed is not None:
-        want = confirmed.lower() in ("1", "true", "yes")
-        cases = [c for c in cases if c["confirmed"] == want]
-    return {"total": len(cases), "cases": cases}
-
-
-@app.get("/api/badcases/stats")
-async def badcases_stats(job_id: str | None = None):
-    """分类分布 + 来源分布 + 总数（图表数据源）。"""
-    cases = list_badcases(job_id)
-    by_category: dict[str, int] = {}
-    by_source: dict[str, int] = {}
-    confirmed = 0
-    for c in cases:
-        by_category[c["category"]] = by_category.get(c["category"], 0) + 1
-        for s in c.get("sources", []):
-            by_source[s] = by_source.get(s, 0) + 1
-        if c.get("confirmed"):
-            confirmed += 1
-    return {
-        "total": len(cases),
-        "confirmed": confirmed,
-        "by_category": by_category,
-        "by_source": by_source,
-        "categories": list(BAD_CASE_CATEGORIES) + [UNCATEGORIZED],
-    }
-
-
-@app.get("/api/badcases/export")
-async def badcases_export(job_id: str | None = None):
-    """导出 bad case 清单 JSON（含修订建议），可指定 job。"""
-    from fastapi.responses import Response
-    content = export_badcases_json(job_id)
-    fname = f"badcases-{job_id}.json" if job_id else "badcases-all.json"
-    return Response(
-        content=content,
-        media_type="application/json",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
-    )
-
-
-@app.get("/api/badcases/{case_id}")
-async def badcase_detail(case_id: str):
-    """bad case 详情（含证据全量，供归因报告与跳转报告原文）。"""
-    _require_badcase_id(case_id)
-    case = load_badcase(case_id)
-    if case is None:
-        raise HTTPException(404, "bad case not found")
-    return redact_sensitive(case)
-
-
-@app.post("/api/badcases/{case_id}/attribution")
-async def badcase_attribution_confirm(case_id: str, req: dict):
-    """人工确认/改标归因（body: {category, suggestion?}；驳回传 category=null）。"""
-    _require_badcase_id(case_id)
-    case = load_badcase(case_id)
-    if case is None:
-        raise HTTPException(404, "bad case not found")
-    category = req.get("category")
-    if category is not None and category not in BAD_CASE_CATEGORIES:
-        raise HTTPException(400, f"category 必须是五类之一: {', '.join(BAD_CASE_CATEGORIES)}")
-    label = category or UNCATEGORIZED
-    suggestion = req.get("suggestion")
-    if suggestion is not None and not isinstance(suggestion, str):
-        raise HTTPException(400, "suggestion 必须是字符串")
-    updated = update_badcase_attribution(case_id, {
-        "label": label,
-        "by": "human",
-        "confirmed": True,
-        "basis": req.get("basis") or (case.get("attribution") or {}).get("basis") or "",
-        "suggestion": suggestion if suggestion is not None else (case.get("attribution") or {}).get("suggestion") or "",
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    })
-    audit.badcase_attribution(case_id, "confirm" if category else "revert")
-    return {"ok": True, "case_id": case_id, "category": label, "confirmed": True}
 
 
 # ---- 人工双盲评审 ----

@@ -273,6 +273,33 @@ def test_api_create_and_list(client):
     assert any(x["lb_id"] == lb_id for x in items)
 
 
+def test_api_delete_leaderboard(client):
+    """迭代十一：已有排行榜删除（DELETE /api/leaderboard/{lb_id}）。"""
+    j1 = _make_job("j1", {"T1": 8.0, "T2": 7.0, "T3": 6.0, "T4": 5.0},
+                   {"T1": 6.0, "T2": 5.0, "T3": 4.0, "T4": 9.0},
+                   x="模型A", y="模型B")
+    resp = _call(main_module.create_leaderboard, LeaderboardRequest(
+        name="待删榜单", job_ids=[j1]))
+    lb_id = resp["lb_id"]
+
+    r = client.delete(f"/api/leaderboard/{lb_id}")
+    assert r.status_code == 200
+    assert r.json()["deleted"] is True
+    assert storage.load_leaderboard(lb_id) is None
+    items = client.get("/api/leaderboard").json()["leaderboards"]
+    assert all(x["lb_id"] != lb_id for x in items)
+    events = audit.read_events()
+    assert any(e["event"] == "leaderboard_deleted" and e["target"] == lb_id
+               for e in events)
+
+
+def test_api_delete_leaderboard_missing_and_invalid(client):
+    assert client.delete("/api/leaderboard/lb_20260101_000000_abcdef").status_code == 404
+    # 路径穿越/非法格式：路由层规范化或 is_valid_lb_id 拒绝（均不删除任何文件）
+    assert client.delete("/api/leaderboard/../evil").status_code in (400, 404)
+    assert client.delete("/api/leaderboard/not-a-lb").status_code == 400
+
+
 def test_api_rejects_unfinished_job(client):
     jid = _make_job("j1", {"T1": 8.0, "T2": 7.0, "T3": 6.0, "T4": 5.0},
                     {"T1": 6.0, "T2": 5.0, "T3": 4.0, "T4": 9.0},
@@ -316,8 +343,7 @@ def test_api_dashboard(client):
     resp = client.get("/api/dashboard")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["hw"]["gpu"] is None          # GPU 无硬件 N/A
-    assert "cpu" in body["hw"]
+    assert "hw" not in body  # 迭代十一：硬件利用率已移除
     # mock job 的 report 无 kpi → 入列但字段 N/A（历史记录空态）
     trend0 = {x["job_id"]: x for x in body["jobs_trend"]}
     assert trend0[j1]["duration_sec"] is None

@@ -52,7 +52,7 @@ def _payload(**overrides) -> dict:
 
 
 async def _fake_execute(model_label, config, tasks, stability_repeat,
-                        progress_cb=None, embedding_cfg=None):
+                        progress_cb=None, embedding_cfg=None, concurrency=1):
     answers = []
     for t in tasks:
         cases = t.get("test_cases") or []

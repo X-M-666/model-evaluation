@@ -1,11 +1,8 @@
 ﻿# -*- coding: utf-8 -*-
-"""迭代八：benchmark 批次整体取消与重跑。
+"""迭代八：benchmark 批次整体取消。
 
 - cancel：排队中 job 出队+删目录（无 task.cancel）、运行中 job 走 cancelling
   （真实 asyncio 任务）；终态 409、不存在/非法格式 404；审计 benchmark_cancelled
-- rerun：复用 batch 文件（model_ids/rounds/dataset/name）+ job config 重建；
-  运行中 409、缺 model_ids 400、原批次有 judge 必须重供评审配置、模型 Key
-  从配置库重取（未补录 400）；审计 benchmark_rerun
 """
 from __future__ import annotations
 
@@ -42,7 +39,7 @@ def _dataset() -> dict:
 
 async def _fake_execute(model_label, config, tasks, stability_repeat,
                         progress_cb=None, embedding_cfg=None, skip_ids=None,
-                        persist_cb=None):
+                        persist_cb=None, concurrency=1):
     answers = []
     for t in tasks:
         if skip_ids and t["id"] in skip_ids:
@@ -78,16 +75,11 @@ class _DummyTask:
     def add_done_callback(self, fn):
         pass
 
+    def done(self):
+        return True
 
-def _drain_batch(batch_id: str) -> None:
-    """直跑批次内全部 job 的后台协程（测试专用，幂等）。"""
-    batch = storage.load_batch(batch_id)
-    for jid in batch["jobs"]:
-        j = main_module._jobs.get(jid)
-        if j is None or j.get("state") in ("completed", "error", "cancelled"):
-            continue
-        main_module._tasks.pop(jid, None)
-        asyncio.run(main_module._run_batch_job(jid))
+    def cancel(self):
+        pass
 
 
 @pytest.fixture
@@ -97,7 +89,6 @@ def client():
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    from backend import models_registry
     main_module._jobs.clear()
     main_module._tasks.clear()
     main_module._SCHEDULER.clear()
@@ -105,30 +96,23 @@ def _clean(monkeypatch):
     monkeypatch.setattr(main_module, "run_single_arm_judge", _fake_single_arm)
     monkeypatch.setattr(main_module.asyncio, "create_task", _DummyTask)
     audit._log_path().write_text("", encoding="utf-8")
-    models_registry.clear_memory_keys()
-    for p in models_registry.MODELS_DIR.glob("*.json"):
-        p.unlink(missing_ok=True)
     storage.save_dataset("批次控制集", _dataset())
     yield
     main_module._jobs.clear()
     main_module._tasks.clear()
     main_module._SCHEDULER.clear()
-    models_registry.clear_memory_keys()
-    for p in models_registry.MODELS_DIR.glob("*.json"):
-        p.unlink(missing_ok=True)
 
 
-def _register(client, name, key="k", url=PUBLIC_URL) -> str:
-    r = client.post("/api/models", json={"name": name, "url": url, "key": key})
-    assert r.status_code == 200, r.text
-    return r.json()["model"]["id"]
-
-
-def _start(client, n=3, **overrides) -> dict:
-    ids = [_register(client, f"控制模型{i + 1}") for i in range(n)]
-    base = {"dataset_name": "批次控制集", "model_ids": ids, "rounds": 1}
+def _payload(n=3, **overrides) -> dict:
+    base = {"dataset_name": "批次控制集", "models": [
+        {"url": PUBLIC_URL, "key": "k", "name": f"控制模型{i + 1}",
+         "temperature": 0.7, "max_tokens": 4096} for i in range(n)]}
     base.update(overrides)
-    return _call(main_module.create_benchmark, BenchmarkRequest(**base))
+    return base
+
+
+def _start(n=3, **overrides) -> dict:
+    return _call(main_module.create_benchmark, BenchmarkRequest(**_payload(n, **overrides)))
 
 
 # ---- cancel ----
@@ -142,7 +126,7 @@ def test_cancel_queued_batch(client, monkeypatch):
     sched.submit(filler)
     sched.next_batch()
     main_module._jobs[filler] = {"state": "executing", "config": {}}
-    res = _start(client, n=3)
+    res = _start(n=3)
     try:
         assert storage.load_batch(res["batch_id"])["state"] == "running"
         for jid in res["jobs"]:
@@ -189,10 +173,8 @@ def test_cancel_running_batch_real_tasks(client, monkeypatch):
     monkeypatch.setattr(main_module, "_execute_model", _slow_execute)
     monkeypatch.setattr(main_module.asyncio, "create_task", _REAL_CREATE_TASK)
 
-    ids = [_register(client, f"运行模型{i + 1}") for i in range(2)]
-
     async def _scenario():
-        req = BenchmarkRequest(dataset_name="批次控制集", model_ids=ids, rounds=1)
+        req = BenchmarkRequest(**_payload(2))
         res = await main_module.create_benchmark(req)
         bid = res["batch_id"]
         await asyncio.sleep(0.2)                       # 任务已派发进入执行
@@ -209,88 +191,3 @@ def test_cancel_running_batch_real_tasks(client, monkeypatch):
     events = audit.read_events()
     assert any(e["event"] == "benchmark_cancelled" and e["target"] == bid for e in events)
     assert sum(1 for e in events if e["event"] == "eval_cancelled") == 2
-
-
-# ---- rerun ----
-
-def test_rerun_done_batch(client):
-    res = _start(client, n=3)
-    bid = res["batch_id"]
-    _drain_batch(bid)
-    batch = storage.load_batch(bid)
-    assert batch["state"] == "done"
-
-    r = client.post(f"/api/benchmark/{bid}/rerun", json={})
-    assert r.status_code == 200, r.text
-    d = r.json()
-    assert d["from_batch"] == bid
-    assert d["batch_id"] != bid
-    assert len(d["jobs"]) == 3
-    assert d["models"] == batch["models"]
-    new_batch = storage.load_batch(d["batch_id"])
-    assert new_batch["model_ids"] == batch["model_ids"]
-    assert new_batch["rounds"] == batch["rounds"]
-    assert new_batch["dataset"] == batch["dataset"]
-    assert storage.load_batch(d["batch_id"])["state"] == "running"
-    events = audit.read_events()
-    assert any(e["event"] == "benchmark_rerun" and e["target"] == bid
-               and e["path"] == d["batch_id"] for e in events)
-
-
-def test_rerun_running_409(client):
-    res = _start(client, n=2)
-    r = client.post(f"/api/benchmark/{res['batch_id']}/rerun", json={})
-    assert r.status_code == 409
-
-
-def test_rerun_missing_404(client):
-    r = client.post("/api/benchmark/batch_20990101_000000_000000/rerun", json={})
-    assert r.status_code == 404
-
-
-def test_rerun_old_batch_without_model_ids_400(client):
-    res = _start(client, n=2)
-    bid = res["batch_id"]
-    _drain_batch(bid)
-    batch = storage.load_batch(bid)
-    batch.pop("model_ids", None)          # 模拟迭代七创建的历史批次
-    storage.save_batch(bid, batch)
-    r = client.post(f"/api/benchmark/{bid}/rerun", json={})
-    assert r.status_code == 400
-    assert "model_ids" in r.json()["detail"]
-
-
-def test_rerun_requires_judge_reprovision(client):
-    res = _start(client, n=2, review={"mode": "pure_agent", "judge": {
-        "url": PUBLIC_URL, "name": "J", "key": "jk", "temperature": 0.0,
-        "max_tokens": 256}})
-    bid = res["batch_id"]
-    _drain_batch(bid)
-    r = client.post(f"/api/benchmark/{bid}/rerun", json={})
-    assert r.status_code == 400
-    assert "评审" in r.json()["detail"]
-    r2 = client.post(f"/api/benchmark/{bid}/rerun", json={
-        "review": {"mode": "pure_agent", "judge": {
-            "url": PUBLIC_URL, "name": "J2", "key": "jk2", "temperature": 0.0,
-            "max_tokens": 256}}})
-    assert r2.status_code == 200, r2.text
-
-
-def test_rerun_model_key_missing_400(client):
-    from backend import models_registry
-    res = _start(client, n=2)
-    bid = res["batch_id"]
-    _drain_batch(bid)
-    models_registry.clear_memory_keys()   # 模拟重启后 Key 未补录
-    r = client.post(f"/api/benchmark/{bid}/rerun", json={})
-    assert r.status_code == 400
-    assert "Key" in r.json()["detail"]
-
-
-def test_rerun_dataset_deleted_404(client):
-    res = _start(client, n=2)
-    bid = res["batch_id"]
-    _drain_batch(bid)
-    storage.delete_dataset("批次控制集")
-    r = client.post(f"/api/benchmark/{bid}/rerun", json={})
-    assert r.status_code == 404

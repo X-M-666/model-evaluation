@@ -235,13 +235,16 @@ async def _execute_model(
     embedding_cfg: dict[str, Any] | None = None,
     skip_ids: set[str] | None = None,
     persist_cb: Callable[[str, str, dict[str, Any]], None] | None = None,
+    concurrency: int = 1,
 ) -> dict[str, Any]:
-    """串行跑完该模型的全部题目。config 含 url/key/name/temperature/max_tokens/top_p。
+    """跑完该模型的全部题目。config 含 url/key/name/temperature/max_tokens/top_p。
 
     embedding_cfg：embedding provider 配置（None=不采集语义向量；失败自动降级）。
     skip_ids（迭代七断点续跑）：跳过执行这些题（不产生 entry，由调用方合并
     磁盘增量答案）；persist_cb：每题完成后回调 (side_label, task_id, entry)，
     供增量落盘（幂等，含失败/重试后条目）。
+    concurrency（迭代十一）：>1 时以信号量限并发执行（扰动评测提速用；
+    默认 1 保持主评测链路语义）。answers 顺序不保证，调用方按 id 取用。
     """
     url = config["url"].rstrip("/")
     model_name = config["name"]
@@ -249,17 +252,23 @@ async def _execute_model(
 
     answers: list[dict[str, Any]] = []
     total = len(tasks)
+    done_count = 0
+
     # 统一走 SSRF 校验客户端：连接前重新解析并按公网性过滤（DNS 重绑定防护）
     async with build_upstream_client() as client:
         embedder = None
         if embedding_cfg is not None:
             embedder = await _make_embedder(resolve_provider(embedding_cfg), client)
-        for i, task in enumerate(tasks):
+        sem = asyncio.Semaphore(concurrency) if concurrency > 1 else None
+
+        async def run_one(task: dict[str, Any]) -> None:
+            nonlocal done_count
             tid = task["id"]
             if tid in skip_ids:
                 if progress_cb:
-                    await progress_cb(model_label, i + 1, total)
-                continue
+                    await progress_cb(model_label, done_count + 1, total)
+                done_count += 1
+                return
             is_repeat_task = stability_repeat is not None and tid in stability_repeat
             repeat_n = stability_repeat.get(tid, 1) if is_repeat_task else 1
 
@@ -282,8 +291,19 @@ async def _execute_model(
                 if persist_cb:
                     persist_cb(model_label, tid, ans)
 
+            done_count += 1
             if progress_cb:
-                await progress_cb(model_label, i + 1, total)
+                await progress_cb(model_label, done_count, total)
+
+        async def run_with_sem(task: dict[str, Any]) -> None:
+            async with sem:
+                await run_one(task)
+
+        if sem is None:
+            for task in tasks:
+                await run_one(task)
+        else:
+            await asyncio.gather(*(run_with_sem(t) for t in tasks))
 
     return {
         "model": model_name,

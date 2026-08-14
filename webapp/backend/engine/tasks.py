@@ -475,16 +475,31 @@ def build_task_set(
     return {"meta": meta, "tasks": tasks}
 
 
-def build_task_set_from_dataset(dataset: dict[str, Any]) -> dict[str, Any]:
+def build_task_set_from_dataset(
+    dataset: dict[str, Any],
+    num_questions: int | None = None,
+    seed: int | None = None,
+) -> dict[str, Any]:
     """从上传的评测集构建任务集（结构与 build_task_set 输出一致）。
 
     issue #15（R2-006）：入口统一校验，拒绝类型非法 / 空 id / 重复 id 等
     篡改数据集（磁盘文件可被手工编辑），校验失败在评测启动前以 400 返回。
+
+    Args:
+        num_questions: 随机抽 N 题（校验后、字段补全前抽样）；None=全量。
+            抽样保留原题 id 与原顺序（同 seed 可复现）；N >= 题数时不抽样。
+        seed: 抽样随机种子；固定 seed 可复现同一抽样结果。
     """
     dataset = validate_standard_dataset(dataset)
     tasks = dataset.get("tasks", [])
     if not tasks:
         raise ValueError("评测集 tasks 为空")
+
+    if num_questions is not None and num_questions < len(tasks):
+        if seed is not None:
+            random.seed(seed)
+        idx = sorted(random.sample(range(len(tasks)), num_questions))
+        tasks = [tasks[i] for i in idx]
 
     # 补全缺失字段并重新编号
     for i, t in enumerate(tasks):
@@ -512,6 +527,7 @@ def build_task_set_from_dataset(dataset: dict[str, Any]) -> dict[str, Any]:
         "dataset_description": dataset.get("description", ""),
         "dataset_version": dataset.get("version", "v1"),
         "dataset_source": dataset.get("source", "upload"),
+        "num_questions": num_questions,
     }
     if stability_ids:
         meta["eval_flags"] = {"stability_repeat": {stability_ids[0]: 2}}

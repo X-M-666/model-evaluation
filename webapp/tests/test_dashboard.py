@@ -1,65 +1,15 @@
 # -*- coding: utf-8 -*-
-"""迭代六：KPI 看板（hwmon + duration_sec + jobs_trend）单测。
+"""迭代六：KPI 趋势（duration_sec + jobs_trend）单测。
 
-覆盖：_util_from_deltas 纯函数、CpuSampler 注入 fake reader（首采 None/
-增量值/平台不支持）、GPU N/A、_job_duration_sec 内存与磁盘两路径、
-build_jobs_trend 聚合（含历史记录空态）。
+覆盖：_job_duration_sec 内存与磁盘两路径、build_jobs_trend 聚合（含历史记录空态）。
+迭代十一：KPI 看板融入排行榜页，hwmon 硬件利用率已移除。
 """
 import json
 import time
 
 import pytest
 
-from backend import hwmon
 from backend.engine.dashboard import build_jobs_trend
-
-
-class TestUtilFromDeltas:
-    def test_busy_ratio(self):
-        assert hwmon._util_from_deltas(30.0, 100.0) == 70.0
-
-    def test_zero_total(self):
-        assert hwmon._util_from_deltas(0.0, 0.0) == 0.0
-
-    def test_idle_equal_total(self):
-        assert hwmon._util_from_deltas(100.0, 100.0) == 0.0
-
-    def test_clamped_100(self):
-        assert hwmon._util_from_deltas(-5.0, 100.0) == 100.0
-
-
-class TestCpuSampler:
-    def test_first_sample_returns_none(self):
-        s = hwmon.CpuSampler(reader=lambda: (10.0, 100.0))
-        assert s.sample() is None
-
-    def test_incremental_utilization(self):
-        data = iter([(10.0, 100.0), (30.0, 200.0)])
-        s = hwmon.CpuSampler(reader=lambda: next(data))
-        assert s.sample() is None
-        assert s.sample() == 80.0  # busy 70 / total 100
-
-    def test_unsupported_platform_returns_none(self):
-        s = hwmon.CpuSampler(reader=lambda: None)
-        assert s.sample() is None
-
-    def test_injected_kind(self):
-        s = hwmon.CpuSampler(reader=lambda: (1.0, 2.0))
-        assert s.kind == "injected"
-
-
-class TestCollectHw:
-    def test_gpu_na(self):
-        assert hwmon.collect_gpu_util() is None
-
-    def test_collect_hw_structure(self, monkeypatch):
-        monkeypatch.setattr(hwmon, "_SAMPLER", hwmon.CpuSampler(
-            reader=lambda: None))
-        out = hwmon.collect_hw()
-        assert out["gpu"] is None
-        assert out["cpu"]["percent"] is None
-        assert "N/A" in out["cpu"]["note"]
-        assert "generated_at" in out
 
 
 class TestJobDurationSec:
