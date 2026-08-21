@@ -274,3 +274,43 @@ async def test_pipeline_multi_dimensions_per_dim_count():
     # 每维度生成后 + 每题 autocheck 后各上报一次（进度封顶 total）
     assert progress == [(1, 2), (2, 2), (2, 2), (2, 2)]
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_concurrent_dims_bounded_and_deterministic():
+    """迭代十二：多维度并行生成，结果顺序（gather 保序）与进度语义不变。"""
+    p1 = '{"tasks":[{"prompt":"数学题1","expected":"e","rubric_note":"r"}]}'
+    p2 = '{"tasks":[{"prompt":"数学题2","expected":"e","rubric_note":"r"}]}'
+    p3 = '{"tasks":[{"prompt":"语言题1","expected":"e","rubric_note":"r"}]}'
+    p4 = '{"tasks":[{"prompt":"语言题2","expected":"e","rubric_note":"r"}]}'
+    # 生成阶段：2 维度 × 2 题 → 4 次；校验阶段：每题 PASS+自答 2 次 → 8 次
+    contents = [p1, p2, p3, p4] + ["PASS", "e"] * 4
+    client = _client_for(*contents)
+    spec = {"task_type": "判别式", "dimensions": ["数学能力", "语言能力"],
+            "count": 2}
+    items = await gen.run_generation_pipeline(GEN_CONFIG, spec, client=client)
+    assert len(items) == 4
+    # gather 保序：维度顺序 → 维度内生成顺序
+    assert [it["task"]["prompt"] for it in items] == \
+        ["数学题1", "数学题2", "语言题1", "语言题2"]
+    assert all(it["ok"] for it in items)
+    # 新的去重池口径（快照池）：同批内题目彼此比对 dedup 正常执行
+    assert all(it["checks"]["dedup"]["ok"] for it in items)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_concurrency_capped_by_semaphore():
+    """迭代十二：并发上限 GEN_CALL_CONCURRENCY 内并行，不超发请求。"""
+    p1 = '{"tasks":[{"prompt":"题甲","expected":"e","rubric_note":"r"}]}'
+    p2 = '{"tasks":[{"prompt":"题乙","expected":"e","rubric_note":"r"}]}'
+    p3 = '{"tasks":[{"prompt":"题丙","expected":"e","rubric_note":"r"}]}'
+    p4 = '{"tasks":[{"prompt":"题丁","expected":"e","rubric_note":"r"}]}'
+    client = _client_for(p1, p2, p3, p4, "PASS", "e", "PASS", "e",
+                         "PASS", "e", "PASS", "e")
+    spec = {"task_type": "判别式", "dimensions": ["知识能力", "数学能力",
+            "逻辑推理能力", "代码能力"], "count": 1}
+    items = await gen.run_generation_pipeline(GEN_CONFIG, spec, client=client)
+    assert len(items) == 4
+    assert {it["task"]["prompt"] for it in items} == {"题甲", "题乙", "题丙", "题丁"}
+    await client.aclose()

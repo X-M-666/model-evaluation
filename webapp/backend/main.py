@@ -1013,6 +1013,23 @@ async def resume_eval(job_id: str):
 
 # ---- benchmark 批次（迭代七）----
 
+def _settle_orphan_queued(job_id: str) -> None:
+    """重启孤儿排队任务沉降（迭代十二）：磁盘态 queued 且不在内存
+    （_jobs / 调度器）的任务无法再执行（内存队列不持久化 + 模型 Key 仅内存），
+    自动标记 error 使批次可收尾。与启动时 _settle_queued_on_restart 互补：
+    覆盖「启动后创建、随后 reload/重启丢失」的排队任务，而非仅启动那一刻。
+    """
+    if job_id in _jobs or _SCHEDULER.is_queued(job_id):
+        return
+    st = get_job_status(job_id) or {}
+    if st.get("state") == "queued":
+        try:
+            save_error(job_id, "排队任务在进程重启中丢失（内存队列不持久化），"
+                               "已自动标记 error，批次其余结果不受影响")
+        except Exception:
+            pass
+
+
 def _finalize_batch_if_ready(batch_id: str) -> None:
     """批次收尾（幂等）：全部 job 终态时聚合排行榜并置批次终态。
 
@@ -1026,6 +1043,7 @@ def _finalize_batch_if_ready(batch_id: str) -> None:
         return
     states: dict[str, str] = {}
     for jid in batch.get("jobs", []):
+        _settle_orphan_queued(jid)
         if jid in _jobs:
             states[jid] = _jobs[jid].get("state", "executing")
         else:
@@ -1317,6 +1335,7 @@ async def create_benchmark(req: BenchmarkRequest):
                        "judge": judge_cfg, "k_top_human": 0},
             "budget": req.budget.model_dump() if req.budget else None,
             "embedding": req.embedding.model_dump() if req.embedding else None,
+            "budget_cap_tokens": req.budget_cap_tokens,
             "batch_id": batch_id,
             "model_id": m["id"],
         }
@@ -1936,6 +1955,7 @@ async def start_eval(req: StartRequest):
         },
         "budget": req.budget.model_dump() if req.budget else None,
         "embedding": req.embedding.model_dump() if req.embedding else None,
+        "budget_cap_tokens": req.budget_cap_tokens,
     }
     save_config(job_id, config_data)
     # 迭代七：tasks.json/env 快照延后到调度派发时落盘（排队中磁盘态 = queued）

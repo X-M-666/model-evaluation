@@ -16,8 +16,9 @@ import statistics
 from typing import Any
 
 from backend import storage
+from backend.engine.metrics import efficiency_frontier, normalize_efficiency, token_efficiency
 from backend.engine.perturb import k_recall_curve
-from backend.engine.stats import MIN_SAMPLE, paired_bootstrap_ci, win_rate
+from backend.engine.stats import MIN_SAMPLE, clustered_bootstrap_ci, paired_bootstrap_ci, win_rate
 
 
 class LeaderboardError(ValueError):
@@ -138,6 +139,8 @@ def build_leaderboard(
     all_scores: dict[str, dict[str, dict[str, Any]]] = {}
     per_job_tasks: dict[str, dict[str, Any]] = {}
     per_job_ids: dict[str, set[str]] = {}
+    per_job_extract: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+    per_job_dataset: dict[str, str | None] = {}
     dataset = None
     errors: list[str] = []
     for jid in job_ids:
@@ -154,10 +157,12 @@ def build_leaderboard(
         per_job_ids[jid] = set(per_job_tasks[jid])
         if dataset is None:
             dataset = (files.get("config.json") or {}).get("dataset_name")
+        per_job_dataset[jid] = (files.get("config.json") or {}).get("dataset_name")
         extracted = extract_job_model_scores(jid)
         if not extracted:
             errors.append(f"{jid}: 无有效评审数据")
             continue
+        per_job_extract[jid] = extracted
         for model, per_task in extracted.items():
             bucket = all_scores.setdefault(model, {})
             for tid, entry in per_task.items():
@@ -261,6 +266,27 @@ def build_leaderboard(
                          else (f"题数不足 {MIN_SAMPLE}，差异不显著" if n < MIN_SAMPLE
                                else "置信区间包含 0，差异不显著")),
             }
+            # 迭代十二（改动 F 精神）：按 job（数据集实例）聚类稳健 CI 对照
+            c_deltas: dict[str, list[float]] = {}
+            for jid, ex in per_job_extract.items():
+                e1, e2 = ex.get(m1) or {}, ex.get(m2) or {}
+                shared = [
+                    tid for tid in scoring_ids
+                    if (e1.get(tid) or {}).get("score") is not None
+                    and (e2.get(tid) or {}).get("score") is not None
+                ]
+                if len(shared) >= 2:
+                    c_deltas[jid] = [
+                        float(e1[tid]["score"] - e2[tid]["score"]) for tid in shared
+                    ]
+            if len(c_deltas) >= 2:
+                cl_lo, cl_hi = clustered_bootstrap_ci(c_deltas, seed=seed)
+                ci_matrix[m1][m2]["ci_clustered"] = {
+                    "ci": [cl_lo, cl_hi],
+                    "n_clusters": len(c_deltas),
+                    "cluster_unit": "job（数据集实例）",
+                    "note": "聚类 bootstrap 通常给出更宽 CI（伪重复校正），与逐题 CI 对照呈现",
+                }
 
     # ---- K-召回率（Top-K 达标覆盖） ----
     k_recall: dict[str, dict[str, Any]] = {}
@@ -291,6 +317,48 @@ def build_leaderboard(
             radar_avg[m][d] = round(sum(vals) / len(vals), 2) if vals else None
 
     excluded_dimensions = sorted({dim_of[tid] for tid in excluded_ids})
+
+    # ---- 迭代十二：效率归一化（每 1K token 得分 + 跨评测集共用归一基准） ----
+    efficiency: dict[str, dict[str, Any]] = {}
+    eff_raw: dict[str, float | None] = {}
+    for m in models:
+        tokens = 0
+        for tid in scoring_ids:
+            entry = all_scores[m].get(tid)
+            if entry is not None and entry.get("score") is not None:
+                tokens += int(entry.get("tokens") or 0)
+        te = token_efficiency(composite[m]["score"], completion=tokens)
+        efficiency[m] = {
+            "tokens": te["tokens"],
+            "score": composite[m]["score"],
+            "score_per_1k_tokens": te["score_per_1k_tokens"],
+            "cost_per_score": te["cost_per_score"],
+            "norm_score": None,
+        }
+        eff_raw[m] = te["score_per_1k_tokens"]
+    normed = normalize_efficiency([eff_raw[m] for m in models])
+    for m, nv in zip(models, normed):
+        efficiency[m]["norm_score"] = nv
+
+    # ---- 迭代十二（改动 E）：成本–性能前沿线（累计 token → 累计得分 + 拐点） ----
+    efficiency_frontier_data: dict[str, dict[str, Any]] = {}
+    for m in models:
+        pts = [
+            (float(all_scores[m][tid].get("tokens") or 0), float(all_scores[m][tid]["score"]))
+            for tid in scoring_ids
+            if all_scores[m].get(tid, {}).get("score") is not None
+        ]
+        efficiency_frontier_data[m] = efficiency_frontier(pts)
+
+    # ---- 迭代十二（改动 C）：结论跨评测集可迁移性标注（LODO 精神） ----
+    transferability = _build_transferability(
+        models, scoring_ids, per_job_extract, per_job_dataset)
+
+    # ---- 迭代十二（N3）：任务锚定能力指数（ACI）----
+    # ACI = 模型跨评测集综合平均得分率（composite.score / (10×计分题数)），
+    # 作为跨任务集横向比较的归一基准（论文推荐 ACI 为主要能力指标）。
+    aci = _build_aci(models, composite, per_job_extract, per_job_dataset)
+
     return {
         "name": name or "",
         "jobs": job_ids,
@@ -306,10 +374,119 @@ def build_leaderboard(
         "score_dist": score_dist,
         "scatter": scatter,
         "radar": {"dimensions": dims, "avg": radar_avg},
+        "efficiency": efficiency,
+        "efficiency_frontier": efficiency_frontier_data,
+        "transferability": transferability,
+        "aci": aci,
         "excluded_dimensions": excluded_dimensions,
         "seed": seed,
         "note": "口径：各 job 为双盲成对评审，得分经 reveal 归一化到模型名跨 job "
                 "聚合（同模型多 job 同题 last-wins）；综合分=计分题得分合计（满分 "
                 "10×题数）；安全与价值观维度不计入排名；CI 为配对 bootstrap 95% "
-                "区间，题数不足标注差异不显著。",
+                "区间，题数不足标注差异不显著。efficiency 基于该评测集合计分/合计 "
+                "token，norm_score 以当前榜单最高效率为 1.0 共用归一基准。"
+                "绝对分数与排序基于当前评测集，跨评测集可能翻转（LODO 精神），"
+                "选型需谨慎。aci（能力指数）= 模型跨评测集综合平均得分率，作为跨任务集"
+                "横向比较的归一基准。",
+    }
+
+
+def _build_aci(
+    models: list[str],
+    composite: dict[str, dict[str, Any]],
+    per_job_extract: dict[str, dict[str, dict[str, dict[str, Any]]]],
+    per_job_dataset: dict[str, str | None],
+) -> dict[str, dict[str, Any]]:
+    """任务锚定能力指数（迭代十二 N3，论文 ACI）。
+
+    每模型 aci = 综合平均得分率（composite.score / max(10×n_scored, 1)）。
+    多评测集（不同 dataset_name 的 job 混合）时同时给出按评测集分别统计的
+    平均得分率（per_dataset），供"模型×任务集"横向比较。
+    无计分数据 → {"aci": None, "per_dataset": {}}（不输出段内数值）。
+    """
+    per_ds_scores: dict[str, dict[str, dict[str, float]]] = {}
+    for jid, ex in per_job_extract.items():
+        ds = per_job_dataset.get(jid) or "__all__"
+        bucket = per_ds_scores.setdefault(ds, {})
+        for m, per_task in ex.items():
+            mb = bucket.setdefault(m, {})
+            for tid, entry in per_task.items():
+                if entry.get("score") is not None:
+                    mb[tid] = float(entry["score"])
+    out: dict[str, dict[str, Any]] = {}
+    for m in models:
+        c = composite.get(m) or {}
+        n = int(c.get("n_scored") or 0)
+        aci_value = round(float(c.get("score") or 0) / max(10.0 * n, 1.0), 4) if n else None
+        per_dataset: dict[str, float | None] = {}
+        for ds, bucket in sorted(per_ds_scores.items()):
+            scores = bucket.get(m) or {}
+            if scores:
+                per_dataset[ds] = round(
+                    sum(scores.values()) / (10.0 * len(scores)), 4)
+            else:
+                per_dataset[ds] = None
+        out[m] = {"aci": aci_value, "per_dataset": per_dataset}
+    return out
+
+
+def _build_transferability(
+    models: list[str],
+    scoring_ids: list[str],
+    per_job_extract: dict[str, dict[str, dict[str, dict[str, Any]]]],
+    per_job_dataset: dict[str, str | None],
+) -> dict[str, Any]:
+    """跨评测集胜者方向一致性标注（改动 C）。
+
+    对每对模型，按数据集分组统计“各评测集中胜者方向”：方向一致 →
+    consistent；出现相反方向 → flips_across_datasets 并列出相悖的评测集。
+    单臂（跨 job 配对）/双盲（同 job 配对）均按“同一评测集内逐题配对”口径。
+    """
+    by_dataset: dict[str, dict[str, dict[str, float]]] = {}
+    for jid, ex in per_job_extract.items():
+        ds = per_job_dataset.get(jid) or "__all__"
+        bucket = by_dataset.setdefault(ds, {})
+        for m, per_task in ex.items():
+            model_bucket = bucket.setdefault(m, {})
+            for tid, entry in per_task.items():
+                if entry.get("score") is not None:
+                    model_bucket[tid] = float(entry["score"])
+    per_pair: dict[str, dict[str, dict[str, Any]]] = {}
+    for i, m1 in enumerate(models):
+        per_pair[m1] = {}
+        for m2 in models[i + 1:]:
+            directions: dict[str, str] = {}
+            flipped: dict[str, str] = {}
+            for ds, bucket in sorted(by_dataset.items()):
+                s1 = bucket.get(m1) or {}
+                s2 = bucket.get(m2) or {}
+                shared = [t for t in scoring_ids if t in s1 and t in s2]
+                if not shared:
+                    continue
+                d = sum(s1[t] - s2[t] for t in shared)
+                directions[ds] = "m1_ahead" if d > 1e-9 else ("m2_ahead" if d < -1e-9 else "tie")
+            signs = [v for v in directions.values() if v != "tie"]
+            if not signs:
+                status = "consistent"  # 无有效方向（全平局或数据缺失）
+                flipped = {}
+            elif all(s == signs[0] for s in signs):
+                status = "consistent"
+            else:
+                status = "flips_across_datasets"
+                for ds, v in directions.items():
+                    if v != "tie" and v != signs[0]:
+                        flipped[ds] = v
+            per_pair[m1][m2] = {
+                "status": status,
+                "datasets": sorted(directions),
+                "directions": directions,
+                "flipped": dict(sorted(flipped.items())),
+            }
+    has_multi = len(by_dataset) > 1
+    return {
+        "per_pair": per_pair,
+        "datasets": sorted(by_dataset),
+        "note": ("跨评测集结论迁移性：按数据集分组统计胜者方向，方向相反表示"
+                 "排序可能随评测集翻转（论文 LODO：绝对分数不可跨域迁移）。"
+                 + ("" if has_multi else "当前仅一个评测集，无可迁移性对照。")),
     }

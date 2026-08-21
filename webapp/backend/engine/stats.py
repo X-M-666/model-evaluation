@@ -46,6 +46,37 @@ def paired_bootstrap_ci(
     return (round(lo, 3), round(hi, 3))
 
 
+def clustered_bootstrap_ci(
+    cluster_deltas: dict[Any, list[float]],
+    seed: int | None = None,
+    n_boot: int = DEFAULT_N_BOOT,
+) -> tuple[float, float]:
+    """聚类稳健 bootstrap 配对均值差置信区间（迭代十二，论文聚类推断落地）。
+
+    以「簇」为单位重采样（bootstrap clusters）：cluster_deltas 为
+    {cluster_id: [该簇内逐题配对差 Δ=x−y]}，每次抽出整簇的全部差值参与均值
+    计算。簇内题目共享相关性（同数据集/同维度），抽样不能拆散它们；
+    该 CI 通常比逐题 bootstrap 更宽（标准误膨胀，伪重复校正）。
+
+    返回 (ci_lo, ci_hi) 95% 分位；无任何簇数据返回 (0.0, 0.0)。
+    """
+    clusters = [list(v) for v in cluster_deltas.values() if v]
+    if not clusters:
+        return (0.0, 0.0)
+    rng = random.Random(seed)
+    n = len(clusters)
+    means: list[float] = []
+    for _ in range(n_boot):
+        sample: list[float] = []
+        for _ in range(n):
+            sample.extend(rng.choice(clusters))
+        means.append(sum(sample) / len(sample) if sample else 0.0)
+    means.sort()
+    lo = means[max(0, int(n_boot * 0.025))]
+    hi = means[min(n_boot - 1, int(n_boot * 0.975))]
+    return (round(lo, 3), round(hi, 3))
+
+
 def win_rate(x_scores: list[float], y_scores: list[float]) -> dict[str, Any]:
     """逐题胜/平/负统计（含占比）。"""
     wins = ties = losses = 0

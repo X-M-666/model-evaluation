@@ -41,6 +41,10 @@ class StartRequest(BaseModel):
         "cot", pattern=r"^(cot|direct|fewshot)$",
         description="执行侧提示策略（迭代二）：cot=零样本思维链（默认）；direct=直答原文；fewshot=注入示例",
     )
+    budget_cap_tokens: int = Field(
+        0, ge=0,
+        description="每系统算力预算声明（token，0=不设上限=软记录）：仅记录与标注，不强制限制"
+    )
     review: ReviewConfig | None = Field(None, description="AI 评审配置（迭代二，缺省 pure_human）")
     budget: BudgetConfig | None = Field(None, description="预算熔断配置（迭代二，缺省不限制）")
     embedding: EmbeddingConfig | None = Field(None, description="embedding 配置（迭代二，缺省 auto）")
@@ -233,6 +237,10 @@ class BenchmarkRequest(BaseModel):
     code_verify_mode: str = Field("off", pattern=r"^(off|native-sandbox)$")
     budget: BudgetConfig | None = Field(None, description="预算熔断（按 N 模型放大预估）")
     embedding: EmbeddingConfig | None = Field(None, description="embedding 配置")
+    budget_cap_tokens: int = Field(
+        0, ge=0,
+        description="每系统算力预算声明（token，0=不设上限=软记录）：仅记录与标注，不强制限制"
+    )
 
 
 class PriorityRequest(BaseModel):

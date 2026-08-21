@@ -82,10 +82,14 @@ a{color:#58a6ff}
 <p class="sub" id="viewMeta"></p>
 <p class="hint" id="viewNote" style="margin-top:6px"></p>
 <div class="grid">
-  <div class="card" style="margin-top:12px"><h2>综合分排名</h2><div id="compositeTable"></div></div>
+  <div class="card" style="margin-top:12px"><h2>综合分排名（含效率归一化）</h2><div id="compositeTable"></div></div>
   <div class="card" style="margin-top:12px"><h2>分维度得分（点击行查看维度详情）</h2><div id="dimTable"></div></div>
 </div>
-<div class="card" style="margin-top:12px"><h2>胜率矩阵 + 置信区间（行模型 vs 列模型）</h2><div id="winTable"></div></div>
+<div class="card" style="margin-top:12px"><h2>胜率矩阵 + 置信区间（行模型 vs 列模型，含聚类稳健 CI 对照）</h2><div id="winTable"></div></div>
+<div class="card" style="margin-top:12px">
+<h2>成本–性能前沿线 <span class="hint">累计 token → 累计得分，拐点=边际收益递减起始点</span></h2>
+<div id="chartFrontier" class="chart"></div>
+</div>
 <div class="card" id="perturbCard" style="margin-top:12px;display:none">
   <h2>鲁棒性评测 <span class="hint">批次扰动评测（改写/噪声/属性扰动）：扰动强度 → 平均得分</span></h2>
   <p class="hint" id="perturbNote"></p>
@@ -226,6 +230,10 @@ async function openLb(id){
   renderBox(d);
   renderK(d);
   renderScatter(d);
+  renderFrontier(d);
+  document.getElementById('viewNote').innerHTML =
+    `${esc(d.note || '')}<br><span class="hint">跨评测集可迁移性：</span>${renderTransferability(d)}`
+    + `<span class="hint">${esc(d.transferability?.note || '')}</span>`;
   renderPerturb(d.perturb || []);
   }catch(e){
     CD.toast('排行榜加载失败：' + (e.message||e), 'err');
@@ -306,13 +314,23 @@ function renderPerturb(list){
 }
 function renderComposite(d){
   const models = d.models;
+  const fmtN = v => v == null ? '—' : (Number.isInteger(v) ? String(v) : String(Math.round(v*100)/100));
   const rows = models.map(m=>{
     const c = d.composite[m];
+    const e = (d.efficiency||{})[m] || {};
+    const band = e.norm_score == null ? '—' : e.norm_score;
+    const aci = (d.aci||{})[m] || {};
     return `<tr><td>${rankBadge(d.ranks[m])}</td><td><strong>${esc(m)}</strong></td>
-      <td>${c.score} / ${c.max}</td><td>${c.n_scored}</td></tr>`;
+      <td>${c.score} / ${c.max}</td><td>${c.n_scored}</td>
+      <td>${fmtN(e.score_per_1k_tokens)}</td>
+      <td><span class="badge ${e.norm_score != null && e.norm_score >= 0.9 ? 'ok' : ''}">${band}</span></td>
+      <td>${fmtN(e.cost_per_score)}</td>
+      <td>${aci.aci == null ? '—' : (aci.aci*100).toFixed(1)+'%'}</td></tr>`;
   }).join('');
   document.getElementById('compositeTable').innerHTML =
-    `<table><thead><tr><th>名次</th><th>模型</th><th>综合分（满分）</th><th>计分题数</th></tr></thead><tbody>${rows}</tbody></table>`;
+    `<table><thead><tr><th>名次</th><th>模型</th><th>综合分（满分）</th><th>计分题数</th>
+      <th>每 1K token 得分</th><th>归一化效率（1.0=最高）</th><th>单位得分成本（token/分）</th>
+      <th>能力指数 ACI（跨评测集平均得分率）</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 function renderDims(d){
   const dims = d.dims || [];
@@ -333,12 +351,59 @@ function renderWinMatrix(d){
       const ci = (d.ci[m1]||{})[m2];
       if(!wm || !ci) return '<td>-</td>';
       const badge = ci.significant ? '<span class="badge ok">显著</span>' : '<span class="badge warn">差异不显著</span>';
-      return `<td>${wm.wins}胜/${wm.ties}平/${wm.losses}负<br>
-        <span class="hint">Δ=${ci.mean} CI[${ci.ci[0]}, ${ci.ci[1]}] ${badge}</span></td>`;
+      let ciLine = `<span class="hint">Δ=${ci.mean} CI[${ci.ci[0]}, ${ci.ci[1]}] ${badge}</span>`;
+      const cc = ci.ci_clustered || {};
+      if(cc.ci){
+        const flip = ci.significant && (cc.ci[0] <= 0 && cc.ci[1] >= 0);
+        ciLine += `<br><span class="hint">聚类 CI[${cc.ci[0]}, ${cc.ci[1]}]（${cc.n_clusters||0} 簇）${flip ? '<span class="badge warn">聚类后不显著</span>' : ''}</span>`;
+      }
+      return `<td>${wm.wins}胜/${wm.ties}平/${wm.losses}负<br>${ciLine}</td>`;
     }).join('');
     return `<tr><td><strong>${esc(m1)}</strong></td>${cells}</tr>`;
   }).join('');
   document.getElementById('winTable').innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+}
+function renderFrontier(d){
+  const chart = echarts.init(document.getElementById('chartFrontier'));
+  const series = d.models.map((m,i)=>{
+    const f = (d.efficiency_frontier||{})[m] || {};
+    const line = {
+      name: m, type:'line', smooth:true, symbolSize:6,
+      itemStyle:{color:PALETTE[i%PALETTE.length]}, lineStyle:{width:2},
+      data:(f.cum_tokens||[]).map((t,idx)=>[t, (f.cum_score||[])[idx]]),
+    };
+    if(f.knee_index != null && (f.cum_tokens||[])[f.knee_index] != null){
+      line.markPoint = {
+        data:[{coord:[f.knee_tokens, f.knee_score], symbol:'pin', symbolSize:44,
+               itemStyle:{color:'#f0883e'},
+               label:{formatter:'拐点', fontSize:10, color:'#0d1117'}}],
+      };
+    }
+    return line;
+  });
+  chart.setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'axis', formatter: p=>p.map(x=>`${x.marker} ${x.seriesName}<br>累计 token ${x.value[0].toLocaleString()} · 累计得分 ${x.value[1]}`).join('<br>')},
+    legend:{textStyle:{color:'#8b949e'}, top:0},
+    xAxis:{type:'value', name:'累计 token', axisLabel:{color:'#8b949e'}, splitLine:{lineStyle:{color:'#21262d'}}},
+    yAxis:{type:'value', name:'累计得分', axisLabel:{color:'#8b949e'}, splitLine:{lineStyle:{color:'#21262d'}}},
+    series,
+  });
+}
+function renderTransferability(d){
+  const t = d.transferability || {};
+  const pairs = t.per_pair || {};
+  const badges = Object.entries(pairs).flatMap(([m1, m2map])=>
+    Object.entries(m2map).map(([m2, v])=>{
+      const flipped = (v.flipped && Object.keys(v.flipped).length) ? `，相悖评测集：${Object.keys(v.flipped).join('、')}` : '';
+      return `<span style="display:inline-block;margin:4px 8px 0 0;font-size:12px">
+        <strong>${esc(m1)}</strong> vs <strong>${esc(m2)}</strong>：
+        ${v.status === 'flips_across_datasets'
+          ? `<span class="badge warn">跨评测集翻转</span><span class="hint"> ${esc(flipped)}</span>`
+          : '<span class="badge ok">方向一致</span>'}
+      </span>`;
+    })).join('');
+  return badges;
 }
 function renderRadar(d){
   const dims = d.radar.dimensions || [];

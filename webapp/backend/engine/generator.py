@@ -16,6 +16,7 @@ build_upstream_client（SSRF/审计基线）；测试经 client 注入 httpx.Moc
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, Awaitable, Callable
@@ -29,6 +30,9 @@ from backend.ssrf import build_upstream_client
 # 单次生成上限（成本控制：生成+自答+安全审核 ≈3 次调用/题）
 MAX_COUNT = 20
 DEFAULT_COUNT = 5
+# 出题并发上限（迭代十二）：维度生成与逐题校验共用同一信号量，
+# 避免 N 维 × count 题完全串行（每题为 3 次串行 LLM 调用，上游慢时单批可拖数小时）
+GEN_CALL_CONCURRENCY = 3
 # 生成调用围栏：产物超长视为异常（截断解析）
 GEN_OUTPUT_FENCE = 20000
 # 去重相似度阈值（n-gram 余弦）
@@ -460,36 +464,56 @@ async def run_generation_pipeline(
     try:
         total = max(1, count * len(dims))
         done = 0
-        raw_tasks: list[dict[str, Any]] = []
-        for dim in dims:
+        sem = asyncio.Semaphore(GEN_CALL_CONCURRENCY)
+
+        async def _gen_dim(dim: str) -> list[dict[str, Any]]:
+            """单维度出题：examples 按需注入，信号量约束并发调用数。"""
             examples = None
             if options.get("few_shots"):
                 from backend.engine.tasks import QUESTION_POOL as _QP
 
                 examples = [q for q in _QP.get(dim, [])][:2]
-            subtasks = await generate_tasks(
-                gen_config, task_type, dim, count, options, examples,
-                client=client, progress_cb=None,
-            )
+            async with sem:
+                subtasks = await generate_tasks(
+                    gen_config, task_type, dim, count, options, examples,
+                    client=client, progress_cb=None,
+                )
             for t in subtasks:
                 t.setdefault("dimension", dim)
-            raw_tasks.extend(subtasks)
-            done += len(subtasks)
+            return subtasks
+
+        per_dim = await asyncio.gather(*(_gen_dim(d) for d in dims))
+        raw_tasks: list[dict[str, Any]] = []
+        for sub in per_dim:  # gather 保序：维度结果按输入顺序回填
+            raw_tasks.extend(sub)
+            done += len(sub)
             if progress_cb:
                 await progress_cb(min(done, total), total)
+
         items: list[dict[str, Any]] = []
-        local_pool = list(base_pool)
-        for t in raw_tasks:
+        all_prompts = [str(t.get("prompt", "")) for t in raw_tasks
+                       if str(t.get("prompt", "")).strip()]
+
+        async def _check(t: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            """单题校验：去重池取「基准池 + 本批其余题面」快照（并行下不做
+            顺序追加，结果仍确定性：gather 按输入顺序回填）。"""
             t.setdefault("dimension", dims[0])
             t.setdefault("type", task_type)
             t.setdefault("difficulty", t.get("difficulty") or "medium")
-            result = await autocheck(
-                t, local_pool, leaked_extra=leaked_extra,
-                client=client, gen_config=gen_config,
-            )
-            items.append({"task": t, "checks": result["checks"], "issues": result["issues"],
-                          "ok": result["ok"]})
-            local_pool.append(str(t.get("prompt", "")))
+            own = str(t.get("prompt", ""))
+            against = list(base_pool)
+            against += [p for p in all_prompts if p != own]
+            async with sem:
+                result = await autocheck(
+                    t, against, leaked_extra=leaked_extra,
+                    client=client, gen_config=gen_config,
+                )
+            return t, result
+
+        checked = await asyncio.gather(*(_check(t) for t in raw_tasks))
+        for t, result in checked:
+            items.append({"task": t, "checks": result["checks"],
+                          "issues": result["issues"], "ok": result["ok"]})
             done += 1
             if progress_cb:
                 await progress_cb(min(done, total), total)

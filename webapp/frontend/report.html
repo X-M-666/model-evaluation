@@ -90,6 +90,11 @@ td{color:#c9d1d9}
 <div id="analysisBody"></div>
 </div>
 
+<div class="card" id="warnCard" style="display:none">
+<h2>合理性警示 <span class="hint">效率对照 / 算力匹配 / 题库判别力 / 混淆变量 / 聚类显著性</span></h2>
+<div id="warnBody"></div>
+</div>
+
 <div class="card" id="groundingCard" style="display:none"></div>
 
 <div class="card" id="metaEvalCard" style="display:none"></div>
@@ -227,9 +232,20 @@ function renderReport(data){
       {k:'胜场 X/Y/平', v:`${s.win_x}/${s.win_y}/${s.ties}`},
       {k:'评测轮次', v:repeatN},
     ];
-    document.getElementById('statCard').innerHTML = `<h2>核心指标</h2><div class="stat-grid">${stats.map(st=>`<div class="stat-box ${st.c||''}"><div class="v">${st.v}</div><div class="k">${st.k}</div></div>`).join('')}</div>`;
+    const eff = rep?.kpi?.efficiency;
+    if(eff){
+      const fv = v => v == null ? '—' : (Number.isInteger(v) ? String(v) : fmt(v));
+      stats.push(
+        {k:'每 1K token 得分 X/Y', v:`${fv(eff.x?.score_per_1k_tokens)} / ${fv(eff.y?.score_per_1k_tokens)}`},
+        {k:'归一化效率 X/Y（1.0=最高）', v:`${fv(eff.x?.norm_score)} / ${fv(eff.y?.norm_score)}`},
+        {k:'单位得分成本（token/分）X/Y', v:`${fv(eff.x?.cost_per_score)} / ${fv(eff.y?.cost_per_score)}`},
+      );
+    }
+    document.getElementById('statCard').innerHTML = `<h2>核心指标</h2><div class="stat-grid">${stats.map(st=>`<div class="stat-box ${st.c||''}"><div class="v">${st.v}</div><div class="k">${st.k}</div></div>`).join('')}</div>${
+      eff && eff.note ? `<p class="hint" style="margin-top:8px">${esc(eff.note)}</p>` : ''}`;
     renderCharts(rep);
     renderAnalysis(rep.analysis || []);
+    renderWarnings(rep);
     renderMetaEval(rep);
     renderConsistency(rep);
     renderGrounding(rep);
@@ -566,6 +582,23 @@ function renderAnalysis(sections){
   document.getElementById('analysisBody').innerHTML = sections.map(sec=>`
     <div class="analysis-section"><h3>${esc(sec.title)}</h3>${sec.paragraphs.map(p=>`<p>${esc(p)}</p>`).join('')}</div>
   `).join('');
+}
+
+// ---- 合理性警示（迭代十二：效率对照/算力软记录/判别力/混淆变量/聚类显著性） ----
+function renderWarnings(rep){
+  const list = (rep && rep.warnings) || [];
+  const body = document.getElementById('warnBody');
+  if(!body) return;
+  if(!list.length){
+    body.parentElement.style.display = 'none';
+    return;
+  }
+  body.parentElement.style.display = 'block';
+  body.innerHTML = list.map(w=>`
+    <div style="display:flex;gap:8px;align-items:flex-start;padding:6px 0;font-size:13px">
+      <span class="badge ${w.level === 'warning' ? 'warn' : ''}" style="flex:none">${w.level === 'warning' ? '⚠ 警示' : 'ⓘ 提示'}</span>
+      <span style="color:#c9d1d9;line-height:1.6">${esc(w.message)}</span>
+    </div>`).join('');
 }
 
 // ---- 环境快照（迭代八）：运行环境 + 评测参数（新字段缺省 N/A，零破坏） ----

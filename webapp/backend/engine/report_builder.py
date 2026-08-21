@@ -12,11 +12,13 @@ import statistics
 from typing import Any
 
 from backend.engine.metrics import (
-    GROUNDING_SUPPORT_THRESHOLD, compute_task_metrics,
+    GROUNDING_SUPPORT_THRESHOLD, answer_redundancy, compute_task_metrics,
+    efficiency_frontier, normalize_efficiency,
     metric_answer_relevancy, metric_grounding_faithfulness,
+    token_efficiency,
 )
-from backend.engine.stats import MIN_SAMPLE, significance_note
-from backend.engine.tasks import STABILITY_DIMENSION
+from backend.engine.stats import MIN_SAMPLE, clustered_bootstrap_ci, significance_note
+from backend.engine.tasks import STABILITY_DIMENSION, discriminative_band
 
 EPS = 0.001
 SIG_SEED = 2026
@@ -187,12 +189,15 @@ def build_report(
 
     summary = _build_summary(config, tasks, rows, verdict)
     charts = _build_charts(tasks, rows, summary)
-    analysis = _build_analysis(tasks, rows, summary, charts)
     metrics = _build_metrics(task_set, rounds_answers, answers_a, answers_b, verdict,
                              embedding_config)
-    significance = _build_significance(task_set, verdict)
-    kpi = _build_kpi(summary, charts, significance, rows)
-    warnings = _build_warnings(task_set, verdict, metrics, significance)
+    analysis = _build_analysis(tasks, rows, summary, charts, config, metrics)
+    metrics = _build_metrics(task_set, rounds_answers, answers_a, answers_b, verdict,
+                             embedding_config)
+    significance = _build_significance(task_set, verdict, config)
+    kpi = _build_kpi(summary, charts, significance, rows, config)
+    warnings = _build_warnings(task_set, verdict, metrics, significance,
+                               config, rows)
     meta_eval = _build_meta_eval(gold, verdict, task_set)
     consistency = _build_consistency(round_verdicts,
                                      verdict.get("meta", {}).get("repeat_n", 1))
@@ -216,6 +221,7 @@ def build_report(
         "warnings": warnings,
         "meta_eval": meta_eval,
         "consistency": consistency,
+        "budget_cap_tokens": int(config.get("budget_cap_tokens") or 0),
     }
 
 
@@ -303,23 +309,32 @@ def _build_metrics(
     grounding_ctx_tasks = 0
     grounding_grounded_x = 0
     grounding_grounded_y = 0
+    redundancy_values: list[float] = []
     for t in task_set.get("tasks", []):
         sid = t["id"]
         sc = score_map.get(sid, {})
+        entries_x = entries("a" if x_file == "a" else "b", sid)
+        entries_y = entries("b" if y_file == "b" else "a", sid)
         item: dict[str, Any] = {
             "id": sid,
             "dimension": t.get("dimension", "自定义"),
-            "x": compute_task_metrics(t, entries("a" if x_file == "a" else "b", sid),
-                                      sc.get("answer_x")),
-            "y": compute_task_metrics(t, entries("b" if y_file == "b" else "a", sid),
-                                      sc.get("answer_y")),
+            "x": compute_task_metrics(t, entries_x, sc.get("answer_x")),
+            "y": compute_task_metrics(t, entries_y, sc.get("answer_y")),
         }
+        # 迭代十二（N1）：双模型答案冗余度/分化度（优先语义向量，n-gram 兜底）
+        rx, ry = _pick_entry(entries_x), _pick_entry(entries_y)
+        if rx.get("raw_answer") and ry.get("raw_answer"):
+            item["redundancy"] = answer_redundancy(
+                rx["raw_answer"], ry["raw_answer"],
+                (rx or {}).get("semantic"), (ry or {}).get("semantic"))
+            if item["redundancy"]["cosine"] is not None:
+                redundancy_values.append(item["redundancy"]["cosine"])
+        else:
+            item["redundancy"] = {"cosine": None, "band": None, "source": "no_answer"}
         ctx = (t.get("context") or "").strip()
         if ctx:
-            gx = _grounding_side(ctx, entries("a" if x_file == "a" else "b", sid),
-                                 t.get("prompt", ""))
-            gy = _grounding_side(ctx, entries("b" if y_file == "b" else "a", sid),
-                                 t.get("prompt", ""))
+            gx = _grounding_side(ctx, entries_x, t.get("prompt", ""))
+            gy = _grounding_side(ctx, entries_y, t.get("prompt", ""))
             item["grounding"] = {"x": gx, "y": gy}
             grounding_ctx_tasks += 1
             grounding_grounded_x += int(gx["grounded"])
@@ -330,6 +345,9 @@ def _build_metrics(
         "error": (embedding_config or {}).get("error"),
     }
     result: dict[str, Any] = {"provider": provider, "per_task": per_task}
+    if redundancy_values:
+        result["redundancy_avg"] = round(
+            sum(redundancy_values) / len(redundancy_values), 4)
     if grounding_ctx_tasks:
         result["grounding"] = {
             "context_tasks": grounding_ctx_tasks,
@@ -363,10 +381,13 @@ def _grounding_side(context: str, side_entries: list[dict[str, Any]],
 def _build_significance(
     task_set: dict[str, Any],
     verdict: dict[str, Any],
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """bootstrap 配对显著性（迭代二）：稳定模型空间，按 scoring_ids 过滤。
 
     整体 + 分维度；样本 < MIN_SAMPLE 或 CI 含 0 → significant=False 并区分原因。
+    迭代十二：整体额外输出 ci_clustered（按维度聚类稳健 CI，伪重复校正）；
+    旧调用方不传 config 时照旧输出（不新增段）。
     """
     excluded = {t["id"] for t in task_set.get("tasks", []) if t.get("excluded_from_total")}
     x_file = verdict.get("revealed", {}).get("answer_x_file", "a")
@@ -392,7 +413,22 @@ def _build_significance(
         if rows else {"significant": False, "reason": "no_scoring_tasks",
                       "ci": [0.0, 0.0], "sample": 0, "note": "无计分题，无法进行显著性检验"}
     )
-    return {"overall": overall, "per_dimension": per_dimension}
+    result: dict[str, Any] = {"overall": overall, "per_dimension": per_dimension}
+    if config is not None and rows:
+        clusters: dict[str, list[float]] = {}
+        for r in rows:
+            clusters.setdefault(r["dimension"], []).append(r["ma"] - r["mb"])
+        ci = clustered_bootstrap_ci(clusters, seed=SIG_SEED)
+        one_cluster = len(clusters) <= 1
+        result["overall"]["ci_clustered"] = {
+            "ci": [ci[0], ci[1]],
+            "cluster_unit": "维度",
+            "n_clusters": len(clusters),
+            "note": ("按维度聚类重采样（逐题 bootstrap 忽略同簇相关性），"
+                     + ("仅一个簇（聚类 CI 退化为整组重采样）" if one_cluster
+                        else "聚类后 CI 通常更宽")),
+        }
+    return result
 
 
 def _build_kpi(
@@ -400,8 +436,13 @@ def _build_kpi(
     charts: dict[str, Any],
     significance: dict[str, Any],
     rows: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """KPI 汇总：分数/胜场/代码通过率/延迟/token + 显著性结论。"""
+    """KPI 汇总：分数/胜场/代码通过率/延迟/token + 显著性结论。
+
+    迭代十二：新增 efficiency 段（每 1K token 得分 + 归一化效率 + 单位得分
+    成本），旧 job/config 无 token 或无可得分时不输出该段。
+    """
     code_rates = {"x": None, "y": None}
     total_px = total_tx = total_py = total_ty = 0
     for c in charts.get("code_pass_rate", []):
@@ -417,7 +458,10 @@ def _build_kpi(
     lat_x = [r["latency_x"] for r in rows if r["status_x"] == "ok" and r["latency_x"] > 0]
     lat_y = [r["latency_y"] for r in rows if r["status_y"] == "ok" and r["latency_y"] > 0]
 
-    return {
+    total_tokens_x = sum(r["prompt_x"] + r["completion_x"] for r in rows)
+    total_tokens_y = sum(r["prompt_y"] + r["completion_y"] for r in rows)
+
+    kpi: dict[str, Any] = {
         "total_score": {"x": summary["total_x"], "y": summary["total_y"],
                         "max": summary["max_score"]},
         "avg_score": {"x": summary["avg_x"], "y": summary["avg_y"]},
@@ -427,12 +471,34 @@ def _build_kpi(
             "x": round(statistics.mean(lat_x), 1) if lat_x else None,
             "y": round(statistics.mean(lat_y), 1) if lat_y else None,
         },
-        "total_tokens": {
-            "x": sum(r["prompt_x"] + r["completion_x"] for r in rows),
-            "y": sum(r["prompt_y"] + r["completion_y"] for r in rows),
-        },
+        "total_tokens": {"x": total_tokens_x, "y": total_tokens_y},
         "significance": significance["overall"],
     }
+    eff_x = token_efficiency(summary["total_x"], completion=total_tokens_x)
+    eff_y = token_efficiency(summary["total_y"], completion=total_tokens_y)
+    norm_x, norm_y = normalize_efficiency([eff_x["score_per_1k_tokens"],
+                                           eff_y["score_per_1k_tokens"]])
+    if eff_x["tokens"] > 0 or eff_y["tokens"] > 0:
+        note_parts = ["归一化效率以双方最高效率为 1.0（论文：避免只看绝对分数，兼顾成本差异）"]
+        cap = int((config or {}).get("budget_cap_tokens") or 0)
+        if cap > 0:
+            note_parts.append(f"声明算力预算 {cap} token（软记录，仅标注不强制）")
+        kpi["efficiency"] = {
+            "x": {
+                "score_per_1k_tokens": eff_x["score_per_1k_tokens"],
+                "norm_score": norm_x,
+                "cost_per_score": eff_x["cost_per_score"],
+                "tokens": eff_x["tokens"],
+            },
+            "y": {
+                "score_per_1k_tokens": eff_y["score_per_1k_tokens"],
+                "norm_score": norm_y,
+                "cost_per_score": eff_y["cost_per_score"],
+                "tokens": eff_y["tokens"],
+            },
+            "note": "；".join(note_parts),
+        }
+    return kpi
 
 
 def _build_warnings(
@@ -440,9 +506,15 @@ def _build_warnings(
     verdict: dict[str, Any],
     metrics: dict[str, Any],
     significance: dict[str, Any],
+    config: dict[str, Any] | None = None,
+    rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """告警清单：指标跳过（截断/失败/无 expected/代码未执行）、评审失败、
-    embedding 降级、显著性未达样本/CI 含 0。"""
+    embedding 降级、显著性未达样本/CI 含 0。
+
+    迭代十二新增：效率归一化对照、算力匹配软记录、题库判别力档位、
+    提示策略混淆、聚类显著性对照、推导自洽性矛盾高亮。
+    """
     warnings: list[dict[str, Any]] = []
     meta = verdict.get("meta", {})
     if meta.get("invalid"):
@@ -459,6 +531,27 @@ def _build_warnings(
                     "code": "metrics_skipped", "level": "info",
                     "message": f"{pt['id']} 侧{side}指标跳过：{reason}",
                 })
+            if (m.get("coherence") or {}).get("flag") == "logical_contradiction":
+                warnings.append({
+                    "code": "logical_contradiction", "level": "info",
+                    "message": f"{pt['id']} 侧{side}检测到逻辑矛盾信号（推导自洽性贴近 0），"
+                               "结论与前提存在自我否定，建议人工复核该题答案",
+                })
+            if (m.get("numeric_drift") or {}).get("drift"):
+                nd = m["numeric_drift"]
+                warnings.append({
+                    "code": "numeric_drift", "level": "info",
+                    "message": f"{pt['id']} 侧{side}数值结果相对期望偏差 "
+                               f"{round((nd.get('max_delta_ratio') or 0) * 100, 1)}%（>5%），"
+                               "疑似计算漂移，建议人工复核",
+                })
+        red = pt.get("redundancy") or {}
+        if red.get("band") == "same-ish":
+            warnings.append({
+                "code": "answer_redundant", "level": "info",
+                "message": f"{pt['id']} 双方答案高度相似（余弦 {red.get('cosine')}），"
+                           "对比同质化，建议核查提示模板或答案来源",
+            })
     emb_err = (metrics.get("provider") or {}).get("error")
     if emb_err:
         warnings.append({
@@ -476,7 +569,125 @@ def _build_warnings(
             "code": "significance_overlap", "level": "info",
             "message": "总分差异不显著（bootstrap CI 包含 0）",
         })
+    ci_plain = sig.get("ci") or [0.0, 0.0]
+    ci_cl = (sig.get("ci_clustered") or {}).get("ci")
+    if ci_cl is not None and (ci_plain[0] > 0 or ci_plain[1] < 0) and ci_cl[0] <= 0 <= ci_cl[1]:
+        warnings.append({
+            "code": "significance_cluster_flip", "level": "warning",
+            "message": "题目间存在相关性，逐题显著性可能被高估：聚类 CI 覆盖 0，"
+                       f"按簇（{sig.get('ci_clustered', {}).get('cluster_unit', '维度')}）"
+                       "聚类后差异不再显著",
+        })
+    _append_eff_warnings(warnings, rows, config)
+    _append_discriminative_warnings(warnings, task_set)
+    _append_prompt_confound_warnings(warnings, config)
     return warnings
+
+
+def _side_tokens(rows: list[dict[str, Any]] | None, side: str) -> int:
+    if not rows:
+        return 0
+    return sum(r.get(f"prompt_{side}", 0) + r.get(f"completion_{side}", 0) for r in rows)
+
+
+def _append_eff_warnings(
+    warnings: list[dict[str, Any]],
+    rows: list[dict[str, Any]] | None,
+    config: dict[str, Any] | None = None,
+) -> None:
+    """改动二.5 + 改动四：得分接近但效率差显著 / 算力匹配软记录警示。"""
+    if not rows:
+        return
+    tx, ty = _side_tokens(rows, "x"), _side_tokens(rows, "y")
+    total_x = sum(r.get("score_x", 0) for r in rows)
+    total_y = sum(r.get("score_y", 0) for r in rows)
+    eff_x = token_efficiency(total_x, completion=tx)["score_per_1k_tokens"]
+    eff_y = token_efficiency(total_y, completion=ty)["score_per_1k_tokens"]
+    if eff_x and eff_y and total_x and total_y:
+        gap = abs(total_x - total_y) / max(total_x, total_y)
+        eff_gap = abs(eff_x - eff_y) / max(eff_x, eff_y)
+        if gap < 0.05 and eff_gap > 0.3:
+            warnings.append({
+                "code": "efficiency_score_close_cost_far", "level": "info",
+                "message": "得分接近但效率差异显著，成本敏感场景建议选效率更高者"
+                           f"（每 1K token 得分 X {eff_x:.2f} vs Y {eff_y:.2f}）",
+            })
+    cap = int((config or {}).get("budget_cap_tokens") or 0)
+    if cap > 0 and (tx > 1.5 * cap or ty > 1.5 * cap):
+        exceed = "X" if tx > 1.5 * cap else "Y"
+        warnings.append({
+            "code": "compute_budget_exceeded", "level": "warning",
+            "message": f"声明算力预算 {cap} token（软记录），{exceed} 侧实际消耗 "
+                       f"（{tx if exceed == 'X' else ty} token）超过预算 1.5 倍，"
+                       "该对比未做硬性算力匹配，结论可能受成本差异影响",
+        })
+    if tx > 0 and ty > 0:
+        soft_note = "未设硬性算力上限（软记录），该对比未做算力匹配，结论可能受成本差异影响"
+        if tx > 5 * ty or ty > 5 * tx:
+            warnings.append({
+                "code": "compute_mismatch", "level": "info",
+                "message": f"模型间 token 消耗差异大于 5 倍（X {tx} vs Y {ty}）。{soft_note}",
+            })
+
+
+def _append_discriminative_warnings(
+    warnings: list[dict[str, Any]],
+    task_set: dict[str, Any],
+) -> None:
+    """改动 A：题目判别力档位（来自历史得分率）饱和/过难提示。"""
+    rated: dict[str, list[str]] = {"too_easy": [], "too_hard": []}
+    dim_easy: dict[str, int] = {}
+    dim_total: dict[str, int] = {}
+    for t in task_set.get("tasks", []):
+        rate = t.get("history_rate")
+        if rate is None:
+            continue
+        band = discriminative_band(float(rate))
+        dim = t.get("dimension", "自定义")
+        dim_total[dim] = dim_total.get(dim, 0) + 1
+        if band == "too_easy":
+            rated["too_easy"].append(t["id"])
+            dim_easy[dim] = dim_easy.get(dim, 0) + 1
+        elif band == "too_hard":
+            rated["too_hard"].append(t["id"])
+    if rated["too_easy"]:
+        warnings.append({
+            "code": "task_saturated", "level": "info",
+            "message": "题库已饱和：too_easy 题目降低评测区分度（得分率≥0.8）："
+                       f"{'、'.join(rated['too_easy'][:8])}"
+                       + ("等" if len(rated["too_easy"]) > 8 else ""),
+        })
+    if rated["too_hard"]:
+        warnings.append({
+            "code": "task_too_hard", "level": "info",
+            "message": "题目过难：too_hard 题目同样降低评测区分度（得分率≤0.2）："
+                       f"{'、'.join(rated['too_hard'][:8])}"
+                       + ("等" if len(rated["too_hard"]) > 8 else ""),
+        })
+    for dim, n in dim_easy.items():
+        if dim_total.get(dim, 1) > 0 and n / dim_total[dim] >= 0.5:
+            warnings.append({
+                "code": "dimension_saturated", "level": "warning",
+                "message": f"{dim} 维度题目已饱和（{n}/{dim_total[dim]} 题得分率≥0.8），"
+                           "建议提升难度或更换题库",
+            })
+
+
+def _append_prompt_confound_warnings(
+    warnings: list[dict[str, Any]],
+    config: dict[str, Any] | None,
+) -> None:
+    """改动 D：提示策略差异作为混淆变量显式建模。"""
+    if not config:
+        return
+    ps_a = config.get("prompt_strategy_a") or config.get("prompt_strategy")
+    ps_b = config.get("prompt_strategy_b") or config.get("prompt_strategy")
+    if ps_a and ps_b and ps_a != ps_b:
+        warnings.append({
+            "code": "prompt_strategy_confound", "level": "info",
+            "message": f"双模型提示策略不同（X: {ps_a} vs Y: {ps_b}），"
+                       "结论差异可能含提示策略影响，非纯模型能力差异",
+        })
 
 
 def _build_rows(
@@ -728,19 +939,76 @@ def _build_charts(
     }
 
 
+def _append_cost_benefit_advice(
+    paras: list[str],
+    rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> None:
+    """改动 E：成本–性能边际收益建议（得分领先但成本显著更高时）。"""
+    wname = summary["x_model"] or "答案X"
+    lname = summary["y_model"] or "答案Y"
+    sides = {
+        wname: (summary["total_x"], sum(r["prompt_x"] + r["completion_x"] for r in rows),
+                [(r["prompt_x"] + r["completion_x"], r["score_x"]) for r in rows]),
+        lname: (summary["total_y"], sum(r["prompt_y"] + r["completion_y"] for r in rows),
+                [(r["prompt_y"] + r["completion_y"], r["score_y"]) for r in rows]),
+    }
+    lead = max(sides, key=lambda m: sides[m][0])
+    trail = lname if lead == wname else wname
+    lead_score, lead_tokens, lead_pts = sides[lead]
+    trail_score, trail_tokens, _ = sides[trail]
+    if lead_score <= 0 or trail_score <= 0 or lead_tokens <= 0:
+        return
+    ratio = lead_tokens / trail_tokens
+    score_gap = (lead_score - trail_score) / max(trail_score, 1e-9)
+    if score_gap < 0.05 and ratio >= 1.5:
+        frontier = efficiency_frontier(lead_pts)
+        knee = frontier.get("knee_index")
+        if knee is not None:
+            paras.append(
+                f"若成本敏感，建议在 {knee} 题（累计 {_fmt(frontier['knee_tokens'])} token，"
+                f"累计得分 {_fmt(frontier['knee_score'])}）内评估 {lead}："
+                f"{lead} 得分仅领先 {_fmt(score_gap * 100)}% 但 token 成本为 "
+                f"{trail} 的 {_fmt(ratio)} 倍，边际收益在拐点后显著递减。"
+            )
+
+
 def _build_analysis(
     tasks: list[dict[str, Any]],
     rows: list[dict[str, Any]],
     summary: dict[str, Any],
     charts: dict[str, Any],
+    config: dict[str, Any] | None = None,
+    metrics: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """纯规则化分析：7 个段落，逐条引用具体数值。"""
+    """纯规则化分析：7 个段落，逐条引用具体数值。
+
+    迭代十二：总体结论带提示策略前提、成本剖析追加效率归一化对照
+    与成本-性能边际收益建议（论文 token 效率/边际成本落地）；
+    N1：双模型答案冗余度提示。
+    """
     sections: list[dict[str, Any]] = []
 
     # ---- 1. 总体结论 ----
     paras = []
     wname = summary["x_model"] or "答案X"
     lname = summary["y_model"] or "答案Y"
+    ps_a = (config or {}).get("prompt_strategy_a") or (config or {}).get("prompt_strategy", "cot")
+    ps_b = (config or {}).get("prompt_strategy_b") or (config or {}).get("prompt_strategy", "cot")
+    if ps_a and ps_b and ps_a == ps_b:
+        paras.append(f"本次双模型提示策略一致（{ps_a}），结论差异可归因于模型能力本身。")
+    else:
+        paras.append(f"注意：双模型提示策略不一致（X: {ps_a} vs Y: {ps_b}），"
+                     "结论差异可能含提示策略影响，非纯模型能力差异。")
+    red_avg = (metrics or {}).get("redundancy_avg")
+    if red_avg is not None:
+        if red_avg > 0.5:
+            paras.append(
+                f"双模型答案冗余度 {_fmt(red_avg)}（>0.5）：双方回答高度雷同，"
+                "本次对比较为同质化，建议核查提示模板或答案来源。"
+            )
+        elif red_avg <= 0.3:
+            paras.append(f"双模型答案冗余度 {_fmt(red_avg)}（≤0.3）：回答分化明显，对比信息量充足。")
     if summary["winner"] == "tie":
         paras.append(
             f"双方总分战平：{wname} {_fmt(summary['total_x'])} 分 vs {lname} {_fmt(summary['total_y'])} 分，"
@@ -857,6 +1125,29 @@ def _build_analysis(
         paras.append(f"输出占比：{wname} {_fmt(c_x / (p_x + c_x) * 100 if p_x + c_x else 0)}%，{lname} {_fmt(c_y / (p_y + c_y) * 100 if p_y + c_y else 0)}%（输出 token 越多通常意味着回答越长、潜在成本越高）。")
     if summary["total_y"] > 0:
         paras.append(f"单位得分成本：{wname} 每得 1 分消耗 {_fmt((p_x + c_x) / summary['total_x'] if summary['total_x'] else 0)} token；{lname} 每得 1 分消耗 {_fmt((p_y + c_y) / summary['total_y'])} token。")
+    eff_x = token_efficiency(summary["total_x"], completion=p_x + c_x)
+    eff_y = token_efficiency(summary["total_y"], completion=p_y + c_y)
+    if eff_x["score_per_1k_tokens"] and eff_y["score_per_1k_tokens"]:
+        nx, ny = normalize_efficiency([eff_x["score_per_1k_tokens"],
+                                       eff_y["score_per_1k_tokens"]])
+        paras.append(
+            f"每 1K token 得分：{wname} {_fmt(eff_x['score_per_1k_tokens'])} vs "
+            f"{lname} {_fmt(eff_y['score_per_1k_tokens'])}；归一化效率 {wname} "
+            f"{_fmt(nx)} vs {lname} {_fmt(ny)}（1.0=当前最高效率）。"
+        )
+        high = wname if eff_x["score_per_1k_tokens"] >= eff_y["score_per_1k_tokens"] else lname
+        low = lname if high == wname else wname
+        ratio = max(eff_x["score_per_1k_tokens"], eff_y["score_per_1k_tokens"]) / \
+            max(min(eff_x["score_per_1k_tokens"], eff_y["score_per_1k_tokens"]), 1e-9)
+        if ratio >= 1.3:
+            paras.append(
+                f"{high} 以更低 token 成本达成相近得分，选型上更具成本优势"
+                f"（效率约为 {low} 的 {_fmt(ratio)} 倍）。"
+            )
+        _append_cost_benefit_advice(paras, rows, summary)
+    cap = int((config or {}).get("budget_cap_tokens") or 0)
+    if cap > 0:
+        paras.append(f"声明算力预算（软记录，仅标注不强制）：每系统 {cap} token。")
     sections.append({"title": "成本剖析", "paragraphs": paras})
 
     # ---- 5. 代码质量 ----

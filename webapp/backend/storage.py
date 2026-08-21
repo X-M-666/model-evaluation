@@ -228,6 +228,7 @@ def save_config(job_id: str, config: dict) -> None:
         "review_k_top_human": int(config["review"].get("k_top_human") or 0) if isinstance(config.get("review"), dict) else 0,
         "review_degraded": bool(config["review"].get("degraded")) if isinstance(config.get("review"), dict) else False,
         "budget": config.get("budget") if isinstance(config.get("budget"), dict) else None,
+        "budget_cap_tokens": int(config.get("budget_cap_tokens") or 0),
     }
     (_job_dir(job_id) / "config.json").write_text(json.dumps(safe, ensure_ascii=False, indent=2), encoding="utf-8")
 

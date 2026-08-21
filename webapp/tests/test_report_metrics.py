@@ -259,15 +259,18 @@ def test_warnings_significance():
 
 def test_no_warnings_when_all_clean():
     codes = [w["code"] for w in _report(emb={"provider": "offline"})["warnings"]]
-    # 只有样本不足的 info 级提示（3 个计分题 < MIN_SAMPLE=8）
-    assert codes == ["significance_sample"]
+    # 只有样本不足的 info 级提示（3 个计分题 < MIN_SAMPLE=8）+
+    # 迭代十二新提示（语言/安全题目双方答案完全相同 → 每题一条同质化提示）
+    assert codes == ["answer_redundant", "answer_redundant", "significance_sample"]
 
 
 def test_significance_overlap_warning_with_sufficient_sample():
     a, b = _big_answers()
     r = build_report({"repeat_n": 1}, _big_task_set(), a, b, _big_verdict(all_same=True))
     codes = [w["code"] for w in r["warnings"]]
-    assert codes == ["significance_overlap"]
+    # 迭代十二：大题集答案高度相同时同质化提示先于显著性提示
+    assert codes[0] == "answer_redundant"
+    assert "significance_overlap" in codes
 
 
 # ---- 既有字段不动 ----

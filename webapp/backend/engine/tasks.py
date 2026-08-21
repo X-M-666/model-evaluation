@@ -15,6 +15,26 @@ from typing import Any
 
 from backend.engine.datasets import validate_standard_dataset
 
+# 判别力档位（迭代十二：基线判别力洞察，对齐论文 45% 能力饱和阈值理念）
+DISCRIMINATIVE_GOOD = "good"
+DISCRIMINATIVE_TOO_HARD = "too_hard"
+DISCRIMINATIVE_TOO_EASY = "too_easy"
+
+
+def discriminative_band(rate: float | None) -> str:
+    """题目判别力档位（纯函数）：基于历史得分率 rate（0-1）。
+
+    rate ∈ (0.2, 0.8) → good（有区分度）；≤ 0.2 → too_hard；
+    ≥ 0.8 → too_easy（饱和，难区分）；None → good（无历史数据不设限）。
+    """
+    if rate is None:
+        return DISCRIMINATIVE_GOOD
+    if rate <= 0.2:
+        return DISCRIMINATIVE_TOO_HARD
+    if rate >= 0.8:
+        return DISCRIMINATIVE_TOO_EASY
+    return DISCRIMINATIVE_GOOD
+
 # 八大能力维度（与评测体系一致）
 DIMENSIONS = [
     "知识能力",
@@ -421,6 +441,46 @@ for _pool in QUESTION_POOL.values():
         _q.setdefault("excluded_from_total", False)
 
 
+def _history_rates(dataset_name: str | None = None) -> dict[str, float]:
+    """从饱和度历史取每题最新得分率（迭代十二：基线判别力洞察）。
+
+    按数据集过滤（评测集不同得分率不可比）；无历史或读取出错时返回空。
+    得分率 = 双侧评审分均值 / 10（与 stats.saturation_trend 同口径）。
+    """
+    try:
+        from backend import storage
+        saturation = storage.get_saturation()
+    except Exception:
+        return {}
+    rates: dict[str, float] = {}
+    jobs = sorted(saturation.get("jobs", []),
+                  key=lambda j: str(j.get("updated_at", "")))
+    for j in jobs:
+        if dataset_name is not None and str(j.get("dataset") or "") != dataset_name:
+            continue
+        for e in j.get("entries", []):
+            if not isinstance(e, dict) or e.get("id") is None:
+                continue
+            try:
+                rate = (float(e.get("answer_x", 0)) + float(e.get("answer_y", 0))) / 2.0 / 10.0
+            except (TypeError, ValueError):
+                continue
+            rates[str(e.get("id"))] = round(rate, 4)  # 时间序，最后写入者为最新
+    return rates
+
+
+def _attach_history_rate(
+    task: dict[str, Any],
+    rates: dict[str, float],
+) -> dict[str, Any]:
+    """给任务附带 history_rate 与判别力档位（无历史数据时置 None/good）。"""
+    t = {k: v for k, v in task.items()}
+    rate = rates.get(str(t.get("id", "")))
+    t["history_rate"] = rate
+    t["discriminative"] = discriminative_band(rate)
+    return t
+
+
 def generate_tasks(
     dims: list[str] | None = None,
     seed: int | None = None,
@@ -456,8 +516,13 @@ def build_task_set(
     seed: int | None = None,
     num_questions: int | None = None,
 ) -> dict[str, Any]:
-    """生成完整任务集 dict（与 .eval/tasks.json 结构一致）。"""
+    """生成完整任务集 dict（与 .eval/tasks.json 结构一致）。
+
+    迭代十二：附带 history_rate/判别力档位（来自历史得分率，无则 None/good）。
+    """
     tasks = generate_tasks(dims, seed, num_questions)
+    rates = _history_rates()
+    tasks = [_attach_history_rate(t, rates) for t in tasks]
     stability_ids = [
         t["id"] for t in tasks if t["dimension"] == STABILITY_DIMENSION
     ]
@@ -513,6 +578,8 @@ def build_task_set_from_dataset(
         t.setdefault("context", "")
         t.setdefault("tags", [])
         t.setdefault("excluded_from_total", False)
+    rates = _history_rates(dataset.get("name"))
+    tasks = [_attach_history_rate(t, rates) for t in tasks]
 
     # 检测稳定性维度
     stability_ids = [t["id"] for t in tasks if t["dimension"] == STABILITY_DIMENSION]
